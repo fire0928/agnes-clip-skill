@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>配乐台 · 老位置</title>
+<style>
+  :root{
+    --bg:#f6f4f1; --card:#ffffff; --line:#e6e0d8; --text:#1f1c19;
+    --muted:#8a8178; --accent:#b06a4a; --accent-soft:#f2e6df; --ok:#4a7c6f;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:14px/1.6 "Microsoft YaHei","PingFang SC",system-ui,sans-serif;}
+  header{position:sticky;top:0;z-index:20;background:rgba(246,244,241,.92);
+         backdrop-filter:blur(10px);border-bottom:1px solid var(--line);
+         padding:14px 22px;display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+  h1{font-size:17px;margin:0;font-weight:600;letter-spacing:.5px}
+  h1 small{color:var(--muted);font-weight:400;font-size:12px;margin-left:8px}
+  .pill{background:var(--card);border:1px solid var(--line);border-radius:999px;
+        padding:4px 12px;font-size:12px;color:var(--muted)}
+  .pill b{color:var(--text);font-weight:600}
+  main{display:grid;grid-template-columns:300px 1fr;gap:18px;padding:18px 22px 90px;
+       max-width:1320px;margin:0 auto}
+  @media(max-width:900px){main{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+  .card h2{font-size:13px;margin:0 0 12px;font-weight:600;color:var(--muted);
+           letter-spacing:1px;text-transform:uppercase}
+  .track{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:10px;
+         cursor:pointer;border:1px solid transparent}
+  .track:hover{background:#faf7f4}
+  .track.on{background:var(--accent-soft);border-color:#e2c8b8}
+  .track .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}
+  .track .du{color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
+  button{border:1px solid var(--line);background:#fff;border-radius:8px;padding:6px 12px;
+         font:inherit;font-size:12px;cursor:pointer;color:var(--text)}
+  button:hover{border-color:#cfc6bb}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.ghost{background:transparent}
+  .shot{display:grid;grid-template-columns:64px 1fr 190px;gap:14px;align-items:center;
+        padding:11px 12px;border-radius:12px;border:1px solid transparent}
+  .shot:hover{background:#faf7f4}
+  .shot+.shot{border-top:1px solid #f0ece6}
+  .sid{font-variant-numeric:tabular-nums;font-weight:600;font-size:13px}
+  .tc{color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
+  .line{font-size:13px}
+  .line .none{color:#b9b2a9}
+  .scene{color:var(--muted);font-size:11px;margin-top:2px}
+  .ctl{display:flex;align-items:center;gap:8px}
+  input[type=range]{width:110px;accent-color:var(--accent)}
+  .val{width:34px;text-align:right;font-variant-numeric:tabular-nums;font-size:12px;color:var(--muted)}
+  .play{border:none;background:transparent;font-size:15px;cursor:pointer;padding:0 2px;color:var(--accent)}
+  .curve{margin-top:6px}
+  .hint{color:var(--muted);font-size:12px;margin-top:10px;line-height:1.7}
+  .toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:#1f1c19;
+         color:#fff;padding:9px 18px;border-radius:999px;font-size:12px;opacity:0;
+         transition:opacity .25s;pointer-events:none;z-index:50}
+  .toast.on{opacity:.94}
+  .up{display:none}
+  video{width:100%;border-radius:10px;background:#000}
+  .drawer{position:fixed;right:22px;bottom:22px;width:260px;z-index:30;
+          box-shadow:0 10px 30px rgba(0,0,0,.14)}
+  .drawer .close{float:right;border:none;background:none;cursor:pointer;color:var(--muted)}
+  .bar{height:6px;border-radius:3px;background:#efe9e2;overflow:hidden;margin-top:6px}
+  .bar i{display:block;height:100%;background:var(--accent)}
+</style>
+</head>
+<body>
+<header>
+  <h1>配乐台 <small id="proj">—</small></h1>
+  <span class="pill">总长 <b id="total">—</b></span>
+  <span class="pill">当前配乐 <b id="curtrack">未指定</b></span>
+  <button id="rescan" class="ghost">重新扫描</button>
+  <button id="apply" class="primary">保存并应用</button>
+</header>
+
+<main>
+  <section class="card">
+    <h2>配乐库</h2>
+    <div id="tracks"></div>
+    <div style="margin-top:12px;display:flex;gap:8px">
+      <button id="upload">上传音乐</button>
+      <input type="file" id="file" class="up" accept="audio/*" multiple>
+    </div>
+    <div class="hint">
+      点击曲目即可试听；点“选用”把它作为本片配乐。<br>
+      音乐文件放在 <code>audio/music/</code> 下会自动出现在这里。
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>逐镜配乐音量</h2>
+    <div class="curve"><svg id="svg" width="100%" height="72"></svg></div>
+    <div id="shots"></div>
+    <div class="hint">
+      音量 0 表示该段完全静音（用于留白、纯人声）；0.4 以上适合情绪上扬的段落。<br>
+      改完自动保存到镜头表，点右上角“保存并应用”会按新配乐重新合成。
+    </div>
+  </section>
+</main>
+
+<div class="drawer card" id="drawer" style="display:none">
+  <button class="close" id="closeDrawer">关闭</button>
+  <div id="dTitle" style="font-size:12px;color:var(--muted);margin-bottom:8px"></div>
+  <video id="vid" controls playsinline></video>
+</div>
+
+<div class="toast" id="toast"></div>
+<audio id="aud"></audio>
+
+<script>
+const $ = s => document.querySelector(s);
+let S = null, timer = null;
+
+function toast(t){ const el=$('#toast'); el.textContent=t; el.classList.add('on');
+  clearTimeout(el._t); el._t=setTimeout(()=>el.classList.remove('on'),1600); }
+
+function fmt(t){ const m=Math.floor(t/60), s=Math.floor(t%60); return m+':'+String(s).padStart(2,'0'); }
+
+async function load(){
+  S = await fetch('/api/state').then(r=>r.json());
+  $('#proj').textContent = S.title || '';
+  $('#total').textContent = fmt(S.total) + ' / ' + S.shots.length + ' 镜';
+  $('#curtrack').textContent = S.current && S.current !== 'bgm.mp3' ? S.current : '默认 bgm.mp3';
+  renderTracks(); renderShots(); renderCurve();
+}
+
+function renderTracks(){
+  const box = $('#tracks'); box.innerHTML = '';
+  if(!S.tracks.length){
+    box.innerHTML = '<div class="hint">还没有配乐文件。点“上传音乐”或在 audio/music/ 里放几首歌。</div>';
+    return;
+  }
+  S.tracks.forEach(t => {
+    const d = document.createElement('div');
+    d.className = 'track' + (t.name === S.current ? ' on' : '');
+    d.innerHTML = `<span class="play">▶</span>
+      <span class="nm" title="${t.name}">${t.name}</span>
+      <span class="du">${t.dur ? fmt(t.dur) : ''}</span>`;
+    d.querySelector('.play').onclick = e => { e.stopPropagation(); audition(t); };
+    d.onclick = () => pick(t);
+    box.appendChild(d);
+  });
+}
+
+function audition(t){
+  const a = $('#aud'); a.src = '/media/track/' + encodeURIComponent(t.name);
+  a.play().catch(()=>toast('这个格式浏览器放不了，可以先转成 mp3'));
+  $('#vid').pause();
+}
+
+async function pick(t){
+  await fetch('/api/track', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({file: t.name})});
+  S.current = t.name;
+  $('#curtrack').textContent = t.name;
+  renderTracks();
+  toast('已选用：' + t.name + '（记得点“保存并应用”）');
+}
+
+function renderShots(){
+  const box = $('#shots'); box.innerHTML = '';
+  S.shots.forEach((sh, i) => {
+    const row = document.createElement('div');
+    row.className = 'shot';
+    row.innerHTML = `
+      <div><div class="sid">${sh.id}</div><div class="tc">${fmt(sh.start)}</div></div>
+      <div>
+        <div class="line">${sh.line ? sh.line : '<span class="none">（无台词）</span>'}</div>
+        <div class="scene">${sh.scene || ''}</div>
+      </div>
+      <div class="ctl">
+        <button class="play" title="看这一镜">▶</button>
+        <input type="range" min="0" max="1" step="0.02" value="${sh.bgm}">
+        <span class="val">${sh.bgm.toFixed(2)}</span>
+      </div>`;
+    const rng = row.querySelector('input');
+    rng.oninput = () => {
+      row.querySelector('.val').textContent = (+rng.value).toFixed(2);
+      S.shots[i].bgm = +rng.value; renderCurve();
+      clearTimeout(timer);
+      timer = setTimeout(() => saveShot(sh.id, +rng.value), 220);
+    };
+    row.querySelector('.play').onclick = () => preview(sh);
+    box.appendChild(row);
+  });
+}
+
+async function saveShot(id, v){
+  await fetch('/api/shot', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id, bgm: v})});
+  toast(id + ' 音量 ' + v.toFixed(2));
+}
+
+function preview(sh){
+  const d = $('#drawer'); d.style.display = 'block';
+  $('#aud').pause();
+  $('#dTitle').textContent = sh.id + ' · ' + fmt(sh.start) + (sh.line ? ' · ' + sh.line : '');
+  const v = $('#vid'); v.src = '/media/clip/' + sh.id + '.mp4'; v.play().catch(()=>{});
+}
+
+function renderCurve(){
+  const svg = $('#svg'), W = svg.clientWidth || 600, H = 72, pad = 6;
+  const n = S.shots.length, total = S.total || 1;
+  let pts = S.shots.map(sh => {
+    const x = pad + (sh.start / total) * (W - pad*2);
+    const y = H - pad - sh.bgm * (H - pad*2);
+    return x.toFixed(1) + ',' + y.toFixed(1);
+  });
+  const last = S.shots[n-1];
+  const xe = pad + ((last.start + last.dur) / total) * (W - pad*2);
+  const ye = H - pad - last.bgm * (H - pad*2);
+  pts.push(xe.toFixed(1) + ',' + ye.toFixed(1));
+  svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+  const bars = S.shots.map(sh => {
+    const x = pad + (sh.start / total) * (W - pad*2);
+    const y = H - pad - sh.bgm * (H - pad*2);
+    return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.4" fill="#b06a4a"/>`;
+  }).join('');
+  svg.innerHTML = `<line x1="0" y1="${H-pad}" x2="${W}" y2="${H-pad}" stroke="#e6e0d8"/>
+    <polyline points="${pts.join(' ')}" fill="none" stroke="#b06a4a" stroke-width="1.6"
+      stroke-linejoin="round" opacity=".85"/>${bars}`;
+}
+
+$('#apply').onclick = async () => {
+  const r = await fetch('/api/apply', {method:'POST'});
+  const d = await r.json();
+  toast(d.message || '已保存');
+};
+$('#rescan').onclick = load;
+$('#upload').onclick = () => $('#file').click();
+$('#file').onchange = async e => {
+  for (const f of e.target.files){
+    await fetch('/api/upload', {method:'POST', headers:{'X-Filename': encodeURIComponent(f.name)},
+      body: f});
+  }
+  toast('上传完成'); load();
+};
+$('#closeDrawer').onclick = () => { $('#drawer').style.display='none'; $('#vid').pause(); };
+window.addEventListener('resize', renderCurve);
+load();
+</script>
+</body>
+</html>

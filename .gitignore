@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 本机凭据（绝对不能提交）
+.env
+*.key
+*_key.json
+agnes-clip.json
+ai-video-pipeline.json
+
+# 打包产物（按需：想让 Releases 里留 zip 就删掉下面两行）
+dist/*.zip
+dist/*.sha256
+
+# 项目产物（跑片子时生成的，别混进 skill 仓库）
+projects/
+out/
+frames/
+clips/
+*.mp4
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

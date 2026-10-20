@@ -463,6 +463,63 @@ def ff_has_audio(path, exe):
     return "Audio:" in p.stderr.decode("utf-8", "ignore")
 
 
+def ff_size(path, exe):
+    """返回 (w, h)；取不到返回 None。
+
+    不同模型/不同通道出的竖屏尺寸会不一样：agnes-video-2.5-flash 是 704x1280，
+    付费版 agnes-video-2.5 是 720x1280。混着拼的时候 xfade 会因为尺寸不一致直接失败。
+    """
+    p = ff_run(exe, ["-i", path], check=False)
+    txt = p.stderr.decode("utf-8", "ignore")
+    for line in txt.splitlines():
+        if "Video:" in line:
+            m = re.search(r"(\d{2,5})x(\d{2,5})", line)
+            if m:
+                return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def ff_lufs(path, exe):
+    """返回 (integrated_lufs, true_peak_dbtp)；测不到返回 (None, None)。"""
+    p = ff_run(exe, ["-hide_banner", "-i", path,
+                     "-af", "loudnorm=print_format=json", "-f", "null", "-"],
+                check=False)
+    txt = p.stderr.decode("utf-8", "ignore")
+    m = re.findall(r'"input_i"\s*:\s*"(-?[\d.]+)"', txt)
+    t = re.findall(r'"input_tp"\s*:\s*"(-?[\d.]+)"', txt)
+    if not m:
+        return None, None
+    return float(m[-1]), (float(t[-1]) if t else None)
+
+
+def normalize_loudness(path, exe, target=-16.0, ceiling=-1.5):
+    """把成片整体提到 target LUFS（静态增益 + 峰值保护），视频流直接 copy。
+
+    对白片常见坑：TTS 每条都按 -23 LUFS 归过，混完整体只有 -24 左右，
+    手机外放听起来闷、小。这里统一抬到 -16（抖音/B站/视频号的常见基准）。
+    """
+    cur, tp = ff_lufs(path, exe)
+    if cur is None:
+        warn("测不到响度，跳过响度归一")
+        return
+    gain = target - cur
+    if tp is not None and tp + gain > ceiling:
+        gain = ceiling - tp
+    if gain < 0.5:
+        info("响度 %.1f LUFS（峰值 %s dBTP），不再调整" % (cur, tp))
+        return
+    tmp = path + ".norm.mp4"
+    af = "volume=%.2fdB" % gain
+    if tp is not None and tp + gain > ceiling - 0.3:
+        af += ",alimiter=limit=%.3f:level=disabled" % (10 ** (ceiling / 20.0))
+    ff_run(exe, ["-y", "-loglevel", "error", "-i", path, "-c:v", "copy",
+                 "-af", af, "-c:a", "aac", "-b:a", "192k",
+                 "-movflags", "+faststart", tmp])
+    os.replace(tmp, path)
+    info("响度 %.1f → %.1f LUFS（+%.1f dB，峰值 %s dBTP）"
+         % (cur, cur + gain, gain, tp))
+
+
 def save_image_bytes(raw, dst, exe=None):
     """Agnes 生图返回 PNG；目标名 .jpg 时用 ffmpeg 转码。"""
     is_png = raw[:8] == b"\x89PNG\r\n\x1a\n"
@@ -2790,10 +2847,118 @@ def _voice_for(cfg, speaker):
     return v.get(speaker) or v.get("default") or "zh-CN-XiaoxiaoNeural"
 
 
-def do_voice(cfg, paths, force=False, only=None):
+def _doubao_tts(cfg, txt, dst, rate_pct=0):
+    """豆包 Seed-Audio 语音合成（https://openspeech.bytedance.com/api/v3/tts/create）。
+
+    走 text_prompt：「角色描述 + 台词」一句自然语言，模型自己决定情绪和停顿，
+    比 edge-tts 的逐字朗读强一个量级。返回 (ok, err)。
+    """
+    vcfg = cfg.get("voices") or {}
+    db = vcfg.get("doubao") or {}
+    key = (db.get("key") or "").strip()
+    if not key:
+        return False, "未配置 voices.doubao.key（豆包语音合成 API Key）"
+    style = (db.get("style") or "").strip()
+    tail = (db.get("tail") or "").strip()
+    prompt = "%s“%s”" % (style, txt)
+    if tail:
+        prompt += "。" + tail
+    body = {
+        "model": db.get("model") or "seed-audio-1.0",
+        "text_prompt": prompt,
+        "audio_config": {
+            "format": "mp3",
+            "sample_rate": 48000,
+            "pitch_rate": int(db.get("pitch_rate") or 0),
+            "speech_rate": int(rate_pct),
+            "loudness_rate": int(db.get("loudness_rate") or 0),
+        },
+        "watermark": {},
+    }
+    url = db.get("endpoint") or "https://openspeech.bytedance.com/api/v3/tts/create"
+    attempts = int(db.get("attempts") or 3)
+    last = ""
+    for i in range(attempts):
+        try:
+            req = urllib.request.Request(
+                url, data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json", "X-Api-Key": key})
+            with urllib.request.urlopen(req, timeout=300) as r:
+                d = json.loads(r.read().decode("utf-8"))
+            raw = base64.b64decode(d.get("audio") or "")
+            if not raw:
+                last = "返回里没有 audio 字段：%s" % json.dumps(d, ensure_ascii=False)[:200]
+            else:
+                with open(dst, "wb") as f:
+                    f.write(raw)
+                return True, ""
+        except urllib.error.HTTPError as e:
+            last = "HTTP %s: %s" % (e.code, e.read().decode("utf-8", "ignore")[:200])
+            if e.code in (400, 401, 403):
+                break
+        except Exception as e:
+            last = str(e)[:200]
+        time.sleep(min(20, 3 * (i + 1)))
+    return False, last
+
+
+def _trim_pauses(exe, src, dst, keep=0.45):
+    """把豆包生成的长停顿压到 keep 秒，其余音频原样保留。
+
+    豆包爱插 1.8~2.3 秒的戏，单句独白听着舒服，塞镜头里就超长了。
+    """
+    try:
+        ff_run(exe, ["-y", "-loglevel", "error", "-i", src, "-af",
+                     "silenceremove=start_periods=0:start_silence=0.08:"
+                     "stop_periods=-1:stop_duration=%.2f:stop_silence=%.2f:"
+                     "stop_threshold=-38dB" % (keep, keep),
+                     "-ar", "44100", "-ac", "1", "-b:a", "192k", dst])
+        return True
+    except SystemExit:
+        return False
+
+
+def _tts_one(cfg, voice, txt, dst, rate_pct=None, pitch=None):
+    """跑一次 TTS。provider=edge（默认）走 edge-tts，provider=doubao 走豆包。"""
+    vcfg = cfg.get("voices") or {}
+    if (vcfg.get("provider") or "edge") == "doubao":
+        if rate_pct is None:
+            rate_pct = int(str(vcfg.get("rate") or "0").replace("%", "") or 0)
+        return _doubao_tts(cfg, txt, dst, rate_pct=rate_pct)
+
+    # ---- edge-tts：rate/pitch 必须用 = 连接（+/- 开头会被 argparse 当选项）
+    cmd = [sys.executable, "-m", "edge_tts", "--voice", voice,
+           "--text", txt, "--write-media", dst]
+    if rate_pct is not None:
+        r = "%+d%%" % int(rate_pct)
+    else:
+        r = vcfg.get("rate")
+    if r:
+        cmd += ["--rate=%s" % str(r)]
+    pt = pitch if pitch is not None else vcfg.get("pitch")
+    if pt:
+        cmd += ["--pitch=%s" % str(pt)]
+    # 注意：voices.volume 是混音时的增益倍数（如 1.6），不是 edge-tts 的 "+10%"。
+    # 要给 edge-tts 调音量得写 voices.tts_volume = "+10%"，别拿 volume 直接传。
+    tv = vcfg.get("tts_volume")
+    if tv and "%" in str(tv):
+        cmd += ["--volume=%s" % str(tv)]
+    pr = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if pr.returncode != 0 or not os.path.exists(dst):
+        return False, pr.stderr.decode("utf-8", "ignore")[-200:]
+    return True, ""
+
+
+def _pct(x):
+    return int(round(x))
+
+
+def do_voice(cfg, paths, force=False, only=None, fit=True):
     """把每一镜的 line 用 edge-tts 念成 audio/vo/<sid>.mp3，按角色分配音色。
 
     only：只生成这些镜号（集合）；None = 全部。
+    fit：合成后如果比该镜时长还长，自动提语速重合成（最多提到 base+16%），
+         保证配音一定塞得进画面，不用回头重剪。
     """
     shots = load_json(paths["shots"])["shots"]
     lines = [s for s in shots if (s.get("line") or "").strip()]
@@ -2806,6 +2971,7 @@ def do_voice(cfg, paths, force=False, only=None):
         warn("未安装 edge-tts，跳过配音（pip install edge-tts）")
         return []
     vcfg = cfg.get("voices") or {}
+    exe = have_ffmpeg(cfg)
     vo_dir = os.path.join(paths["audio"], "vo")
     os.makedirs(vo_dir, exist_ok=True)
     stored = load_json(paths["shots"], {"shots": []})
@@ -2822,41 +2988,110 @@ def do_voice(cfg, paths, force=False, only=None):
         for x in (s.get("extra_lines") or []):
             if (x.get("line") or "").strip():
                 parts.append((x.get("speaker") or speaker, x["line"]))
-        tmp_parts = []
-        ok = True
-        for k, (spk, txt) in enumerate(parts):
-            voice = char_voice.get(spk) or _voice_for(cfg, spk)
-            part = dst if len(parts) == 1 else "%s.part%d.mp3" % (dst, k)
-            cmd = [sys.executable, "-m", "edge_tts", "--voice", voice,
-                   "--text", txt, "--write-media", part]
-            if vcfg.get("rate"):
-                cmd += ["--rate=%s" % str(vcfg["rate"])]  # 必须用 = 连接：+/-10% 会被 argparse 当成选项
-            info("%s 配音（%s）：%s" % (sid, voice, txt))
-            pr = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if pr.returncode != 0 or not os.path.exists(part):
-                warn("%s 配音失败：%s" % (sid, pr.stderr.decode("utf-8", "ignore")[-200:]))
-                ok = False
+
+        is_doubao = (vcfg.get("provider") or "edge") == "doubao"
+        if is_doubao:
+            base_rate = float((vcfg.get("doubao") or {}).get("speech_rate") or 0)
+            step, max_rate = 8.0, base_rate + 48
+        else:
+            base_rate = float(str(vcfg.get("rate") or "+0%").replace("%", "") or 0)
+            step, max_rate = 3.0, base_rate + 16
+        limit = float(s.get("duration") or 0) - 0.30
+        rate_now = base_rate
+        attempt = 0
+        while True:
+            tmp_parts = []
+            ok = True
+            for k, (spk, txt) in enumerate(parts):
+                voice = char_voice.get(spk) or _voice_for(cfg, spk)
+                part = "%s.part%d.mp3" % (dst, k)
+                info("%s 配音（%s）：%s" % (sid, voice, txt))
+                good, err = _tts_one(cfg, voice, txt, part, rate_pct=_pct(rate_now))
+                if not good:
+                    warn("%s 配音失败：%s" % (sid, err))
+                    ok = False
+                    break
+                tmp_parts.append(part)
+            if not ok:
                 break
-            tmp_parts.append(part)
-        if not ok:
-            continue
-        if len(tmp_parts) > 1:
-            exe = have_ffmpeg(cfg)
-            if exe:
+
+            # 多句先拼成一整条
+            if len(tmp_parts) == 1:
+                raw = tmp_parts[0]
+            else:
+                raw = dst + ".join.mp3"
                 args = ["-y", "-loglevel", "error"]
                 for tp in tmp_parts:
                     args += ["-i", tp]
                 fc = "".join("[%d:a]" % i for i in range(len(tmp_parts)))
                 args += ["-filter_complex", "%sconcat=n=%d:v=0:a=1[out]" % (fc, len(tmp_parts)),
-                         "-map", "[out]", "-b:a", "160k", dst]
+                         "-map", "[out]", "-b:a", "192k", raw]
                 try:
                     ff_run(exe, args)
                 except SystemExit:
                     warn("%s 多句配音拼接失败" % sid)
-                    continue
+                    ok = False
+                    break
+
+            # 豆包爱插长停顿，先压到 0.45s 再量时长
+            if is_doubao and exe:
+                keep = float((vcfg.get("doubao") or {}).get("trim_pause") or 0.45)
+                trimmed = dst + ".trim.mp3"
+                if _trim_pauses(exe, raw, trimmed, keep=keep):
+                    if os.path.abspath(raw) != os.path.abspath(trimmed):
+                        try:
+                            os.remove(raw)
+                        except Exception:
+                            pass
+                    raw = trimmed
+
+            # 塞不进画面就提语速再来一遍
+            real = ff_duration(raw, exe)
+            if fit and limit > 0 and real > limit and attempt < 6:
+                rate_now = min(max_rate, rate_now + step)
+                info("  %s 配音 %.2fs 超镜长 %.2fs，语速提到 %+d%% 重来"
+                     % (sid, real, limit, _pct(rate_now)))
                 for tp in tmp_parts:
                     try:
                         os.remove(tp)
+                    except Exception:
+                        pass
+                if os.path.exists(raw) and raw != tmp_parts[-1]:
+                    try:
+                        os.remove(raw)
+                    except Exception:
+                        pass
+                attempt += 1
+                continue
+            if fit and limit > 0 and real > limit:
+                warn("%s 配音仍超镜长（%.2fs > %.2fs），建议改成更短的句子" % (sid, real, limit))
+            break
+
+        if not ok:
+            continue
+
+        # 后处理：房间感/压缩/去齿音（项目级 voices.postfilter）
+        pf = (vcfg.get("postfilter") or "").strip()
+        if pf and exe and os.path.exists(raw):
+            try:
+                ff_run(exe, ["-y", "-loglevel", "error", "-i", raw, "-af", pf,
+                             "-ar", "44100", "-ac", "1", "-b:a", "192k", dst])
+            except SystemExit:
+                warn("%s 配音后处理失败，用干声" % sid)
+                shutil.copyfile(raw, dst)
+            for p in tmp_parts + [raw]:
+                if os.path.exists(p) and os.path.abspath(p) != os.path.abspath(dst):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+        else:
+            if os.path.abspath(raw) != os.path.abspath(dst):
+                shutil.move(raw, dst)
+            for p in tmp_parts:
+                if os.path.exists(p) and os.path.abspath(p) != os.path.abspath(dst):
+                    try:
+                        os.remove(p)
                     except Exception:
                         pass
         made.append(dst)
@@ -2866,7 +3101,8 @@ def do_voice(cfg, paths, force=False, only=None):
 
 def cmd_voice(args):
     cfg, paths = load_project(args.dir)
-    do_voice(cfg, paths, force=args.force)
+    do_voice(cfg, paths, force=args.force,
+             fit=not getattr(args, "no_fit", False))
 
 
 # ----------------------------------------------------------------------------- assemble
@@ -3390,12 +3626,23 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
         info("逐段转场 %d 处叠化，合计 %.1fs（音频同步交叉淡化）"
              % (sum(1 for t in trans[1:] if t > 0.05), sum(trans[1:])))
         # xfade 要求各段帧率/尺寸/像素格式一致，先统一
+        # 尺寸按"出现次数最多的那个"当基准（混用 flash / 付费模型时会出现 704 与 720 并存）
+        sizes = [ff_size(c, exe) for c in work]
+        sizes = [s for s in sizes if s]
+        canon = None
+        if sizes:
+            canon = max(set(sizes), key=lambda s: (sizes.count(s), s[0]))
         tr_dir = os.path.join(paths["out"], "_tr")
         os.makedirs(tr_dir, exist_ok=True)
         for i, c in enumerate(work):
             dst = os.path.join(tr_dir, "t%02d.mp4" % i)
+            if canon:
+                vf = ("scale=%d:%d:force_original_aspect_ratio=increase,"
+                      "crop=%d:%d,setsar=1" % (canon[0], canon[1], canon[0], canon[1]))
+            else:
+                vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1"
             ff_run(exe, ["-y", "-loglevel", "error", "-i", c, "-r", "24",
-                         "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1",
+                         "-vf", vf,
                          "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
                          "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k",
                          "-movflags", "+faststart", dst])
@@ -3605,6 +3852,7 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
     norm_dir = os.path.join(paths["out"], "_norm")
     if os.path.isdir(norm_dir):
         shutil.rmtree(norm_dir, ignore_errors=True)
+    normalize_loudness(final, exe)
     info("成片 -> out/final.mp4  (%.1f MB, %.1fs)" % (os.path.getsize(final) / 1e6, total))
     return final
 
@@ -3646,9 +3894,11 @@ def do_audit(cfg, paths):
             "shot_size": s.get("shot_size") or "",
         }
         image_count += (1 if rec["scene"] else 0) + (1 if rec["frame"] else 0)
-        if not rec["scene"]:
+        is_recall = (s.get("kind") == "recall")
+        # 回忆镜是从前几集剪出来的，本来就没有场景板/首帧，别报成缺失
+        if not rec["scene"] and not is_recall:
             issues.append("%s 缺场景图" % sid)
-        if not rec["frame"]:
+        if not rec["frame"] and not is_recall:
             issues.append("%s 缺首帧" % sid)
         if os.path.exists(clip):
             rec["clip"] = True
@@ -3664,13 +3914,15 @@ def do_audit(cfg, paths):
             if m:
                 rec["fps"] = m.group(1)
             rec["audio"] = "Audio:" in txt
+            is_vo = (rec["speaker"] or "").upper() == "VO"
             if rec["audio"]:
                 rec["speech"] = detect_speech(cfg, clip, exe)
             if abs(d - planned) > 1.5:
                 issues.append("%s 实际 %.2fs 与计划 %ds 相差超过 1.5s" % (sid, d, planned))
-            if rec["line"] and not rec["speech"]:
+            # VO（画外音/独白）是后期 TTS 贴上去的，片段里本来就没这条人声
+            if rec["line"] and not rec["speech"] and not is_vo:
                 issues.append("%s 有台词但未检测到人声" % sid)
-            if rec["speech"] and d > 0 and rec["speech"][0][0] > 0.45 * d:
+            if rec["speech"] and d > 0 and rec["speech"][0][0] > 0.45 * d and not is_vo:
                 issues.append("%s 台词到 %.1fs 才开口（占 %.0f%%），前段空等，合成前建议收紧"
                               % (sid, rec["speech"][0][0], 100.0 * rec["speech"][0][0] / d))
             if rec["res"] and rec["res"] not in ("704x1280", "720x1280"):
@@ -3754,6 +4006,8 @@ def do_audit(cfg, paths):
     for sh in shots:
         sc = sh.get("scene") or {}
         key = scene_key(sh)
+        if sh.get("kind") == "recall":
+            continue  # 回忆镜沿用前几集素材，自己的场景/机位描述没意义
         seen_scene.setdefault(key, sc)
         if len(sc.get("set") or []) < 4:
             script_issues.append("%s 的场景 %s 陈设不足（set 少于 4 条）" % (sh["id"], key))
@@ -5342,6 +5596,8 @@ def main():
     p = sub.add_parser("voice", help="按台词生成配音（edge-tts，按角色分配音色）")
     p.add_argument("dir")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--no-fit", action="store_true",
+                   help="不做「超镜长自动提语速」，按配置语速原样出")
     p.set_defaults(func=cmd_voice)
 
     p = sub.add_parser("assemble", help="拼接 + 混音出成片（字幕默认关闭）")

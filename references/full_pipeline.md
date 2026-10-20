@@ -386,6 +386,24 @@ python scripts/ac.py recall <本集目录> --only S04,S09 --force
 
 ---
 
+## 配音（贯穿阶段 7~13，随时可跑）
+
+```bash
+python scripts/ac.py voice "<dir>"                 # 全片配音
+python scripts/ac.py voice "<dir>" --only S04,S09   # 只补几镜
+python scripts/ac.py voice "<dir>" --no-fit         # 关掉「超镜长自动提语速」
+```
+
+- 走**豆包 TTS**（火山引擎语音合成），中文音色比 edge-tts 自然；音色按角色自动分配，
+  语速/音调在配置页「配音」TAB 调。
+- **默认开着时长适配**：某镜的台词念完镜头还没结束，自动提语速把话塞进镜内；提速后仍超长，
+  才裁掉句首句尾多余的停顿。目的是台词不会被下一个镜头切断——**配音做完后不要再手改 `duration`**，
+  否则适配就白做了。
+- 某镜模型自己念了台词、念得清楚，就别再叠 TTS（该镜写 `"tts": true` 表示"只留 TTS"，
+  或者合成时去掉 `--voice`）。两重人声是最常见的翻车点。
+
+---
+
 ## 阶段 8 · 质检（这步不能省）
 
 不能只看日志说"完成"。两个动作：
@@ -566,8 +584,8 @@ python scripts/ac.py status "<dir>"
 | 项 | 标准 | 怎么测 |
 |---|---|---|
 | 时长 | 落在用户要求区间（±10s） | `ffmpeg -i out/final.mp4` 看 Duration |
-| 画幅 | 704×1280 竖屏 | 同上 |
-| 响度 | −16 ~ −17 LUFS，峰值 ≤ −1 dBTP | `ffmpeg -af loudnorm=I=-16:TP=-1.5:print_format=summary -f null -` |
+| 画幅 | 704×1280 或 720×1280 竖屏（同片统一） | 同上；flash 出 704，付费版出 720，混用由转场前统一尺寸兜住 |
+| 响度 | −16 ~ −17 LUFS，峰值 ≤ −1 dBTP | `ffmpeg -i out/final.mp4 -af loudnorm=print_format=summary -f null -`，看 **Input Integrated / Input True Peak**（`assemble` 结束会自动做一次归一并打印） |
 | 字幕 | 每句单排、在对应台词处 | 抽帧 |
 | 人声 | 每句台词都真实出现 | 抽音轨转写 |
 | 转场 | 该叠化的地方有过渡，不是硬切 | 抽转场中间帧 |

@@ -2,7 +2,7 @@
 name: agnes-clip
 description: 用 Agnes 云端算力全自动做竖屏短剧/长视频——一句话创意 → 编剧（场景/动作/微表情/对白/口型）→ 分镜表 → 角色定妆图 → 道具图 → 场景板 → 逐镜首帧 → 批量提交 agnes-video-2.5-flash 出视频 → 质检 → 配乐/音效/转场/逐句字幕 → 拼成一条完整成片。含 15 阶段完整作业流程（references/full_pipeline.md）与多集共享角色库（同一系列第 2、3 集复用同一张脸，不重新生成）。当用户要用 Agnes 生成视频、要"从剧本到成片全自动"、要写有对白会说话的短剧、要锁住人物脸做多镜头连续剧/系列剧、要批量提交视频任务、问"这个 skill 怎么用/怎么配置/怎么启动/装完怎么跑"、要打开配置界面配出图或视频的端点和 Key、要给项目切换出图通道（Agnes / GPT Image / 自定义 OpenAI 兼容）时使用。模型：agnes-video-2.5-flash（视频）+ agnes-image-2.5-flash（图片）+ agnes-2.5-flash（编剧）。配乐两条通道可选：本地 ComfyUI（MiniMax Music3）或火山引擎 AI 音乐生成（豆包音乐模型，无显卡也能跑，0.002 元/秒）。
 agent_created: true
-version: 1.1.0
+version: 1.2.0
 ---
 
 # Agnes Clip · 一句话到成片（平哥分享版）
@@ -779,6 +779,8 @@ python <skill-creator>/scripts/quick_validate.py <skill目录>   # 必须输出 
 | **一句台词显示成两排** | 播放器自动折行 | 改 `shot.subs` 逐句手写，14 字拆两条，`WrapStyle=2` |
 | **旁白有两重人声** | 模型念了一遍 + TTS 又混一遍 | 该镜音轨换静音只留 TTS，或去掉 `--voice` |
 | **台词后的表演被剪掉** | tighten 按「人声结束+0.9s」裁尾 | 该镜 `"tighten": false`（拿不准就全片关） |
+| **叠化报 `size 704x1280 do not match 720x1280`** | 同一片里混了 flash（704）和付费版（720） | 已修：转场前统一按「出现最多的尺寸」缩放+裁切 |
+| **flash 提交一直 429/503** | 免费额度排队 | 换 `agnes-video-2.5`（付费，同接口）；并发额度是账号级，别同时开两个 `video` 进程 |
 | **桌上多出剧本没有的食物** | 首帧提示词写过 / `scene.set` 漏 / 旧的全局面馆锚 | 改 prompt 明令禁止该道具，重跑该镜 frame+video |
 | **同一镜出现两个同一人** | 过肩镜把前景那张脸也喂进参考图 | `faces` 只留露脸的人 |
 | **每镜都换一间店** | 场景板按镜头出而非按机位 | 写 `scene.set` + `scene.angles` 后 `scene-gen --force` |

@@ -1,8 +1,12 @@
 ---
 name: agnes-clip
+display_name: 一句话成片
+display_name_en: One-Line to Clip
 description: 用 Agnes 云端算力全自动做竖屏短剧/长视频——一句话创意 → 编剧（场景/动作/微表情/对白/口型）→ 分镜表 → 角色定妆图 → 道具图 → 场景板 → 逐镜首帧 → 批量提交 agnes-video-2.5-flash 出视频 → 质检 → 配乐/音效/转场/逐句字幕 → 拼成一条完整成片。含 15 阶段完整作业流程（references/full_pipeline.md）与多集共享角色库（同一系列第 2、3 集复用同一张脸，不重新生成）。当用户要用 Agnes 生成视频、要"从剧本到成片全自动"、要写有对白会说话的短剧、要锁住人物脸做多镜头连续剧/系列剧、要批量提交视频任务、问"这个 skill 怎么用/怎么配置/怎么启动/装完怎么跑"、要打开配置界面配出图或视频的端点和 Key、要给项目切换出图通道（Agnes / GPT Image / 自定义 OpenAI 兼容）时使用。模型：agnes-video-2.5-flash（视频）+ agnes-image-2.5-flash（图片）+ agnes-2.5-flash（编剧）。配乐两条通道可选：本地 ComfyUI（MiniMax Music3）或火山引擎 AI 音乐生成（豆包音乐模型，无显卡也能跑，0.002 元/秒）。
+description_zh: 一句话创意自动做成有对白、会说话的竖屏短剧。全流程 15 步：写剧本、分镜、角色定妆、场景板、逐镜首帧、批量出视频、配乐音效字幕、合成成片，人脸全程锁死不怕换脸。视频走云端算力，不占本地显卡。适合做催泪短剧、漫剧、系列连续剧，也支持同系列多集复用同一张脸。
+description_en: Turn a one-line idea into a vertical short drama with real dialogue. A 15-stage pipeline handles scripting, storyboarding, character sheets, scene boards, first frames, batch video generation, music, sound effects, subtitles and final cut — with character faces locked across every shot so nobody switches faces mid-story. Video runs on cloud GPUs, so no local hardware needed. Great for tearjerkers, anime shorts and serialized episodes that reuse the same face across episodes.
 agent_created: true
-version: 1.2.0
+version: 1.2.1
 ---
 
 # Agnes Clip · 一句话到成片（平哥分享版）

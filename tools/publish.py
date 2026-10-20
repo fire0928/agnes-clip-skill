@@ -150,18 +150,34 @@ def main():
     # 1. 远端对齐
     print("\n[1/5] 对齐远端")
     git("remote", "set-url", "origin", REPO)
-    code, out = git("fetch", "origin", must=False)
+    code, out = git("fetch", "origin", "main", must=False)
     if code != 0:
         warn("拉取远端失败（首次发布正常，继续）")
-    else:
-        _, br = git("rev-parse", "--abbrev-ref", "HEAD", must=False)
-        code, out = git("rev-list", "--count", "HEAD..origin/main", must=False)
-        behind = (out or "0").strip()
-        if behind.isdigit() and int(behind) > 0:
-            ok("远端有 %s 个新提交，先合并" % behind)
-            git("merge", "--no-edit", "origin/main", must=False)
+
+    # 分支名必须叫 main，且要把远端历史接在本地前面，
+    # 否则新机器上会出现 src refspec main does not match any
+    cur = (git("branch", "--show-current", must=False)[1] or "").strip()
+    if cur and cur != "main":
+        git("branch", "-m", "main")
+        ok("分支名 %s -> main" % cur)
+        cur = "main"
+
+    if code == 0:
+        _, has = git("rev-parse", "--verify", "origin/main", must=False)
+        if has.strip() == "0" or not has.strip():
+            # 远端有提交、本地还没有 → 把本地接到远端后面（不动工作区文件）
+            code2, _ = git("rev-list", "--count", "origin/main", must=False)
+            if code2 == 0:
+                git("reset", "--soft", "origin/main", must=False)
+                ok("本地历史已接到远端 main 之后")
         else:
-            ok("已是最新")
+            _, behind = git("rev-list", "--count", "HEAD..origin/main", must=False)
+            b = (behind or "0").strip()
+            if b.isdigit() and int(b) > 0:
+                ok("远端有 %s 个新提交，先合并" % b)
+                git("merge", "--no-edit", "origin/main", must=False)
+            else:
+                ok("已是最新")
 
     # 2. 安全体检
     print("\n[2/5] 安全检查")

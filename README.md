@@ -4,6 +4,8 @@
 
 视频走云端算力，不占本地显卡。**全程不需要你手动切流程**，但每一步都留了验收门 —— 出问题能立刻定位到是哪一环。
 
+> 当前版本 **v1.1.0**：配乐新增第二条通道（火山引擎 AI 音乐生成），没有显卡也能出配乐。
+
 ---
 
 ## 三步装完就能用
@@ -79,7 +81,7 @@ python ~/.workbuddy/skills/agnes-clip-平哥分享版/scripts/ac.py setup
 | **推理编剧** | 写剧本用的模型和端点 |
 | **生视频** | 视频模型、并发数、时长 |
 | **配音** | 音色映射、语速 |
-| **配乐** | 配乐模型和授权 |
+| **配乐** | 通道二选一（ComfyUI / 火山引擎）+ 各自参数、默认时长、默认提示词 |
 | **系统** | 其它杂项 |
 
 改完点「保存配置」写进全局配置，立刻生效。
@@ -101,6 +103,37 @@ python ~/.workbuddy/skills/agnes-clip-平哥分享版/scripts/ac.py setup
 
 ---
 
+## 配乐：两条通道，按有没有显卡选
+
+配乐是本 skill 里唯一「必须有算力」的一环。现在有两条路，出口都是 `audio/bgm.mp3`，后面的逐镜调音量、配乐台、合成都一模一样。
+
+| 通道 | 走什么 | 什么时候用 | 成本 |
+|---|---|---|---|
+| **ComfyUI**（默认） | 本地/远程 ComfyUI + MiniMax Music3，一条片子一次出完 | 有显卡、卡空着 | 0（自己的电） |
+| **火山引擎** | AI 音乐生成（豆包音乐模型）OpenAPI | 没卡、卡在排队、赶时间 | **0.002 元/秒**，100 秒约两毛 |
+
+### 切到火山只要三步
+
+1. 去火山控制台右上角「密钥管理」新建一对 **AccessKey / SecretKey**（建议用子账号），顺便在「AI 音乐生成」控制台把**按时长后付费**开关打开。
+2. 打开 `/配置` → 「配乐」TAB → 通道选 **火山引擎** → 填 AK/SK → 点**测试连接**（显示「签名通过」就对了）。
+3. 照常 `music` 或 `auto --music`。
+
+只想试一次、不改全局：
+
+```bash
+python scripts/ac.py music <项目目录> --provider volc --duration 104 --caption "felt piano, low strings, 58bpm, minor"
+```
+
+### 三件必须先知道的事
+
+- **纯音乐单次最多 60 秒**。片子更长时脚本会自动切段（每段留 2 秒交叉淡化重叠）再拼回一条，最后统一做响度归一化。代价是段与段之间能听出"换段"——**能用 ComfyUI 一次出整条，就别分段**。
+- **两个计费入口不互通**：`GenBGMForTime`（按时长后付费）和 `GenBGM`（套餐包）。本 skill 默认走前者。走错会报 `200028 没有可用资源包`。
+- **描述用中文写具体**。v5.0 不再支持"曲风/情绪/乐器"这类打勾选项，全靠一段文字；写"温暖治愈"这种通用词容易撞版权校验（`50000001`），写清乐器、节奏、场景、情绪反而稳。
+
+报错对照表、签名细节、接口字段都在 [`providers/volc_music.md`](providers/volc_music.md)。
+
+---
+
 ## 完整工作流（15 步）
 
 | # | 阶段 | 命令 | 产出 | 验收门 |
@@ -114,7 +147,7 @@ python ~/.workbuddy/skills/agnes-clip-平哥分享版/scripts/ac.py setup
 | 6 | 首帧 | `frame` | `frames/S*.jpg` | 人数对、无多余人、左右站位对 |
 | 7 | 视频 | `video --wait` | `clips/S*.mp4` | 段数 = 镜数 |
 | 8 | 质检 | 抽帧 + 音轨转写 | `qa/` | 台词真念了、没穿帮、没跳轴 |
-| 9 | 配乐 | `music` → `music-ui` | `audio/bgm.mp3` | loudnorm 归一化、时长够 |
+| 9 | 配乐 | `music` → `music-ui` | `audio/bgm.mp3` | loudnorm 归一化、时长够；火山通道 >60s 自动分段 |
 | 10 | 音效 | 真素材 | `audio/sfx/` | 落点卡转折处，峰值 ≈ −16dB |
 | 11 | 转场 | 写 `shot.x` | 合成时生效 | 硬切统一 0.1s |
 | 12 | 字幕 | 写 `shot.subs` | `out/_subs_shots.ass` | 每句一排、≤14 字 |
@@ -143,7 +176,8 @@ $AC frame <项目目录>                    # 出首帧
 $AC video <项目目录> --wait             # 出视频
 $AC video <项目目录> --only S07 --wait  # 单镜重跑
 $AC voice <项目目录>                    # 配音
-$AC music <项目目录>                    # 配乐
+$AC music <项目目录>                    # 配乐（走配置里的通道）
+$AC music <项目目录> --provider volc --duration 104   # 临时改走火山引擎
 $AC music-ui --dir <项目目录>            # 配乐台
 $AC assemble <项目目录> --subs --voice  # 合成
 $AC audit <项目目录>                    # 审计报告
@@ -220,6 +254,15 @@ ffmpeg -i out/final.mp4 -af ebur128=peak=true -f null -
 ffmpeg -i audio/bgm.mp3 -af loudnorm=I=-23:TP=-2:LRA=7 fixed.mp3
 ```
 
+**Q：火山配乐报 `200028`**
+A：不是代码问题，是账号侧。两个原因：① 控制台没打开「按时长后付费」；② 调错了入口——本 skill 默认 `GenBGMForTime`（后付费），如果你买的是套餐包要改成 `GenBGM`，两个入口额度不互通。
+
+**Q：火山配乐报 `50000001`**
+A：版权/相似度校验没过。把提示词写具体（乐器 + 节奏 + 情绪 + 场景，用中文），或在配置里打开 `rewrite`（`EnableInputRewrite`）。提示词只写"温暖治愈的钢琴"这种通用描述，命中率最高。
+
+**Q：火山配乐超过 60 秒怎么出的**
+A：脚本按公式算出段数（102.6 秒 → 2 段 × 52.3 秒），逐段生成后交叉淡化 2 秒拼回一条。**段与段之间会有"换段"感**，这是接口 60 秒上限带来的，不是 bug；能一次出整条就别分段。
+
 **Q：字幕和台词对不上**
 A：用 `shot.subs` 逐句写（相对时间 `t`/`d`），比 VAD 自动字幕准得多。合成时加 `--subs`。
 
@@ -248,12 +291,29 @@ agnes-clip-平哥分享版/
 │   ├── story_design.md     故事结构设计
 │   ├── prompt_template.md  提示词模板
 │   └── camera_setups.md    12 种运镜语言
-├── providers/agnes.md      Agnes 平台说明
+├── providers/
+│   ├── agnes.md            Agnes 平台说明
+│   └── volc_music.md       火山引擎音乐生成（签名 / 接口 / 错误码）
 └── scripts/
     ├── ac.py               主程序（所有命令都在这）
-    ├── sfx.py              音效处理
+    ├── sfx.py              音效合成库
     └── music_ui.html       配乐台页面
 ```
+
+---
+
+## 版本记录
+
+### v1.1.0（2026-10-20）
+
+- **配乐新增火山引擎通道**：`music --provider volc`，无显卡也能出配乐（0.002 元/秒）。含 V4 签名实现、提交/轮询、JSON 转 WAV、超 60 秒自动切段 + `acrossfade` 拼接 + 统一 loudnorm。
+- 配置界面「配乐」TAB 拆成「通道 / ComfyUI 参数 / 火山参数 / 通用」四块，切换通道自动收起无关项；「测试连接」按通道分流（火山用 `QuerySong` 空任务验签名）。
+- `setup` 支持 `--music-provider` / `--volc-ak` / `--volc-sk`，交互式向导也会问。
+- 新增 `providers/volc_music.md`：接口字段、签名推导（中间密钥二进制）、错误码对照、分段策略。
+
+### v1.0.0（2026-10-20 之前）
+
+- 首个可分发版本：15 阶段全流程、共享角色库、配乐台、音效合成、转场、逐句字幕。
 
 ---
 

@@ -26,6 +26,8 @@ import argparse
 import base64
 import json
 import math
+import hashlib
+import hmac
 import os
 import re
 import shutil
@@ -106,7 +108,10 @@ DEFAULT_AGNES = {
 }
 
 DEFAULT_MUSIC = {
-    # 可选配乐：ComfyUI + MiniMax Music3。不需要配乐可留空。
+    # 可选配乐：两条通道，provider 决定走哪条。
+    #   comfyui = 本地/远程 ComfyUI + MiniMax Music3（有显卡时用，不花钱）
+    #   volc    = 火山引擎 AI 音乐生成（豆包音乐模型，按时长计费，无卡也能跑）
+    "provider": "comfyui",
     "endpoint": "",
     "auth": "",
     "unet": "minimax_music3_dit_int8_convrot.safetensors",
@@ -116,6 +121,23 @@ DEFAULT_MUSIC = {
     "cfg": 1.8,
     "duration": 100,
     "caption": "Cinematic instrumental score, warm strings and soft piano, gentle percussion, emotional and healing, 70 BPM",
+    # 火山引擎「AI 音乐生成」（豆包音乐模型）OpenAPI
+    "volc": {
+        "ak": "",
+        "sk": "",
+        # GenBGMForTime = 按时长后付费；GenBGM = 套餐包。两个入口不互通，默认走后付费。
+        "action": "GenBGMForTime",
+        "api_version": "2024-08-12",
+        "model_version": "v5.0",
+        "region": "cn-beijing",
+        "service": "imagination",
+        "host": "open.volcengineapi.com",
+        # 纯音乐单次官方上限 60 秒，超长自动分段生成再交叉淡化拼接
+        "chunk_max": 60,
+        "poll_interval": 8,
+        "timeout": 900,
+        "rewrite": False,
+    },
 }
 
 DEFAULT_VOICES = {
@@ -658,10 +680,87 @@ def gpt_image_generate(cfg, prompt, ref_paths=None, size=None, ratio=None,
     die("GPT Image 生图失败: " + last)
 
 
+def banana_image_generate(cfg, prompt, ref_paths=None, size=None, ratio=None,
+                          project_paths=None, fallback=True):
+    """Nano Banana 通道（Gemini 原生 generateContent，apibase.cc 网关）。
+
+    和另外两条通道的差别：
+    - 协议是 Gemini 原生，不是 OpenAI 的 /images/generations，也不是 /chat/completions；
+    - 参考图走 parts[].inlineData（base64 + mimeType），顺序就是"主人脸、场景板"；
+    - 尺寸是 imageSize(1K/2K/4K) + aspectRatio，不是像素值。
+    """
+    b = cfg.get("banana") or {}
+    endpoint = (b.get("endpoint") or "https://apibase.cc").rstrip("/")
+    key = b.get("key") or ""
+    model = b.get("model") or "nano-banana-pro"
+    image_size = (size or b.get("image_size") or "2K").strip()
+    if "x" in image_size.lower():          # 误填像素值时换算回 1K/2K
+        image_size = "2K" if image_size.lower().startswith("1536") else "1K"
+    rt = (ratio or b.get("ratio") or "9:16").strip()
+    if not key:
+        if fallback:
+            warn("banana 通道没有 key，回退 Agnes 出图")
+            return agnes_image_generate(cfg, prompt, ref_paths=ref_paths, size=size,
+                                        ratio=ratio, project_paths=project_paths,
+                                        force_channel="agnes")
+        die("banana 通道缺少 key（~/.workbuddy/agnes-clip.json 的 banana.key）")
+
+    parts = [{"text": prompt}]
+    for p in (ref_paths or []):
+        if not p:
+            continue
+        ext = os.path.splitext(p)[1].lower()
+        mime = {".png": "image/png", ".webp": "image/webp"}.get(ext, "image/jpeg")
+        with open(p, "rb") as f:
+            parts.append({"inlineData": {"mimeType": mime,
+                                         "data": base64.b64encode(f.read()).decode("ascii")}})
+    payload = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "responseModalities": ["IMAGE"],
+            "imageConfig": {"imageSize": image_size, "aspectRatio": rt},
+        },
+    }
+    url = endpoint + "/v1beta/models/%s:generateContent" % model
+    headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
+    headers.update(_browser_headers(endpoint))
+    last = ""
+    for attempt in range(3):
+        try:
+            d = http_json(url, payload, headers=headers, timeout=240)
+            cands = d.get("candidates") or []
+            for c in cands:
+                for part in ((c.get("content") or {}).get("parts") or []):
+                    inline = part.get("inlineData") or part.get("inline_data") or {}
+                    if inline.get("data"):
+                        return base64.b64decode(inline["data"]), \
+                            {"provider": "banana", "model": model}
+            last = json.dumps(d, ensure_ascii=False)[:400]
+            break
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "ignore")
+            last = "HTTP %s: %s" % (e.code, body[:400])
+            if e.code in (400, 401, 403, 404):
+                break
+            time.sleep(min(20, 4 * (attempt + 1)))
+        except Exception as e:
+            last = str(e)
+            time.sleep(min(20, 4 * (attempt + 1)))
+    if fallback:
+        print("[ac] banana 通道失败（%s），自动回退 Agnes 出图" % last[:160], flush=True)
+        return agnes_image_generate(cfg, prompt, ref_paths=ref_paths, size=size,
+                                    ratio=ratio, project_paths=project_paths,
+                                    force_channel="agnes")
+    die("banana 生图失败: " + last)
+
+
 def agnes_image_generate(cfg, prompt, ref_paths=None, size=None, ratio=None,
                          project_paths=None, force_channel=None):
-    """agnes-image-2.5-flash：文生图 / 图生图（参考图 base64 data URI）。"""
+    """统一生图入口：按项目/全局配置走 banana / gpt-image / agnes 三条通道之一。"""
     ch = force_channel or image_channel(cfg, project_paths)
+    if ch in ("banana", "nano-banana", "gemini"):
+        return banana_image_generate(cfg, prompt, ref_paths=ref_paths, size=size,
+                                     ratio=ratio, project_paths=project_paths)
     if ch in ("gpt-image", "openai"):
         return gpt_image_generate(cfg, prompt, ref_paths=ref_paths, size=size, ratio=ratio,
                                   project_paths=project_paths)
@@ -851,7 +950,7 @@ def build_music_workflow(mus_cfg, caption, duration, seed):
     }
 
 
-def do_music(cfg, paths, duration=None, caption=None, seed=None):
+def do_music_comfy(cfg, paths, duration=None, caption=None, seed=None):
     m = cfg.get("music") or {}
     if not m.get("endpoint"):
         die("未配置配乐 ComfyUI 端点（music.endpoint）。不需要配乐可跳过，assemble 会输出无配乐版")
@@ -874,9 +973,260 @@ def do_music(cfg, paths, duration=None, caption=None, seed=None):
     info("配乐 -> audio/bgm.mp3 (%.1f MB)" % (len(raw) / 1e6))
 
 
+# ----------------------------------------------------------------------------- music · 火山引擎
+# 火山引擎「AI 音乐生成」（豆包音乐模型）OpenAPI。
+# 签名为火山自有 V4：中间密钥是【二进制】，不是十六进制（官方文档示例可直接反推验证）。
+# 两个入口不互通：GenBGMForTime = 按时长后付费，GenBGM = 套餐包。走错报 200028。
+
+VOLC_ERR_HINT = {
+    "200028": "没有可用资源包 / 未开通「按时长计费」。去 AI 音乐生成控制台把后付费开关打开，"
+              "或确认调的是 GenBGMForTime 而不是套餐包的 GenBGM",
+    "50000001": "版权相似度校验没通过。把 Text 写具体（乐器/情绪/场景/节奏），或开 music.volc.rewrite",
+    "InvalidAccessKey": "AccessKey 不存在，核对 AK",
+    "SignatureDoesNotMatch": "签名不匹配，通常是 SK 填错或本机时间偏差超过 5 分钟",
+}
+
+
+def _volc_cfg(cfg):
+    m = cfg.get("music") or {}
+    vc = dict(DEFAULT_MUSIC["volc"])
+    vc.update({k: v for k, v in (m.get("volc") or {}).items() if v not in (None, "")})
+    return vc
+
+
+def _volc_sign(vc, payload, action, api_version):
+    """返回 (要发的 headers, query string)。Host 只参与签名，不放发送头里由 urllib 自己补。"""
+    ak = (vc.get("ak") or "").strip()
+    sk = (vc.get("sk") or "").strip()
+    if not ak or not sk:
+        die("火山配乐缺 AK/SK。跑 `ac.py setup` 或配置界面「配乐」TAB 填 AccessKey / SecretKey")
+    region = vc.get("region") or "cn-beijing"
+    service = vc.get("service") or "imagination"
+    host = vc.get("host") or "open.volcengineapi.com"
+    t = time.gmtime()
+    xdate = time.strftime("%Y%m%dT%H%M%SZ", t)
+    short = xdate[:8]
+    query = "Action=%s&Version=%s" % (urllib.parse.quote(action, safe=""),
+                                      urllib.parse.quote(api_version, safe=""))
+    payload_hash = hashlib.sha256(payload).hexdigest()
+    signed_headers = "content-type;host;x-content-sha256;x-date"
+    canonical = "\n".join([
+        "POST", "/", query,
+        "content-type:application/json",
+        "host:" + host,
+        "x-content-sha256:" + payload_hash,
+        "x-date:" + xdate,
+        "", signed_headers, payload_hash,
+    ])
+    scope = "%s/%s/%s/request" % (short, region, service)
+    sts = "\n".join(["HMAC-SHA256", xdate, scope,
+                     hashlib.sha256(canonical.encode("utf-8")).hexdigest()])
+
+    def _h(key, msg):
+        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    k = _h(sk.encode("utf-8"), short)
+    k = _h(k, region)
+    k = _h(k, service)
+    k = _h(k, "request")
+    sig = hmac.new(k, sts.encode("utf-8"), hashlib.sha256).hexdigest()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Date": xdate,
+        "X-Content-Sha256": payload_hash,
+        "Authorization": "HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s"
+                         % (ak, scope, signed_headers, sig),
+    }
+    return headers, query
+
+
+def volc_request(vc, action, body, timeout=90):
+    host = vc.get("host") or "open.volcengineapi.com"
+    api_version = vc.get("api_version") or "2024-08-12"
+    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    headers, query = _volc_sign(vc, payload, action, api_version)
+    url = "https://%s/?%s" % (host, query)
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "ignore"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "ignore")
+        try:
+            return json.loads(raw)
+        except Exception:
+            die("火山接口 HTTP %s: %s" % (e.code, raw[:400]))
+    except Exception as e:
+        die("火山接口连不上（%s）：%s" % (host, e))
+
+
+def _volc_error(d):
+    err = ((d or {}).get("ResponseMetadata") or {}).get("Error") or {}
+    code = str(err.get("Code") or "").strip()
+    if not code:
+        return None
+    msg = err.get("Message") or ""
+    hint = VOLC_ERR_HINT.get(code)
+    for k, v in VOLC_ERR_HINT.items():
+        if k.lower() in code.lower():
+            hint = v
+            break
+    return "%s %s%s" % (code, msg, ("\n  → " + hint) if hint else "")
+
+
+def _volc_prompt(caption, idx, total):
+    """分段时给模型一点接续提示，否则每段都像重新开头。"""
+    base = (caption or "").strip()
+    if total <= 1:
+        return base
+    if idx == 1:
+        tail = "这是同一首曲子的第 1 段（共 %d 段），安静铺陈，结尾不要收死，留给下一段接上" % total
+    elif idx == total:
+        tail = "这是同一首曲子的最后一段（第 %d/%d 段），承接上一段的乐器与调性，情绪收拢，自然收尾" % (idx, total)
+    else:
+        tail = ("这是同一首曲子的第 %d/%d 段，保持和上一段相同的乐器编制、调性与速度，"
+                "小幅递进，不要出现明显的重新起段" % (idx, total))
+    return (base + "。" if base else "") + tail + "。纯器乐，无人声。"
+
+
+def volc_music_chunk(vc, text, seconds):
+    body = {"Text": text, "Duration": int(round(seconds)),
+            "Version": vc.get("model_version") or "v5.0"}
+    if vc.get("rewrite"):
+        body["EnableInputRewrite"] = True
+    action = vc.get("action") or "GenBGMForTime"
+    d = volc_request(vc, action, body)
+    e = _volc_error(d)
+    if e:
+        die("火山配乐提交失败：\n  " + e)
+    res = d.get("Result") or {}
+    tid = res.get("TaskID") or res.get("TaskId") or (d.get("TaskID") or "")
+    if not tid:
+        die("火山配乐没返回 TaskID：" + json.dumps(d, ensure_ascii=False)[:400])
+    info("  任务 %s 已提交（%d 秒），轮询中 ..." % (str(tid)[:18], int(round(seconds))))
+    t0 = time.time()
+    interval = float(vc.get("poll_interval") or 8)
+    limit = float(vc.get("timeout") or 900)
+    while time.time() - t0 < limit:
+        time.sleep(interval)
+        q = volc_request(vc, "QuerySong", {"TaskID": tid})
+        qe = _volc_error(q)
+        if qe:
+            die("火山配乐查询失败：\n  " + qe)
+        r = q.get("Result") or {}
+        st = r.get("Status")
+        if st == 2:
+            detail = r.get("SongDetail") or {}
+            url = detail.get("AudioUrl") or ""
+            if not url:
+                die("火山配乐成功但没给 AudioUrl")
+            return url, detail.get("Duration")
+        if st == 3:
+            fr = r.get("FailureReason") or {}
+            msg = "%s %s" % (fr.get("Code"), fr.get("Msg") or "")
+            hint = VOLC_ERR_HINT.get(str(fr.get("Code")), "")
+            die("火山配乐生成失败：%s%s" % (msg, ("\n  → " + hint) if hint else ""))
+        info("  生成中 %ds（状态 %s）" % (int(time.time() - t0), st))
+    die("火山配乐等待超时（%ds）" % int(limit))
+
+
+def _audio_to_wav(cfg, src, dst):
+    exe = have_ffmpeg(cfg)
+    if not exe:
+        die("拼接配乐需要 ffmpeg，但没找到")
+    ff_run(exe, ["-y", "-loglevel", "error", "-i", src, "-vn",
+                 "-ar", "44100", "-ac", "2", dst])
+    return dst
+
+
+def _stitch_bgm(cfg, parts, out_mp3, target, fade=2.0):
+    """多段交叉淡化拼成一条，再做响度归一化 —— 归一化必须在拼接之后。"""
+    exe = have_ffmpeg(cfg)
+    if not exe:
+        die("拼接配乐需要 ffmpeg，但没找到")
+    os.makedirs(os.path.dirname(os.path.abspath(out_mp3)), exist_ok=True)
+    tmp = out_mp3 + ".stitch.wav"
+    if len(parts) == 1:
+        ff_run(exe, ["-y", "-loglevel", "error", "-i", parts[0], "-t", "%.2f" % target,
+                     "-ar", "44100", "-ac", "2", tmp])
+    else:
+        args = []
+        for p in parts:
+            args += ["-i", p]
+        chain = []
+        prev = "[0:a]"
+        for i in range(1, len(parts)):
+            lab = "[x%d]" % i
+            chain.append("%s[%d:a]acrossfade=d=%.2f:c1=tri:c2=tri%s" % (prev, i, fade, lab))
+            prev = lab
+        args += ["-filter_complex", ";".join(chain), "-map", prev,
+                 "-t", "%.2f" % target, "-ar", "44100", "-ac", "2", tmp]
+        ff_run(exe, ["-y", "-loglevel", "error"] + args)
+    ff_run(exe, ["-y", "-loglevel", "error", "-i", tmp,
+                 "-af", "loudnorm=I=-23:TP=-2:LRA=7",
+                 "-c:a", "libmp3lame", "-b:a", "192k", out_mp3])
+    try:
+        os.remove(tmp)
+    except Exception:
+        pass
+    return out_mp3
+
+
+def do_music_volc(cfg, paths, duration=None, caption=None):
+    vc = _volc_cfg(cfg)
+    m = cfg.get("music") or {}
+    duration = float(duration or m.get("duration", 100))
+    caption = caption or m.get("caption")
+    chunk_max = float(vc.get("chunk_max") or 60)
+    fade = 2.0
+    # 纯音乐单次官方上限 60 秒；超长就切成 n 段，每段留出交叉淡化的重叠
+    n, each = 1, duration
+    for cand in range(1, 13):
+        per = (duration + fade * (cand - 1)) / cand
+        if per <= chunk_max + 1e-6:
+            n, each = cand, per
+            break
+    else:
+        die("配乐时长 %.0f 秒太长，分段也算不下（上限 %d 段）" % (duration, 12))
+    info("火山引擎配乐：%.0f 秒，分 %d 段（每段 %.0f 秒，交叉淡化 %.0f 秒）"
+         % (duration, n, each, fade))
+    tmpdir = os.path.join(paths["audio"], "_volc")
+    os.makedirs(tmpdir, exist_ok=True)
+    parts = []
+    for i in range(1, n + 1):
+        text = _volc_prompt(caption, i, n)
+        url, real = volc_music_chunk(vc, text, each)
+        raw_path = os.path.join(tmpdir, "part%d.raw" % i)
+        download_file(url, raw_path, timeout=300)
+        with open(raw_path, "rb") as f:
+            head = f.read(4)
+        # 服务端实际返 WAV（Content-Type 常被标成 video/mp4，别信）
+        wav = os.path.join(tmpdir, "part%d.wav" % i)
+        if head == b"RIFF":
+            os.replace(raw_path, wav)
+        else:
+            _audio_to_wav(cfg, raw_path, wav)
+        parts.append(wav)
+        info("  第 %d/%d 段就绪%s" % (i, n, ("（服务端时长 %.1fs）" % real) if real else ""))
+    dst = os.path.join(paths["audio"], "bgm.mp3")
+    _stitch_bgm(cfg, parts, dst, duration, fade)
+    size = os.path.getsize(dst) / 1e6
+    info("配乐 -> audio/bgm.mp3 (%.1f MB，火山引擎)" % size)
+
+
+def do_music(cfg, paths, duration=None, caption=None, seed=None, provider=None):
+    prov = (provider or (cfg.get("music") or {}).get("provider") or "comfyui").strip().lower()
+    if prov in ("volc", "volcengine", "doubao", "ark"):
+        return do_music_volc(cfg, paths, duration, caption)
+    if prov in ("comfyui", "comfy", "local", ""):
+        return do_music_comfy(cfg, paths, duration, caption, seed)
+    die("不认识的配乐通道 %r，可选 comfyui / volc" % prov)
+
+
 def cmd_music(args):
     cfg, paths = load_project(args.dir)
-    do_music(cfg, paths, args.duration, args.caption, args.seed)
+    do_music(cfg, paths, args.duration, args.caption, args.seed,
+             provider=getattr(args, "provider", None))
 
 
 # ----------------------------------------------------------------------------- init
@@ -3544,7 +3894,7 @@ def cmd_auto(args):
         except SystemExit:
             warn("配乐失败，保持无配乐")
     else:
-        info("未启用配乐（--music 开启，需要 music.endpoint）")
+        info("未启用配乐（加 --music 开启；通道由配置里的 music.provider 决定：comfyui / volc）")
 
     if args.only_first:
         info("仅生成 S01，跳过合成。验收后运行: ac.py auto <dir>（不加 --only-first）")
@@ -3602,7 +3952,9 @@ def cmd_setup(args):
     supplied = any([args.agnes_endpoint, args.agnes_key, args.agnes_video_model,
                     args.agnes_image_model, args.agnes_text_model,
                     args.agnes_video_endpoint, args.agnes_video_key,
-                    args.music_endpoint, args.music_auth])
+                    args.music_endpoint, args.music_auth,
+                    getattr(args, "music_provider", None),
+                    getattr(args, "volc_ak", None), getattr(args, "volc_sk", None)])
 
     def ask(label, cur, secret=False):
         shown = ("已设置" if cur else "空") if secret else (cur or "空")
@@ -3628,6 +3980,12 @@ def cmd_setup(args):
             cfg["music"]["endpoint"] = args.music_endpoint
         if args.music_auth:
             cfg["music"]["auth"] = args.music_auth
+        if getattr(args, "music_provider", None):
+            cfg["music"]["provider"] = args.music_provider
+        if getattr(args, "volc_ak", None):
+            cfg["music"].setdefault("volc", {})["ak"] = args.volc_ak
+        if getattr(args, "volc_sk", None):
+            cfg["music"].setdefault("volc", {})["sk"] = args.volc_sk
     else:
         print("配置 Agnes Clip · 平哥分享版（直接回车 = 保留当前值）\n")
         cfg["agnes"]["endpoint"] = ask("Agnes 端点", cfg["agnes"].get("endpoint") or DEFAULT_AGNES["endpoint"])
@@ -3638,9 +3996,16 @@ def cmd_setup(args):
         print("\n[可选] 视频专用通道（独立 key / 独立入口，只用于视频；留空 = 用上面的主 key）")
         cfg["agnes"]["video_endpoint"] = ask("视频端点", cfg["agnes"].get("video_endpoint"))
         cfg["agnes"]["video_key"] = ask("视频 key", cfg["agnes"].get("video_key"), secret=True)
-        print("\n[可选] 配乐 ComfyUI（不需要直接回车）")
-        cfg["music"]["endpoint"] = ask("ComfyUI 端点", cfg["music"].get("endpoint"))
-        cfg["music"]["auth"] = ask("Basic Auth user:pass", cfg["music"].get("auth"), secret=True)
+        print("\n[可选] 配乐：comfyui（有显卡）或 volc（火山引擎，无卡也能跑），不需要直接回车")
+        cfg["music"]["provider"] = ask("配乐通道 comfyui/volc",
+                                       cfg["music"].get("provider") or "comfyui")
+        if (cfg["music"].get("provider") or "").lower() in ("comfyui", "comfy", "local"):
+            cfg["music"]["endpoint"] = ask("ComfyUI 端点", cfg["music"].get("endpoint"))
+            cfg["music"]["auth"] = ask("Basic Auth user:pass", cfg["music"].get("auth"), secret=True)
+        else:
+            mvolc = cfg["music"].setdefault("volc", {})
+            mvolc["ak"] = ask("火山 AccessKey", mvolc.get("ak"))
+            mvolc["sk"] = ask("火山 SecretKey", mvolc.get("sk"), secret=True)
 
     os.makedirs(os.path.dirname(GLOBAL_CFG_PATH), exist_ok=True)
     save_json(GLOBAL_CFG_PATH, cfg)
@@ -3663,6 +4028,10 @@ def cmd_setup(args):
                     print("  含 agnes-video-2.5-flash ✓")
             except Exception as e:
                 print("\n%s: 不通（%s）" % (label, e))
+        if (cfg.get("music") or {}).get("provider") == "volc":
+            r = _volc_probe(cfg)
+            print("\n配乐(火山): %s %s" % ("OK" if r.get("ok") else "不通",
+                                          r.get("note") or r.get("message") or ""))
 
 
 # ----------------------------------------------------------------------------- config UI
@@ -3905,8 +4274,19 @@ CONFIG_UI_HTML = r"""<!DOCTYPE html>
   <!-- ============ 配乐 ============ -->
   <div class="pane" id="pane-music">
     <div class="card">
-      <h2>配乐 <span class="tag">可选，ComfyUI + MiniMax Music3</span></h2>
-      <div class="hint">本地 ComfyUI 生成，不占 Agnes 额度。留空也能出片，只是没背景音乐。</div>
+      <h2>配乐 <span class="tag">两条通道任选一条</span></h2>
+      <div class="hint">有显卡走 ComfyUI（不花钱）；没卡或排队太久走火山引擎（0.002 元/秒，100 秒约两毛）。留空也能出片，只是没背景音乐。</div>
+      <div class="grid">
+        <label>通道</label>
+        <select id="music-provider">
+          <option value="comfyui">ComfyUI · MiniMax Music3（本地/远程）</option>
+          <option value="volc">火山引擎 · 豆包音乐（无显卡也能跑）</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="card" id="card-music-comfy">
+      <h2>ComfyUI 参数 <span class="tag">provider = comfyui 时生效</span></h2>
       <div class="grid">
         <label>端点</label><input id="music-endpoint" placeholder="https://comfyui.example.com">
         <label>Basic Auth</label><input id="music-auth" placeholder="user:password">
@@ -3920,6 +4300,28 @@ CONFIG_UI_HTML = r"""<!DOCTYPE html>
           <input id="music-steps" type="number" min="8" max="60" style="max-width:90px">
           <input id="music-cfg" type="number" min="0.5" max="6" step="0.1" style="max-width:90px">
         </div>
+      </div>
+    </div>
+
+    <div class="card" id="card-music-volc">
+      <h2>火山引擎参数 <span class="tag">provider = volc 时生效</span></h2>
+      <div class="hint">AI 音乐生成（豆包音乐模型）。AK/SK 在火山控制台右上角「密钥管理」里建，建议用子账号。</div>
+      <div class="grid">
+        <label>AccessKey</label><input id="music-volc-ak" placeholder="AKLT...">
+        <label>SecretKey</label><input id="music-volc-sk" type="password" placeholder="留空 = 保持原值">
+        <label>计费入口</label>
+        <select id="music-volc-action">
+          <option value="GenBGMForTime">GenBGMForTime · 按时长后付费</option>
+          <option value="GenBGM">GenBGM · 套餐包</option>
+        </select>
+        <label>模型版本</label><input id="music-volc-ver" placeholder="v5.0" style="max-width:120px">
+      </div>
+      <div class="hint" style="margin-top:10px">纯音乐单次上限 60 秒，更长的片子会自动分段生成再交叉淡化拼接；两个入口不互通，走错会报 200028。</div>
+    </div>
+
+    <div class="card">
+      <h2>通用 <span class="tag">两条通道共用</span></h2>
+      <div class="grid">
         <label>默认时长</label><input id="music-duration" type="number" min="10" step="5" style="max-width:120px">
         <label>默认提示词</label><input id="music-caption" placeholder="Cinematic instrumental score...">
       </div>
@@ -4040,6 +4442,7 @@ function fill(cfg){
   $('voice-vo').value = vo.VO || '';
   $('voice-rate').value = vo.rate || '+0%';
   $('voice-volume').value = vo.volume || 1.6;
+  $('music-provider').value = mu.provider || 'comfyui';
   $('music-endpoint').value = mu.endpoint || '';
   $('music-auth').value = mu.auth || '';
   $('music-unet').value = mu.unet || '';
@@ -4047,14 +4450,25 @@ function fill(cfg){
   $('music-vae').value = mu.vae || '';
   $('music-steps').value = mu.steps || 28;
   $('music-cfg').value = mu.cfg || 1.8;
+  const mv = mu.volc || {};
+  $('music-volc-ak').value = mv.ak || '';
+  $('music-volc-sk').value = mv.sk || '';
+  $('music-volc-action').value = mv.action || 'GenBGMForTime';
+  $('music-volc-ver').value = mv.model_version || 'v5.0';
   $('music-duration').value = mu.duration || 100;
   $('music-caption').value = mu.caption || '';
   $('sys-ffmpeg').value = sy.ffmpeg || 'ffmpeg';
   $('sys-path').value = sy.config_path || '';
   $('sys-jobs').value = v.jobs || 3;
   $('sys-poll').value = v.poll || 30;
-  toggle(); syncImageNote(); renderImagePresets(); renderOverview();
+  toggle(); syncMusicProvider(); syncImageNote(); renderImagePresets(); renderOverview();
 }
+function syncMusicProvider(){
+  const p = $('music-provider').value;
+  $('card-music-comfy').classList.toggle('hide', p !== 'comfyui');
+  $('card-music-volc').classList.toggle('hide', p !== 'volc');
+}
+$('music-provider').addEventListener('change', syncMusicProvider);
 function toggle(){
   $('text-fields').classList.toggle('hide', $('text-provider').value === 'workbuddy');
 }
@@ -4068,8 +4482,9 @@ function collect(){
            timeout:num('video-timeout',7200), attempts:num('video-attempts',3), rounds:num('video-rounds',40),
            frame_upload:$('video-frame-upload').value.trim()},
     voices:{default:$('voice-default').value.trim(), VO:$('voice-vo').value.trim(), rate:$('voice-rate').value.trim(), volume:num('voice-volume',1.6)},
-    music:{endpoint:$('music-endpoint').value.trim(), auth:$('music-auth').value.trim(), unet:$('music-unet').value.trim(), clip:$('music-clip').value.trim(), vae:$('music-vae').value.trim(),
-           steps:num('music-steps',28), cfg:num('music-cfg',1.8), duration:num('music-duration',100), caption:$('music-caption').value.trim()},
+    music:{provider:$('music-provider').value, endpoint:$('music-endpoint').value.trim(), auth:$('music-auth').value.trim(), unet:$('music-unet').value.trim(), clip:$('music-clip').value.trim(), vae:$('music-vae').value.trim(),
+           steps:num('music-steps',28), cfg:num('music-cfg',1.8), duration:num('music-duration',100), caption:$('music-caption').value.trim(),
+           volc:{ak:$('music-volc-ak').value.trim(), sk:$('music-volc-sk').value.trim(), action:$('music-volc-action').value, model_version:$('music-volc-ver').value.trim()}},
     system:{ffmpeg:$('sys-ffmpeg').value.trim()}
   };
 }
@@ -4087,7 +4502,12 @@ function renderOverview(){
     ['推理/编剧', c.text.provider==='workbuddy'?'workbuddy':'api', c.text.model||'（会话模型）', c.text.endpoint||'—', c.text.key, 'OpenAI 兼容', 'text'],
     ['生视频', c.video.preset, c.video.model, c.video.endpoint, c.video.key, c.video.jobs+' 路 / '+(c.video.poll_interval||30)+'s', 'video'],
     ['配音', 'edge-tts', $('voice-default').value, '本机', '', $('voice-rate').value, null],
-    ['配乐', 'comfyui', $('music-unet').value ? 'MiniMax Music3' : '', $('music-endpoint').value, $('music-auth').value, $('music-steps').value+' 步', null],
+    ['配乐', c.music.provider==='volc' ? 'volc' : 'comfyui',
+     c.music.provider==='volc' ? ('豆包音乐 '+(c.music.volc.model_version||'v5.0'))
+       : ($('music-unet').value ? 'MiniMax Music3' : ''),
+     c.music.provider==='volc' ? 'open.volcengineapi.com' : c.music.endpoint,
+     c.music.provider==='volc' ? c.music.volc.ak : c.music.auth,
+     c.music.provider==='volc' ? (c.music.volc.action||'GenBGMForTime') : ($('music-steps').value+' 步'), null],
     ['视频首帧', c.video.frame_upload? '上传命令':'base64 直传', '—', '—', '', c.video.frame_upload?'已配置':'推荐', null],
   ];
   const tb = document.querySelector('#tbl-overview tbody');
@@ -4239,6 +4659,7 @@ def _ui_public(cfg):
             "volume": vo.get("volume") or DEFAULT_VOICES["volume"],
         },
         "music": {
+            "provider": mu.get("provider") or DEFAULT_MUSIC["provider"],
             "endpoint": mu.get("endpoint") or "",
             "auth": mu.get("auth") or "",
             "unet": mu.get("unet") or DEFAULT_MUSIC["unet"],
@@ -4248,6 +4669,7 @@ def _ui_public(cfg):
             "cfg": mu.get("cfg") or DEFAULT_MUSIC["cfg"],
             "duration": mu.get("duration") or DEFAULT_MUSIC["duration"],
             "caption": mu.get("caption") if mu.get("caption") is not None else DEFAULT_MUSIC["caption"],
+            "volc": _volc_cfg(cfg),
         },
         "system": {
             "ffmpeg": cfg.get("ffmpeg") or "ffmpeg",
@@ -4329,6 +4751,7 @@ def _ui_merge(cfg, data):
     })
     mu = data.get("music") or {}
     out["music"].update({
+        "provider": (mu.get("provider") or out["music"].get("provider") or "comfyui").strip(),
         "endpoint": (mu.get("endpoint") or "").strip(),
         "auth": (mu.get("auth") or "").strip(),
         "unet": (mu.get("unet") or DEFAULT_MUSIC["unet"]).strip(),
@@ -4339,10 +4762,48 @@ def _ui_merge(cfg, data):
         "duration": max(10, float(mu.get("duration") or DEFAULT_MUSIC["duration"])),
         "caption": (mu.get("caption") or DEFAULT_MUSIC["caption"]).strip(),
     })
+    mv = mu.get("volc") or {}
+    old_v = (out["music"].get("volc") or {})
+    out["music"]["volc"] = dict(DEFAULT_MUSIC["volc"], **old_v)
+    if (mv.get("ak") or "").strip():
+        out["music"]["volc"]["ak"] = mv["ak"].strip()
+    # SK 输入框留空 = 保留原值，避免每次保存都得重填
+    if (mv.get("sk") or "").strip():
+        out["music"]["volc"]["sk"] = mv["sk"].strip()
+    if mv.get("action"):
+        out["music"]["volc"]["action"] = mv["action"].strip()
+    if (mv.get("model_version") or "").strip():
+        out["music"]["volc"]["model_version"] = mv["model_version"].strip()
     sy = data.get("system") or {}
     ff = (sy.get("ffmpeg") or "").strip()
     out["ffmpeg"] = ff or "ffmpeg"
     return out
+
+
+def _volc_probe(cfg):
+    """用 QuerySong 打一个空任务：签名对不对能立刻看出来，业务报「任务不存在」反而是通的。"""
+    vc = _volc_cfg(cfg)
+    if not (vc.get("ak") and vc.get("sk")):
+        return {"ok": False, "message": "没填 AccessKey / SecretKey（火山控制台右上角「密钥管理」新建）"}
+    payload = json.dumps({"TaskID": "agnes-clip-connect-test"}, ensure_ascii=False).encode("utf-8")
+    try:
+        headers, query = _volc_sign(vc, payload, "QuerySong", vc.get("api_version") or "2024-08-12")
+        url = "https://%s/?%s" % (vc.get("host") or "open.volcengineapi.com", query)
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                body = json.loads(r.read().decode("utf-8", "ignore"))
+        except urllib.error.HTTPError as e:
+            body = json.loads(e.read().decode("utf-8", "ignore") or "{}")
+    except Exception as e:
+        return {"ok": False, "message": "连不上火山 OpenAPI：%s" % str(e)[:160]}
+    meta = body.get("ResponseMetadata") or {}
+    err = meta.get("Error") or {}
+    code = str(err.get("Code") or "")
+    if any(t in code for t in ("Signature", "AccessKey", "Credential", "AuthFailure", "InvalidCredential")):
+        return {"ok": False, "message": "签名/密钥不通过：%s %s" % (code, err.get("Message") or "")}
+    return {"ok": True,
+            "note": "AK/SK 签名通过 · %s" % (code or ("RequestId " + str(meta.get("RequestId") or "")[:12]))}
 
 
 def _ui_test(data):
@@ -4351,8 +4812,11 @@ def _ui_test(data):
     if kind == "text" and ((cfg.get("text") or {}).get("provider") or "workbuddy") == "workbuddy":
         return {"ok": True, "message": "WorkBuddy 默认，无需测试"}
     if kind == "music":
-        ep = ((cfg.get("music") or {}).get("endpoint") or "").strip().rstrip("/")
-        auth = ((cfg.get("music") or {}).get("auth") or "").strip()
+        mu = cfg.get("music") or {}
+        if (mu.get("provider") or "comfyui").strip().lower() in ("volc", "volcengine", "doubao", "ark"):
+            return _volc_probe(cfg)
+        ep = (mu.get("endpoint") or "").strip().rstrip("/")
+        auth = (mu.get("auth") or "").strip()
         if not ep:
             return {"ok": False, "message": "未填配乐端点（不填也能出片，只是没背景音乐）"}
         try:
@@ -4735,8 +5199,20 @@ def cmd_music_ui(args):
                     self._send(200, json.dumps(
                         {"message": "上一次还在合成，等它跑完"}, ensure_ascii=False))
                     return
-                cmdline = [sys.executable, os.path.abspath(__file__), "assemble",
-                           paths["root"], "--subs", "--voice"]
+                # 合成参数跟着项目走：project.json 的 assemble 段可覆盖。
+                # 默认不混 TTS（模型片段通常自带人声，混了会双重人声），
+                # 但 tighten 默认开——项目若靠留白（开口偏晚是设计），必须显式写 false。
+                conf = load_json(os.path.join(paths["root"], "project.json")) or {}
+                a = conf.get("assemble") or {}
+                cmdline = [sys.executable, os.path.abspath(__file__), "assemble", paths["root"]]
+                if a.get("subs"):
+                    cmdline.append("--subs")
+                if a.get("voice"):
+                    cmdline.append("--voice")
+                if a.get("tighten") is False:
+                    cmdline.append("--no-tighten")
+                if a.get("transition"):
+                    cmdline += ["--transition", str(a["transition"])]
                 state["proc"] = subprocess.Popen(cmdline, cwd=os.path.dirname(
                     os.path.abspath(__file__)), stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL)
@@ -4854,11 +5330,13 @@ def main():
     p.add_argument("--dry-run", action="store_true", help="只打印每条回忆的入点/时长，不剪")
     p.set_defaults(func=cmd_recall)
 
-    p = sub.add_parser("music", help="生成配乐（可选，ComfyUI）")
+    p = sub.add_parser("music", help="生成配乐（comfyui 本地 / volc 火山引擎）")
     p.add_argument("dir")
     p.add_argument("--duration", type=float, default=None)
     p.add_argument("--caption", default=None)
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--provider", default=None,
+                   help="comfyui（本地显卡）或 volc（火山引擎豆包音乐，无卡也能跑）")
     p.set_defaults(func=cmd_music)
 
     p = sub.add_parser("voice", help="按台词生成配音（edge-tts，按角色分配音色）")
@@ -4915,7 +5393,7 @@ def main():
 
     p = sub.add_parser("pick-image", help="给单个项目指定出图通道（不写全局配置）")
     p.add_argument("dir")
-    p.add_argument("--channel", default="", help="agnes / gpt-image / openai，留空=跟随全局")
+    p.add_argument("--channel", default="", help="agnes / gpt-image / openai / banana，留空=跟随全局")
     p.set_defaults(func=cmd_pick_image)
 
     p = sub.add_parser("music-ui", help="打开配乐台（试听配乐库 / 逐镜调音量 / 重新合成）")
@@ -4933,6 +5411,9 @@ def main():
     p.add_argument("--agnes-video-key", default=None)
     p.add_argument("--music-endpoint", default=None)
     p.add_argument("--music-auth", default=None)
+    p.add_argument("--music-provider", default=None, help="comfyui 或 volc")
+    p.add_argument("--volc-ak", default=None, help="火山引擎 AccessKey")
+    p.add_argument("--volc-sk", default=None, help="火山引擎 SecretKey")
     p.add_argument("--check", action="store_true")
     p.set_defaults(func=cmd_setup)
 

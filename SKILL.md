@@ -1,8 +1,8 @@
 ---
 name: agnes-clip
-description: 用 Agnes 云端算力全自动做竖屏短剧/长视频——一句话创意 → 编剧（场景/动作/微表情/对白/口型）→ 分镜表 → 角色定妆图 → 道具图 → 场景板 → 逐镜首帧 → 批量提交 agnes-video-2.5-flash 出视频 → 质检 → 配乐/音效/转场/逐句字幕 → 拼成一条完整成片。含 15 阶段完整作业流程（references/full_pipeline.md）与多集共享角色库（同一系列第 2、3 集复用同一张脸，不重新生成）。当用户要用 Agnes 生成视频、要"从剧本到成片全自动"、要写有对白会说话的短剧、要锁住人物脸做多镜头连续剧/系列剧、要批量提交视频任务、问"这个 skill 怎么用/怎么配置/怎么启动/装完怎么跑"、要打开配置界面配出图或视频的端点和 Key、要给项目切换出图通道（Agnes / GPT Image / 自定义 OpenAI 兼容）时使用。模型：agnes-video-2.5-flash（视频）+ agnes-image-2.5-flash（图片）+ agnes-2.5-flash（编剧）。
+description: 用 Agnes 云端算力全自动做竖屏短剧/长视频——一句话创意 → 编剧（场景/动作/微表情/对白/口型）→ 分镜表 → 角色定妆图 → 道具图 → 场景板 → 逐镜首帧 → 批量提交 agnes-video-2.5-flash 出视频 → 质检 → 配乐/音效/转场/逐句字幕 → 拼成一条完整成片。含 15 阶段完整作业流程（references/full_pipeline.md）与多集共享角色库（同一系列第 2、3 集复用同一张脸，不重新生成）。当用户要用 Agnes 生成视频、要"从剧本到成片全自动"、要写有对白会说话的短剧、要锁住人物脸做多镜头连续剧/系列剧、要批量提交视频任务、问"这个 skill 怎么用/怎么配置/怎么启动/装完怎么跑"、要打开配置界面配出图或视频的端点和 Key、要给项目切换出图通道（Agnes / GPT Image / 自定义 OpenAI 兼容）时使用。模型：agnes-video-2.5-flash（视频）+ agnes-image-2.5-flash（图片）+ agnes-2.5-flash（编剧）。配乐两条通道可选：本地 ComfyUI（MiniMax Music3）或火山引擎 AI 音乐生成（豆包音乐模型，无显卡也能跑，0.002 元/秒）。
 agent_created: true
-version: 1.0.0
+version: 1.1.0
 ---
 
 # Agnes Clip · 一句话到成片（平哥分享版）
@@ -96,7 +96,7 @@ python scripts/ac.py pick-image <项目目录> --channel agnes      # 或 gpt-im
 | 6 | 首帧 | `frame`（先 `--dry-run`） | `frames/S*.jpg` | 人数锁 N 对、参考图张数对、双人镜有 left/right；抽 3–5 张关键镜看 |
 | 7 | 视频 | `video --wait` | `clips/S*.mp4` | 段数 = 镜数；失败镜 `--only` 单跑 |
 | 8 | 质检 | 抽帧 + 抽音轨转写 | `qa/` | 无多余人/道具、无跳轴、无漂移；每句台词真的念出来且没念糊 |
-| 9 | 配乐 | `music` → `music-ui` | `audio/bgm.mp3` | 先 loudnorm 归一化；时长 ≥ 成片；逐镜音量写进 `shot.bgm` |
+| 9 | 配乐 | `music` → `music-ui` | `audio/bgm.mp3` | 先 loudnorm 归一化；时长 ≥ 成片；逐镜音量写进 `shot.bgm`；火山通道 >60s 会自动分段 |
 | 10 | 音效 | 真素材 → `audio/sfx/` | 13 个左右音效 | 落点卡转折处；峰值 ≈ −16dB，对白段只抬 1–2dB |
 | 11 | 转场 | 写 `shot.x` | 合成时生效 | 换场景叠化 0.8–1.2s、正反打硬切 0.1s；合成后核对总时长没被截断 |
 | 12 | 字幕 | 写 `shot.subs`（推荐）或 `--subs` | `out/_subs_shots.ass` | 每句只有一排（≤14 字）、出现在对应台词处 |
@@ -167,7 +167,8 @@ python scripts/ac.py cast "<dir>" list                  # 看哪些角色是本�
 
 | 用途 | 模型 | 接口 |
 |---|---|---|
-| 视频 | `agnes-video-2.5-flash` | `POST /v1/videos` 创建 → `GET /agnesapi?video_id=…&model_name=…` 轮询 |
+| 视频（免费额度） | `agnes-video-2.5-flash` | `POST /v1/videos` 创建 → `GET /agnesapi?video_id=…&model_name=…` 轮询 |
+| 视频（付费/有余额） | `agnes-video-2.5` | 同上，接口完全一致，只换 model 名 |
 | 图片 | `agnes-image-2.5-flash` | `POST /v1/images/generations`（文生图 / 图生图） |
 | 编剧 | `agnes-2.5-flash` | `POST /v1/chat/completions` |
 | 配音 | edge-tts（本机合成，免费） | `python -m edge_tts` |
@@ -183,9 +184,24 @@ python scripts/ac.py cast "<dir>" list                  # 看哪些角色是本�
 | 输出分辨率 | 固定 **720P** | 传别的值直接 400；尺寸由 `aspect_ratio` 决定 |
 | 竖屏 | `aspect_ratio: "9:16"` → 704×1280 | 默认就是竖屏 |
 | 首帧图 | keyframe 模式传 `first_frame` | 本地图用 base64 data URI 直接传，无需图床 |
-| 并发 | **最多 3 路同时生成** | 3 槽位排队，完成一个补一个 |
+| 并发 | **最多 3 路同时生成** | 3 槽位排队，完成一个补一个；**额度是账号级、不分模型** |
 | 轮询 | **30 秒一次**（全局节流） | 多任务轮转查询 |
 | 音轨 | 视频**自带环境音轨**（实测 aac） | 台词口型靠提示词；担心没出声可加 TTS 兜底（见下） |
+
+### flash 排不上队？换付费模型
+
+`agnes-video-2.5-flash` 走免费额度，热门时段提交会连续 `HTTP 429 / 503`，一镜排十几分钟很正常（`submit_rounds` 打满 40 轮才放弃）。**账号里有余额就直接用付费版**，接口和参数完全一样，只改 model 名：
+
+```bash
+python scripts/ac.py setup            # 交互里把「视频模型」改成 agnes-video-2.5
+# 或直接改 ~/.workbuddy/agnes-clip.json：
+#   agnes.video_model = "agnes-video-2.5"
+#   video.model       = "agnes-video-2.5"
+```
+
+实测同一账号：flash 提交 6 次全 429；付费版**立即入队**，8 秒镜头约 3 分钟出片。
+
+⚠️ **并发额度是账号级的，不分模型**。同时开两个 `ac.py video` 进程（每个内部 3 路）就会互相抢槽，付费版照样 429。要跑批量就**只开一个进程**，用 `--only` 一次把镜头列全。
 
 ## ⛔ 开工前置：先有骨架，再写分镜
 
@@ -378,6 +394,7 @@ python scripts/ac.py video "<dir>" [--only S01] [--wait] [--force]
 python scripts/ac.py fetch "<dir>"            # 续查已提交任务（不重复提交）
 python scripts/ac.py voice "<dir>" [--force]  # 按台词生成配音（按角色分配音色）
 python scripts/ac.py music "<dir>" --duration 90 --caption "雨夜，钢琴"
+python scripts/ac.py music "<dir>" --provider volc --duration 90 --caption "..."   # 火山引擎（无卡可跑，>60s 自动分段）
 python scripts/ac.py assemble "<dir>" [--subs] [--voice]
 python scripts/ac.py audit "<dir>"            # 出 AUDIT.md（逐镜核对 + 质检 + 成本）
 python scripts/ac.py status "<dir>"
@@ -395,7 +412,8 @@ python scripts/ac.py auto "<dir>" --idea "..." --only-first
 python scripts/ac.py auto "<dir>"
 
 # 3) 配乐 / 配音 / 字幕（按需）
-python scripts/ac.py auto "<dir>" --music
+python scripts/ac.py auto "<dir>" --music                       # 走配置里的配乐通道
+python scripts/ac.py music "<dir>" --provider volc --duration 104   # 临时改走火山，不影响全局配置
 python scripts/ac.py voice "<dir>" && python scripts/ac.py assemble "<dir>" --voice
 python scripts/ac.py assemble "<dir>" --subs     # 只在合成阶段加字幕，按真实人声对齐
 ```
@@ -477,9 +495,38 @@ python scripts/ac.py assemble "<dir>" --subs     # 只在合成阶段加字幕�
 - 音色表（`~/.workbuddy/agnes-clip.json` 的 `voices`）：`default`、`VO`、`rate`、`volume`，也可以按角色名逐个指定。
   旁白（`VO`）默认音色可能是男声，内心独白要女声时按镜单独合成。
 
+## 配乐通道：有卡走 ComfyUI，没卡走火山
+
+两条通道出口都是 `audio/bgm.mp3`，后面的逐镜音量、配乐台、合成完全一样，换通道不影响流程。
+
+| provider | 走什么 | 什么时候用 | 成本 |
+|---|---|---|---|
+| `comfyui` | 本地/远程 ComfyUI + MiniMax Music3，整条一次出 | 有显卡、卡空着 | 0 |
+| `volc` | 火山引擎「AI 音乐生成」（豆包音乐模型）OpenAPI | 没卡、卡在排队、赶时间 | 0.002 元/秒（100 秒约两毛） |
+
+```bash
+python scripts/ac.py music "<dir>" --provider volc --duration 104 --caption "..."
+# 也可以写进全局配置：配置界面「配乐」TAB 选通道，之后 music / auto 都跟着走
+```
+
+### 火山这条的三个硬事实（不写清楚必踩）
+
+1. **纯音乐单次上限 60 秒**。片子更长时脚本自动切段（每段多留 2 秒做交叉淡化），逐段生成后 `acrossfade` 拼回一条，最后统一 loudnorm。
+   代价是段与段之间能听出"换段"——**能用 ComfyUI 一次出整条就别分段**。
+2. **两个计费入口不互通**：`GenBGMForTime`（按时长后付费）与 `GenBGM`（套餐包）。默认后付费；走错报 `200028 没有可用资源包`。
+3. **签名是火山自有 V4**：中间密钥用**二进制**不是十六进制，Host 只参与签名不单独发。算错会报 `SignatureDoesNotMatch`（多半 SK 填错或本机时间偏 >5 分钟）。
+   配置界面「测试连接」打的是 `QuerySong` 空任务——能返回业务错误（任务不存在）就说明签名通了。
+
+| 错误码 | 意思 | 怎么办 |
+|---|---|---|
+| `200028` | 无可用资源包 / 后付费没开 | 控制台打开「按时长计费」；确认用的是 GenBGMForTime |
+| `50000001` | 版权相似度校验没过 | Text 写具体（乐器/情绪/场景/节奏），或开 `music.volc.rewrite` |
+| `InvalidAccessKey` | AK 不存在 | 核对 AK |
+| `SignatureDoesNotMatch` | 签名不匹配 | 核对 SK、校准系统时间 |
+
 ## 配乐：按镜头控制音量，不要整条铺平
 
-生成：`python scripts/ac.py music "<dir>" --duration 104 --caption "..."`（走 ComfyUI 的 MiniMax Music3，`lyrics` 固定 `[Instrumental]`）。
+生成：`python scripts/ac.py music "<dir>" --duration 104 --caption "..."`（ComfyUI 走 MiniMax Music3，`lyrics` 固定 `[Instrumental]`；`--provider volc` 走火山引擎）。
 
 **第一步必须先做响度归一化**，否则同一首曲子里各段本身差 10dB 以上，后面设的系数完全没有意义：
 
@@ -606,10 +653,10 @@ python scripts/ac.py config-ui
 | 生视频 | 通道（免费 apihub / 付费 api / 自定义）、端点、key、模型、并发路数、轮询秒数、默认时长、画幅 | 视频独立 key，不用于图片和剧本 |
 | 生视频·高级 | 单次超时、每轮重试次数、总重试轮数、首帧上传命令 | 队列满时的行为都在这里调 |
 | 配音 | 默认音色、旁白音色、语速、音量 | 音色可下拉选也可自定义，**带试听按钮**（当场合成一句 MP3 播放） |
-| 配乐 | ComfyUI 端点、Basic Auth、UNet/CLIP/VAE、步数、CFG、默认时长、默认提示词 | 不填也能出片，只是没背景音乐 |
+| 配乐 | **通道二选一**（ComfyUI / 火山引擎）+ 各自的参数 + 默认时长、默认提示词 | 不填也能出片，只是没背景音乐；火山只需 AK/SK |
 | 系统 | ffmpeg 路径、配置文件位置 | 填 `ffmpeg` 表示用 PATH 里的，装了 imageio-ffmpeg 会自动找到 |
 
-每块都有「测试连接」：推理/生图/生视频会拉一次模型列表并核对指定模型是否存在，配乐会探 ComfyUI 的 `/system_stats`，配音是直接试听。
+每块都有「测试连接」：推理/生图/生视频会拉一次模型列表并核对指定模型是否存在；配乐看通道——ComfyUI 探 `/system_stats`，火山用 `QuerySong` 打一个空任务验 AK/SK 签名；配音是直接试听。
 
 保存后写入 `~/.workbuddy/agnes-clip.json`，图片/剧本/视频三条通道互相隔离：视频 key 不会用于生图和剧本。
 
@@ -623,8 +670,17 @@ python scripts/ac.py config-ui
 python scripts/ac.py pick-image <项目目录> --channel agnes      # Agnes 云端（默认，稳）
 python scripts/ac.py pick-image <项目目录> --channel gpt-image  # OpenAI 兼容中转
 python scripts/ac.py pick-image <项目目录> --channel openai     # 同上，语义别名
+python scripts/ac.py pick-image <项目目录> --channel banana     # Nano Banana（Gemini 原生，锁脸/服装最准）
 python scripts/ac.py pick-image <项目目录>                     # 清除设置，跟随全局
 ```
+
+三条通道的实测差别（2026-10-20）：
+
+| 通道 | 协议 | 带参考图的耗时 | 适用 |
+|---|---|---|---|
+| `agnes` | OpenAI `/images/generations` + `extra_body.image` | 30–40s | 稳、快，人多镜头默认用它 |
+| `gpt-image` | OpenAI `/images/generations` + `input[]` | 无参考图 25s；**带参考图常挂满 480s 超时** | 只在生图网关正常时用 |
+| `banana` | Gemini 原生 `/v1beta/models/<model>:generateContent` | 60–90s（nano-banana-pro 2K） | 服装/道具/手部这些"写进提示词就要照做"的细节最听话 |
 
 优先级：**项目级 > 全局**。这样同一个 skill 能同时跑不同通道的项目，不用反复改全局配置。
 

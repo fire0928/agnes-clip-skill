@@ -1831,6 +1831,8 @@ def do_scenes(cfg, paths, force=False):
 
     groups = {}
     for s in shots:
+        if s.get("reuse"):
+            continue
         key = scene_key(s)
         ang = (s.get("angle") or "wide").strip() or "wide"
         g = groups.setdefault(key, {"scene": s.get("scene") or {}, "angles": {}})
@@ -2074,6 +2076,9 @@ def do_frames(cfg, paths, only=None, force=False, dry=False):
     for shot in shots:
         if only_set and shot["id"] not in only_set:
             continue
+        if shot.get("reuse"):
+            # 回忆镜头直接用旧集片段剪（见 recall 命令），不需要首帧
+            continue
         target = os.path.join(paths["frames"], shot["id"] + ".jpg")
         if os.path.exists(target) and not force:
             info("%s 跳过：首帧已存在（--force 覆盖）" % shot["id"])
@@ -2142,6 +2147,8 @@ def do_videos(cfg, paths, only=None, force=False, wait=False, allow_partial=Fals
     tasks = []
     for idx, shot in enumerate(shots):
         if only_set and shot["id"] not in only_set:
+            continue
+        if shot.get("reuse"):
             continue
         sid = shot["id"]
         frame_path = os.path.join(paths["frames"], sid + ".jpg")
@@ -2324,6 +2331,98 @@ def cmd_video(args):
     do_videos(cfg, paths, args.only, args.force, args.wait)
 
 
+# ----------------------------------------------------------------------------- recall (复用旧集当回忆)
+
+# 回忆调色：不是为了好看，是为了让观众知道"这段不是现在"。
+RECALL_GRADES = {
+    "warm": "eq=saturation=0.66:contrast=0.97:brightness=0.03,"
+            "colorbalance=rs=0.04:gs=0.01:bs=-0.03",
+    "cold": "eq=saturation=0.42:contrast=1.02:brightness=-0.015,"
+            "colorbalance=rs=-0.03:bs=0.06",
+    "neutral": "eq=saturation=0.55:contrast=0.98",
+}
+
+
+def do_recall(cfg, paths, only=None, force=False, dry=False):
+    """把别的剧集（通常是第 1 集）的片段剪成"回忆"放进本集 clips/。
+
+    镜头表里这样写，就不用调 Agnes、不花额度：
+        "reuse": {"from": "../clips/S01.mp4", "in": 0.0, "dur": 5.0,
+                  "speed": 0.85, "grade": "warm"}
+    - from：相对本集根目录（也支持绝对路径）
+    - in/dur：源片段的入点与**成片要的长度**（秒）
+    - speed：<1 放慢（回忆感），>1 加快，默认 1
+    - grade：warm / cold / neutral，叠柔光、颗粒、暗角，原声一律去掉
+    """
+    exe = have_ffmpeg(cfg)
+    if not exe:
+        die("找不到 ffmpeg，回忆片段需要它来剪")
+    shots = load_json(paths["shots"])["shots"]
+    only_set = set(only.split(",")) if only else None
+    w, h = RATIO_SIZE.get(cfg["agnes"].get("aspect_ratio", "9:16"), (704, 1280))
+    made, skipped = 0, 0
+    for shot in shots:
+        r = shot.get("reuse") or {}
+        if not r:
+            continue
+        sid = shot["id"]
+        if only_set and sid not in only_set:
+            continue
+        dst = os.path.join(paths["clips"], sid + ".mp4")
+        if os.path.exists(dst) and not force:
+            skipped += 1
+            continue
+        src = r.get("from") or ""
+        if not os.path.isabs(src):
+            src = os.path.normpath(os.path.join(paths["root"], src))
+        if not os.path.exists(src):
+            warn("%s 复用源不存在: %s" % (sid, src))
+            continue
+        t_in = max(0.0, float(r.get("in", 0.0)))
+        out_dur = float(r.get("dur") or shot.get("duration") or 6.0)
+        speed = float(r.get("speed") or 1.0)
+        if speed <= 0:
+            speed = 1.0
+        src_dur = out_dur * speed
+        grade = RECALL_GRADES.get((r.get("grade") or "warm").strip(), RECALL_GRADES["warm"])
+        chain = ["scale=%d:%d:force_original_aspect_ratio=increase" % (w, h),
+                 "crop=%d:%d" % (w, h), "setsar=1"]
+        if abs(speed - 1.0) > 1e-3:
+            chain.append("setpts=PTS/%.4f" % speed)
+        chain += ["fps=24", grade, "gblur=sigma=0.35",
+                  "noise=alls=5:allf=t", "vignette=PI/5", "format=yuv420p"]
+        cmd = ["-y", "-loglevel", "error",
+               "-ss", "%.3f" % t_in, "-t", "%.3f" % src_dur, "-i", src,
+               "-an", "-vf", ",".join(chain),
+               "-c:v", "libx264", "-preset", "medium", "-crf", "17",
+               "-pix_fmt", "yuv420p", "-movflags", "+faststart", dst]
+        if dry:
+            print("%s  <- %s [%.2f, %.2f] x%.2f  %s" % (sid, os.path.basename(src), t_in,
+                                                        t_in + src_dur, speed,
+                                                        (r.get("grade") or "warm")))
+            continue
+        try:
+            ff_run(exe, cmd)
+        except SystemExit:
+            warn("%s 回忆片段剪失败" % sid)
+            continue
+        got = ff_duration(dst, exe)
+        if got is None or got < out_dur * 0.8:
+            warn("%s 只有 %.2fs（想要 %.2fs），源片段可能不够长" % (sid, got or 0, out_dur))
+        else:
+            info("%s 回忆片段 %.2fs（源 %s 从 %.2fs 起%s）"
+                 % (sid, got, os.path.basename(src), t_in,
+                    "" if abs(speed - 1) < 1e-3 else "，%.2f 倍速" % speed))
+        made += 1
+    info("回忆片段：新剪 %d 条，跳过 %d 条 -> clips/" % (made, skipped))
+
+
+def cmd_recall(args):
+    cfg, paths = load_project(args.dir)
+    do_recall(cfg, paths, getattr(args, "only", None),
+              getattr(args, "force", False), getattr(args, "dry_run", False))
+
+
 # ----------------------------------------------------------------------------- voice (edge-tts)
 
 def have_edge_tts():
@@ -2381,7 +2480,7 @@ def do_voice(cfg, paths, force=False, only=None):
             cmd = [sys.executable, "-m", "edge_tts", "--voice", voice,
                    "--text", txt, "--write-media", part]
             if vcfg.get("rate"):
-                cmd += ["--rate", str(vcfg["rate"])]
+                cmd += ["--rate=%s" % str(vcfg["rate"])]  # 必须用 = 连接：+/-10% 会被 argparse 当成选项
             info("%s 配音（%s）：%s" % (sid, voice, txt))
             pr = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if pr.returncode != 0 or not os.path.exists(part):
@@ -3433,6 +3532,9 @@ def cmd_auto(args):
 
     only = "S01" if args.only_first else None
     do_videos(cfg, paths, only=only, force=args.force, wait=True, allow_partial=True)
+    # 回忆镜头不走进视频通道：直接用旧剧集的片段剪（--only-first 时也一起剪好）
+    if any(s.get("reuse") for s in story["shots"]):
+        do_recall(cfg, paths, force=args.force)
 
     if args.music:
         try:
@@ -4301,7 +4403,7 @@ def _ui_tts(data):
         cmd = [sys.executable, "-m", "edge_tts", "--voice", voice,
                "--text", text, "--write-media", tmp]
         if rate:
-            cmd += ["--rate", rate]
+            cmd += ["--rate=%s" % rate]  # 同上：-10% 不能被当成选项
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if p.returncode != 0 or not os.path.exists(tmp):
             raise RuntimeError(p.stderr.decode("utf-8", "ignore")[-200:] or "合成失败")
@@ -4744,6 +4846,13 @@ def main():
     p = sub.add_parser("fetch", help="续查已提交任务并下载（读 clips/_pending.json）")
     p.add_argument("dir")
     p.set_defaults(func=cmd_fetch)
+
+    p = sub.add_parser("recall", help="把旧剧集片段剪成回忆（不调 Agnes，不花额度）")
+    p.add_argument("dir")
+    p.add_argument("--only", default=None)
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--dry-run", action="store_true", help="只打印每条回忆的入点/时长，不剪")
+    p.set_defaults(func=cmd_recall)
 
     p = sub.add_parser("music", help="生成配乐（可选，ComfyUI）")
     p.add_argument("dir")

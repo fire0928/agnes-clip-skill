@@ -16,6 +16,9 @@ ai-video-pipeline.json
 dist/*.zip
 dist/*.sha256
 
+# 平哥自己的发布操作手册（对外发布不需要，tools/publish.py 会自动排除）
+发布指南.md
+
 # 项目产物（跑片子时生成的，别混进 skill 仓库）
 projects/
 out/

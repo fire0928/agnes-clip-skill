@@ -45,6 +45,7 @@ LOCAL_PAT = re.compile(r"(E:/workbuddy|E:\\workbuddy|C:/Users/[A-Za-z0-9_-]+)")
 SELF_REferential = {
     "tools/publish.py",       # 含 LOCAL_PAT / SECRET_PAT 定义
     "tools/package_skill.py",  # 含 SECRET_PAT 定义
+    "tools/git_sync.py",       # 含 LOCAL_PAT / SECRET_PAT 定义
     "发布指南.md",             # 内部手册，讲的就是本机路径与排错
 }
 

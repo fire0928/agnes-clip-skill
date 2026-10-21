@@ -6,7 +6,7 @@ description: 用 Agnes 云端算力全自动做竖屏短剧/长视频——一�
 description_zh: 一句话创意自动做成有对白、会说话的竖屏短剧。全流程 15 步：写剧本、分镜、角色定妆、场景板、逐镜首帧、批量出视频、配乐音效字幕、合成成片，人脸全程锁死不怕换脸。视频走云端算力，不占本地显卡。适合做催泪短剧、漫剧、系列连续剧，也支持同系列多集复用同一张脸。
 description_en: Turn a one-line idea into a vertical short drama with real dialogue. A 15-stage pipeline handles scripting, storyboarding, character sheets, scene boards, first frames, batch video generation, music, sound effects, subtitles and final cut — with character faces locked across every shot so nobody switches faces mid-story. Video runs on cloud GPUs, so no local hardware needed. Great for tearjerkers, anime shorts and serialized episodes that reuse the same face across episodes.
 agent_created: true
-version: 1.5.0
+version: 1.6.0
 ---
 
 # Agnes Clip · 一句话成片
@@ -984,8 +984,27 @@ python <skill-creator>/scripts/quick_validate.py <skill目录>   # 必须输出 
 |---|---|
 | **`references/full_pipeline.md`** | **主作业手册**：15 个阶段的命令、字段、验收门、踩坑与验证命令 |
 | `providers/agnes.md` | 视频/图片/文本三套 API 的完整参数、错误码、实测结论 |
+| `providers/volc_music.md` | 火山引擎 AI 音乐生成（无显卡时的配乐通道） |
 | `references/screenplay.md` | 编剧方法：场景写法、动作、微表情、对白、口型、镜头语言 |
 | `references/shot_schema.md` | 镜头表字段、可拍性规则、动作估时 |
 | `references/story_design.md` | 为什么 AI 写的剧本没逻辑：logline / 情绪曲线 / 母题回环 |
 | `references/camera_setups.md` | 三机位法、轴线、越轴症状、分镜自查清单 |
+| `references/camera_language.md` | 12 种运镜英文写法、6 套组合公式、航拍与特写的安全边界 |
+| `references/micro_expression.md` | 眼神 / 笑意 / 呼吸微表情库，5 套情绪模板 |
+| `references/face_lock.md` | 锁脸方法论与漂移实测数据、尾帧桥接 |
+| `references/troubleshooting.md` | 崩坏现象 → 原因 → 修法（人脸/画面/动作/流程四类） |
 | `references/prompt_template.md` | 首帧图与视频提示词模板（含对白口型写法） |
+
+## 版本更新与同步
+
+本 skill 挂在 GitHub 上，改完可以一键发布，对方 `pull` 一下就同步：
+
+```bash
+python tools/git_sync.py push --bump 1.6.0   # 安全体检 → 打包 → 提交 → 推 GitHub
+python tools/git_sync.py pull                 # 拉取远端最新（别人更新了自动同步到本机）
+python tools/git_sync.py check                # 只看远端有没有新版本
+python tools/git_sync.py status               # 本地 / 远端状态对照
+```
+
+`push` 之前会自动全库扫一遍密钥、本机绝对路径、缓存文件，**有问题直接中止不推**。
+仓库地址配在 `.git-sync.json` 里。

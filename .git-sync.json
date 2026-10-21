@@ -1,0 +1,7 @@
+{
+  "repo": "ssh://git@ssh.github.com:443/fire0928/agnes-clip-skill.git",
+  "web": "https://github.com/fire0928/agnes-clip-skill",
+  "package_name": "agnes-clip",
+  "package_script": "tools/package_skill.py",
+  "branch": "main"
+}

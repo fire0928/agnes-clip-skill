@@ -10,16 +10,28 @@ ffmpeg 未装时自动尝试 imageio-ffmpeg 提供的静态二进制。
 命令：
   ac.py init <dir> [--title 标题]
   ac.py story <dir> --idea "一句话创意" [--shots 10] [--seconds 8]
-  ac.py char-gen <dir> --name hero [--desc "..."] [--tri]
+  ac.py char-gen <dir> --name hero [--desc "..."] [--tri] [--card-style sheets|turnaround] [--channel agnes|gpt-image|banana] [--force]
   ac.py char-add <dir> <photo.jpg> --name hero
-  ac.py prop-gen <dir> --name sword [--desc "..."]
-  ac.py frame <dir> [--only S01]
-  ac.py video <dir> [--only S01] [--wait] [--force]
-  ac.py voice <dir> [--force]
-  ac.py music <dir> [--duration 101] [--caption "..."]
+  ac.py views <dir> [--name hero]
+  ac.py cast <dir> [list|init|push] [--name girl] [--all]
+  ac.py episode-new <第1集目录> --name ep02 --title "第二集"
+  ac.py prop-gen <dir> --name sword [--desc "..."] [--force]
+  ac.py scene-gen <dir> [--force]
+  ac.py frame <dir> [--only S01] [--force] [--dry-run]
+  ac.py video <dir> [--only S01] [--wait] [--force] [--allow-paid]
+  ac.py fetch <dir>
+  ac.py recall <dir> --from <旧集> --shot S03
+  ac.py seam <dir>
+  ac.py voice <dir> [--force] [--no-fit]
+  ac.py music <dir> [--duration 101] [--caption "..."] [--lyrics "..."] [--provider comfyui|volc] [--force]
+  ac.py sfx <dir> [--into out/final.mp4]
   ac.py assemble <dir> [--subs] [--voice]
   ac.py auto <dir> --idea "一句话创意" [--shots 10] [--only-first]
+  ac.py audit <dir>
   ac.py status <dir>
+  ac.py pick-image <dir> [--channel agnes|gpt-image|banana]
+  ac.py config-ui
+  ac.py music-ui <dir>
   ac.py setup --agnes-key ...
 """
 import argparse
@@ -146,6 +158,39 @@ DEFAULT_VOICES = {
     "VO": "zh-CN-YunxiNeural",
     "rate": "+0%",
     "volume": 1.6,
+    # TTS 通道：edge（免费，只能念稿）/ doubao（豆包 Seed-Audio，有情绪和停顿）
+    "provider": "edge",
+    # ffmpeg 后处理链（房间感 / 压缩 / 去齿音），可留空
+    "postfilter": "",
+    # 豆包通道参数（provider=doubao 时才用到）
+    "doubao": {
+        "endpoint": "https://openspeech.bytedance.com/api/v3/tts/create",
+        "key": "",
+        "model": "seed-audio-1.0",
+        # 用一句自然语言描述角色与情绪，模型自己决定停顿和语气
+        "style": "",
+        # 一定要写，否则模型可能自己加音效或配乐
+        "tail": "只有她的人声，不要背景音效，不要音乐，不要任何其他声音。",
+        "speech_rate": 0,
+        # 超过这个秒数的空白会被压掉（**别设太小**，轻声气声会被切没）
+        "trim_pause": 0.45,
+    },
+}
+
+DEFAULT_IMAGE = {
+    # 出图通道：agnes（默认，稳）/ gpt-image / openai（OpenAI 兼容中转）/ banana（Gemini 原生）
+    "provider": "agnes",
+    # gpt-image / openai 通道
+    "endpoint": "",
+    "key": "",
+    "model": "gpt-image-2.5",
+    # banana 通道（Gemini 原生协议，服装/道具/手部细节最听话）
+    "banana": {
+        "endpoint": "https://apibase.cc",
+        "key": "",
+        "model": "nano-banana-pro",
+        "image_size": "2K",
+    },
 }
 
 DEFAULT_TEXT = {
@@ -164,12 +209,22 @@ DEFAULT_VIDEO_CH = {
     "model": "",
     "jobs": 3,
     "poll_interval": 30.0,
+    # 多档通道：订阅额度 → 免费额度 → 按量付费，能白嫖就白嫖，排不上才花钱。
+    # [{"name":"档位名","endpoint":"...","key":"...","model":"..."}]
+    "tiers": [],
+    # 分档并行配额：{"0": 3, "2": 3} = 第1档3路 + 第3档3路同时跑
+    "tier_slots": {},
+    # 换到付费档要不要先问一句（默认要，防止程序偷偷烧钱）
+    "paid_requires_confirm": True,
+    # 免费档最多试几轮就换下一档
+    "free_tier_max_attempts": 1,
 }
 
 DEFAULT_CFG = {
     "title": "untitled",
     "ffmpeg": "ffmpeg",
     "text": DEFAULT_TEXT,
+    "image": DEFAULT_IMAGE,
     "video": DEFAULT_VIDEO_CH,
     "agnes": DEFAULT_AGNES,
     "music": DEFAULT_MUSIC,
@@ -331,6 +386,9 @@ def save_json(path, obj):
 
 
 def project_paths(root):
+    # root 绝对化：后续有些步骤会切 cwd 执行 ffmpeg（如 assemble 的 render 用
+    # cwd=paths["out"]），相对路径在换了工作目录后就指错文件了。
+    root = os.path.abspath(root)
     return {
         "root": root,
         "config": os.path.join(root, "project.json"),
@@ -915,17 +973,28 @@ def agnes_image_generate(cfg, prompt, ref_paths=None, size=None, ratio=None,
 
 
 def frame_source(cfg, frame_path):
-    """本地首帧 → 视频接口可用形式。默认 base64 data URI；配置了 frame_upload 则上传取 URL。"""
+    """本地首帧 → 视频接口可用形式。默认 base64 data URI；配置了 frame_upload 则上传取 URL。
+
+    ⚠️ frame_upload 是配置里的 shell 命令模板，**用 shlex 拆成参数列表执行**，
+    不走 shell=True —— 避免配置被篡改后变成任意命令执行。
+    """
     a = cfg["agnes"]
     up = (a.get("frame_upload") or "").strip()
     if up:
-        cmd = up.replace("{file}", frame_path)
-        p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        import shlex
+        try:
+            parts = shlex.split(up, posix=(os.name != "nt"))
+        except ValueError as e:
+            die("frame_upload 命令无法解析: %s (%s)" % (up, e))
+        if not parts:
+            die("frame_upload 是空的")
+        parts = [p.replace("{file}", frame_path) for p in parts]
+        p = subprocess.run(parts, shell=False, capture_output=True, text=True)
         out = (p.stdout or "").strip()
         url = out.splitlines()[-1].strip() if out else ""
         if not url.startswith("http"):
             die("frame_upload 没有输出公网 URL。命令: %s\nstdout: %s\nstderr: %s"
-                % (cmd, out[:300], (p.stderr or "")[:300]))
+                % (" ".join(parts), out[:300], (p.stderr or "")[:300]))
         return url
     return file_to_data_uri(frame_path)
 
@@ -1118,9 +1187,19 @@ def agnes_video_status(cfg, video_id, tier_idx=None):
 
 # ----------------------------------------------------------------------------- music (optional, comfy)
 
+def comfy_auth_headers(mus_cfg):
+    """ComfyUI 的 Basic Auth 头。music.auth 形如 "user:pass"，为空则不带头。"""
+    raw = (mus_cfg.get("auth") or "").strip()
+    if not raw:
+        return {}
+    import base64 as _b64
+    return {"Authorization": "Basic " + _b64.b64encode(raw.encode("utf-8")).decode()}
+
+
 def comfy_submit(mus_cfg, workflow, client_id="agnes-clip"):
     endpoint = mus_cfg["endpoint"].rstrip("/")
-    d = http_json(endpoint + "/prompt", {"prompt": workflow, "client_id": client_id}, timeout=120)
+    d = http_json(endpoint + "/prompt", {"prompt": workflow, "client_id": client_id},
+                  headers=comfy_auth_headers(mus_cfg), timeout=120)
     if "prompt_id" not in d:
         die("ComfyUI 提交失败: " + json.dumps(d, ensure_ascii=False)[:600])
     return d["prompt_id"]
@@ -1132,7 +1211,8 @@ def comfy_wait(mus_cfg, prompt_id, timeout=1800):
     while time.time() - t0 < timeout:
         time.sleep(15)
         try:
-            h = http_json(endpoint + "/history/" + prompt_id, timeout=60)
+            h = http_json(endpoint + "/history/" + prompt_id,
+                          headers=comfy_auth_headers(mus_cfg), timeout=60)
         except Exception:
             continue
         if prompt_id not in h:
@@ -1149,15 +1229,16 @@ def comfy_wait(mus_cfg, prompt_id, timeout=1800):
     die("配乐等待超时")
 
 
-def build_music_workflow(mus_cfg, caption, duration, seed):
+def build_music_workflow(mus_cfg, caption, duration, seed, lyrics=None):
     return {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": mus_cfg["unet"], "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": mus_cfg["clip"], "type": "minimax", "device": "default"}},
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": mus_cfg["vae"]}},
         "4": {"class_type": "MiniMaxMusic3TextEncode", "inputs": {
-            "clip": ["2", 0], "caption": caption, "lyrics": "[Instrumental]",
+            "clip": ["2", 0], "caption": caption,
+            "lyrics": lyrics if lyrics else "[Instrumental]",
             "seed": seed, "max_duration": float(duration),
-            "cfg_scale": mus_cfg.get("cfg", 1.8), "top_k": 50}},
+            "cfg_scale": mus_cfg.get("cfg", 1.8), "top_k": mus_cfg.get("top_k", 50)}},
         "5": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["4", 0]}},
         "6": {"class_type": "EmptyMiniMaxMusic3LatentAudio", "inputs": {"seconds": float(duration), "batch_size": 1}},
         "7": {"class_type": "KSampler", "inputs": {
@@ -1169,15 +1250,28 @@ def build_music_workflow(mus_cfg, caption, duration, seed):
     }
 
 
-def do_music_comfy(cfg, paths, duration=None, caption=None, seed=None):
+def do_music_comfy(cfg, paths, duration=None, caption=None, seed=None, lyrics=None, force=False):
     m = cfg.get("music") or {}
     if not m.get("endpoint"):
         die("未配置配乐 ComfyUI 端点（music.endpoint）。不需要配乐可跳过，assemble 会输出无配乐版")
     duration = duration or m.get("duration", 100)
     caption = caption or m.get("caption")
     seed = seed or int(time.time()) % 100000
+    lyrics = lyrics if lyrics is not None else m.get("lyrics")
+    dst = os.path.join(paths["audio"], "bgm.mp3")
+    # 幂等：同一 seed 的配乐已存在就跳过，除非 --force
+    if os.path.exists(dst) and not force:
+        meta_p = os.path.join(paths["audio"], "bgm.meta.json")
+        if os.path.exists(meta_p):
+            try:
+                meta = json.load(open(meta_p, encoding="utf-8"))
+                if meta.get("seed") == seed and meta.get("duration") == float(duration):
+                    info("配乐已存在（seed=%s），跳过。--force 可重生成" % seed)
+                    return
+            except Exception:
+                pass
     info("生成配乐 %.1f 秒 ..." % duration)
-    pid = comfy_submit(m, build_music_workflow(m, caption, duration, seed))
+    pid = comfy_submit(m, build_music_workflow(m, caption, duration, seed, lyrics))
     outs = comfy_wait(m, pid)
     if not outs:
         die("配乐没有输出")
@@ -1185,10 +1279,17 @@ def do_music_comfy(cfg, paths, duration=None, caption=None, seed=None):
     q = urllib.parse.urlencode({"filename": item.get("filename"),
                                 "subfolder": item.get("subfolder", ""),
                                 "type": item.get("type", "output")})
-    raw = http_bytes(m["endpoint"].rstrip("/") + "/view?" + q)
-    dst = os.path.join(paths["audio"], "bgm.mp3")
+    raw = http_bytes(m["endpoint"].rstrip("/") + "/view?" + q,
+                     headers=comfy_auth_headers(m))
     with open(dst, "wb") as f:
         f.write(raw)
+    try:
+        json.dump({"seed": seed, "duration": float(duration), "caption": caption,
+                   "lyrics": lyrics or "[Instrumental]", "provider": "comfyui"},
+                  open(os.path.join(paths["audio"], "bgm.meta.json"), "w", encoding="utf-8"),
+                  ensure_ascii=False, indent=2)
+    except Exception:
+        pass
     info("配乐 -> audio/bgm.mp3 (%.1f MB)" % (len(raw) / 1e6))
 
 
@@ -1433,19 +1534,22 @@ def do_music_volc(cfg, paths, duration=None, caption=None):
     info("配乐 -> audio/bgm.mp3 (%.1f MB，火山引擎)" % size)
 
 
-def do_music(cfg, paths, duration=None, caption=None, seed=None, provider=None):
+def do_music(cfg, paths, duration=None, caption=None, seed=None, provider=None,
+             lyrics=None, force=False):
     prov = (provider or (cfg.get("music") or {}).get("provider") or "comfyui").strip().lower()
     if prov in ("volc", "volcengine", "doubao", "ark"):
         return do_music_volc(cfg, paths, duration, caption)
     if prov in ("comfyui", "comfy", "local", ""):
-        return do_music_comfy(cfg, paths, duration, caption, seed)
+        return do_music_comfy(cfg, paths, duration, caption, seed, lyrics, force)
     die("不认识的配乐通道 %r，可选 comfyui / volc" % prov)
 
 
 def cmd_music(args):
     cfg, paths = load_project(args.dir)
     do_music(cfg, paths, args.duration, args.caption, args.seed,
-             provider=getattr(args, "provider", None))
+             provider=getattr(args, "provider", None),
+             lyrics=getattr(args, "lyrics", None),
+             force=getattr(args, "force", False))
 
 
 # ----------------------------------------------------------------------------- init
@@ -2326,7 +2430,7 @@ def make_char_card(cfg, paths, name, face_ref, desc="", outfit="", style="sheets
 
 
 def do_char_gen(cfg, paths, name, desc, with_turnaround=False, outfit="",
-                card=True, card_style="sheets", channel=None):
+                card=True, card_style="sheets", channel=None, force=False):
     """生成角色资产。
 
     两段式：
@@ -2337,12 +2441,31 @@ def do_char_gen(cfg, paths, name, desc, with_turnaround=False, outfit="",
 
     channel：None=跟随配置；"agnes"/"gpt-image"/"banana" 可显式指定。
     两段必须同通道，所以先定下 channel 再两段都用它。
+
+    幂等：face_ref.jpg 已存在且描述/服装/通道都没变时直接跳过（**每次重跑都烧额度**）。
     """
     require_agnes_creds(cfg)
     exe = have_ffmpeg(cfg)
     cdir = os.path.join(paths["chars"], name)
     os.makedirs(cdir, exist_ok=True)
     ch = (channel or "").strip() or image_channel(cfg, paths)
+
+    # ── 幂等守卫：已有资产且规格未变就跳过 ──
+    meta_p = os.path.join(cdir, "meta.json")
+    face_p = os.path.join(cdir, "face_ref.jpg")
+    if not force and os.path.exists(face_p) and os.path.exists(meta_p):
+        try:
+            old = json.load(open(meta_p, encoding="utf-8"))
+            same = (old.get("desc") == desc and old.get("outfit") == outfit
+                    and old.get("channel") == ch
+                    and (not card or bool(old.get("char_card"))))
+            if same:
+                info("角色 %s 已存在（face_ref.jpg + 设定卡齐全），跳过。--force 可重做" % name)
+                return
+            info("角色 %s 规格有变化，重新生成" % name)
+        except Exception:
+            pass
+
     # 定妆图的服装必须和全片 outfit_en 一致，否则首帧会照着参考图穿错衣服。
     wear = ("Wearing exactly this outfit: %s. " % outfit.strip()) if (outfit or "").strip() else ""
     prompt = ("Character reference portrait of an East Asian Chinese person: %s. "
@@ -2410,7 +2533,7 @@ def cmd_char_gen(args):
         die("--channel 只能是：%s" % " / ".join(sorted(IMAGE_CHANNELS)))
     do_char_gen(cfg, paths, name, desc, with_turnaround=args.tri, outfit=outfit,
                 card=not getattr(args, "no_card", False), card_style=style,
-                channel=chan or None)
+                channel=chan or None, force=getattr(args, "force", False))
 
 
 def cmd_char_add(args):
@@ -2586,18 +2709,29 @@ def cmd_episode_new(args):
 
 # ----------------------------------------------------------------------------- props
 
-def do_prop_gen(cfg, paths, name, desc):
+def do_prop_gen(cfg, paths, name, desc, force=False):
     require_agnes_creds(cfg)
     exe = have_ffmpeg(cfg)
     pdir = paths["props"]
     os.makedirs(pdir, exist_ok=True)
+    jpg = os.path.join(pdir, name + ".jpg")
+    js = os.path.join(pdir, name + ".json")
+    # 幂等：已存在且描述没变就跳过
+    if not force and os.path.exists(jpg) and os.path.exists(js):
+        try:
+            old = json.load(open(js, encoding="utf-8"))
+            if old.get("desc") == desc:
+                info("道具 %s 已存在，跳过。--force 可重做" % name)
+                return
+        except Exception:
+            pass
     prompt = ("Product-style reference image of a single prop: %s. "
               "Centered, whole object in frame, clean neutral background, soft studio lighting, "
               "photorealistic, high detail, no text, no watermark, no people." % desc)
     info("生成道具 %s ..." % name)
     raw, _ = agnes_image_generate(cfg, prompt, project_paths=paths)
-    save_image_bytes(raw, os.path.join(pdir, name + ".jpg"), exe)
-    save_json(os.path.join(pdir, name + ".json"), {
+    save_image_bytes(raw, jpg, exe)
+    save_json(js, {
         "name": name, "desc": desc, "created": time.strftime("%Y-%m-%d %H:%M:%S"),
     })
     info("道具资产 -> assets/props/%s.jpg" % name)
@@ -2615,7 +2749,7 @@ def cmd_prop_gen(args):
                 break
     if not desc:
         die("缺少 --desc，且 shots.json 的 props 里没有 %s 的描述" % name)
-    do_prop_gen(cfg, paths, name, desc)
+    do_prop_gen(cfg, paths, name, desc, force=getattr(args, "force", False))
 
 
 # ----------------------------------------------------------------------------- scenes
@@ -4549,8 +4683,13 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
             render(True)
         except SystemExit:
             warn("字幕烧制失败（可能是字体问题），改为无字幕输出")
-            # 去掉 ass 滤镜重试
+            # 去掉 ass 滤镜重试。
+            # 注意：video_only 等中间产物这时已被删掉（见下面的清理），
+            # 所以要先把它们重新生成出来，否则重试必然失败。
             parts[:] = [p for p in parts if "[vout]" not in p]
+            if not os.path.exists(video_only):
+                _xfade_chain(exe, work, [e["duration"] for e in entries], trans, kinds,
+                             video_only, with_audio=all_audio)
             render(False)
     else:
         render(False)
@@ -4639,8 +4778,14 @@ def do_seam(cfg, paths, window=0.4):
             continue
         diff = sum(abs(x - y) for x, y in zip(ta, tb)) / float(len(ta))
         rows.append((a["id"], b["id"], diff, bool(b.get("tail_frame")), b.get("kind")))
-    for r in sorted(rows, key=lambda x: -x[2])[:6]:
-        pass
+    top = sorted(rows, key=lambda x: -x[2])[:6]
+    if top:
+        print("最跳的 6 处：")
+        for a_id, b_id, d, bridged, kind in top:
+            tag = "尾帧桥接" if bridged else ("回忆" if kind == "recall" else "")
+            mark = " <<< 硬跳" if d >= 60 else (" < 轻微" if d >= 35 else "")
+            print("  %s → %s  差值 %.1f%s %s" % (a_id, b_id, d, mark, tag))
+        print("")
     print("接缝检查（上一镜末帧 vs 下一镜首帧，灰度差 0-255）")
     print("%-6s %-6s %6s  %s" % ("前", "后", "差值", "备注"))
     for a, b, d, bridged, kind in rows:
@@ -6313,6 +6458,7 @@ def main():
     p.add_argument("--no-card", action="store_true", help="只出正脸，不生成多格设定卡")
     p.add_argument("--card-style", default="sheets", help="设定卡版式：sheets / turnaround")
     p.add_argument("--channel", default="", help="出图通道：agnes / gpt-image / banana；默认跟随配置")
+    p.add_argument("--force", action="store_true", help="已存在也重新生成（会重新出图，消耗额度）")
     p.set_defaults(func=cmd_char_gen)
 
     p = sub.add_parser("char-add", help="导入已有照片作为角色")
@@ -6340,6 +6486,7 @@ def main():
     p.add_argument("dir")
     p.add_argument("--name", required=True)
     p.add_argument("--desc", default=None)
+    p.add_argument("--force", action="store_true", help="已存在也重新生成（会重新出图，消耗额度）")
     p.set_defaults(func=cmd_prop_gen)
 
     p = sub.add_parser("scene-gen", help="按场景四要素生成空场景图（不带人物）")
@@ -6384,6 +6531,9 @@ def main():
     p.add_argument("--duration", type=float, default=None)
     p.add_argument("--caption", default=None)
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--lyrics", default=None,
+                   help="歌词（带唱词时用）；不给就是纯器乐 [Instrumental]")
+    p.add_argument("--force", action="store_true", help="已存在也重新生成")
     p.add_argument("--provider", default=None,
                    help="comfyui（本地显卡）或 volc（火山引擎豆包音乐，无卡也能跑）")
     p.set_defaults(func=cmd_music)

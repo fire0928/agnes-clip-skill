@@ -6,7 +6,7 @@ description: 用 Agnes 云端算力全自动做竖屏短剧/长视频——一�
 description_zh: 一句话创意自动做成有对白、会说话的竖屏短剧。全流程 15 步：写剧本、分镜、角色定妆、场景板、逐镜首帧、批量出视频、配乐音效字幕、合成成片，人脸全程锁死不怕换脸。视频走云端算力，不占本地显卡。适合做催泪短剧、漫剧、系列连续剧，也支持同系列多集复用同一张脸。
 description_en: Turn a one-line idea into a vertical short drama with real dialogue. A 15-stage pipeline handles scripting, storyboarding, character sheets, scene boards, first frames, batch video generation, music, sound effects, subtitles and final cut — with character faces locked across every shot so nobody switches faces mid-story. Video runs on cloud GPUs, so no local hardware needed. Great for tearjerkers, anime shorts and serialized episodes that reuse the same face across episodes.
 agent_created: true
-version: 1.3.1
+version: 1.4.0
 ---
 
 # Agnes Clip · 一句话成片
@@ -153,7 +153,33 @@ python scripts/ac.py char-gen "<dir>" --name hero --channel gpt-image # 指定�
 `meta.json` 里记了实际用的通道，排查换脸问题时先看这个字段。
 
 **关键纪律：`char_card.jpg` 绝不能拿去当首帧参考图。** 它是多格排版，
-当参考图会把分格线和其他格的人一起喂进首帧，构图直接崩。只用 `face_ref.jpg`。
+当参考图会把分格线和其他格的人一起喂进首帧，构图直接崩。
+
+### 首帧会按机位自动挑角度图
+
+出完设定卡，代码会自动把卡里的正/侧/背三格裁成独立小图，放进
+`assets/characters/<名>/views/`。首帧生成时**按机位取对应的角度图**：
+
+| 机位 `shot.angle` | 取哪张 |
+|---|---|
+| `front` / `eye` / `close` / `portrait` | `views/front.jpg` |
+| `side` / `profile` / `three_quarter` / `3q` | `views/side.jpg` |
+| `back` / `rear` / `from_behind` | `views/back.jpg` |
+| 其余（`wide` / `high` / `low` / 过肩 / 没写） | `face_ref.jpg`（最稳，兜底） |
+
+为什么：**以前不管什么机位都只喂正面照**，拍侧面背面时模型得自己脑补，
+镜头一转脸就飘。喂对应角度的图，人脸在侧背面也有据可依。
+
+裁切靠自动找设定卡上的白色分隔带，不写死比例——两个通道出的卡尺寸不同
+（Agnes 1254 / GPT Image 2048），位置也不完全一样。裁不准就跳过，
+首帧照旧用 `face_ref.jpg`，**不会影响出片**。
+
+换了设定卡想重切：
+
+```bash
+python scripts/ac.py views "<dir>"                # 全部角色
+python scripts/ac.py views "<dir>" --name hero    # 只切一个
+```
 
 > `char-add`（真人照片导入）只会产出 `face_ref.jpg`，不会有设定卡——
 > 想补一张就用同一张人像当参考跑一次 `make_char_card`。
@@ -482,6 +508,7 @@ python scripts/ac.py char-gen "<dir>" --name boss --desc "50岁女性，盘发�
 python scripts/ac.py char-gen "<dir>" --name hero --card-style turnaround   # 换设定卡版式
 python scripts/ac.py char-gen "<dir>" --name hero --no-card                 # 只出正脸，跳过设定卡
 python scripts/ac.py char-gen "<dir>" --name hero --channel gpt-image        # 指定出图通道（agnes/gpt-image/banana）
+python scripts/ac.py views "<dir>"                              # 从设定卡重切角度参考图
 python scripts/ac.py char-add "<dir>" "C:/photos/me.jpg" --name hero   # 真人照片锁脸
 python scripts/ac.py cast "<dir>" [list|init|push] [--name girl] [--all]  # 共享角色库（多集复用同一张脸）
 python scripts/ac.py episode-new "<第1集目录>" --name ep02 --title "第二集"  # 新建一集并继承全部角色形象

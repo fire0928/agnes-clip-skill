@@ -2034,6 +2034,157 @@ def make_turnaround(cfg, paths, name):
     info("%s 三视图 -> assets/characters/%s/turnaround.jpg" % (name, name))
 
 
+# --------------------------------------------------------------------------- 角度分格裁切
+#
+# 设定卡里本来就有正面/侧面/背面，但首帧生成一直只喂 face_ref.jpg（正面），
+# 于是拍侧背面时模型只能自己脑补 → 转个角度脸就漂。
+# 这里把设定卡按白色分隔带自动定位格子，裁成独立小图存进 assets/characters/<名>/views/，
+# 首帧按机位挑对应角度喂进去。
+#
+# 为什么不写死比例：Agnes 和 GPT Image 两个通道出的卡尺寸不同（1254 vs 2048），
+# 分格位置也不完全一致。实测用"白底列投影找分隔带"两边都稳。
+
+VIEW_NAMES = ("front", "side", "back")
+
+
+def _card_panels(img_path):
+    """在设定卡上半部找竖直白色分隔带，返回各格的 x 区间。
+
+    只用 Pillow，不依赖 numpy——大多数环境没装，装依赖会让 skill 跑不起来。
+    算法：逐列统计「该列在中上部有多少比例的像素接近纯白」，连续超阈值的列
+    合成一条分隔带，再把贴边的（画布边界）去掉，剩下的中点即为格线。
+    """
+    from PIL import Image
+    im = Image.open(img_path).convert("L")     # 灰度：白 = 255
+    w, h = im.size                              # 原图尺寸
+    y0, y1 = int(h * 0.04), int(h * 0.56)
+    crop = im.crop((0, y0, w, y1))
+    cw, ch = crop.size                          # 裁片尺寸（只有高度变了）
+    px = crop.load()
+    # 每列的「近白行数」占比
+    ratio = []
+    for x in range(cw):
+        n = 0
+        for y in range(ch):
+            if px[x, y] > 232:
+                n += 1
+        ratio.append(n / float(ch))
+    thr, minw = 0.88, max(2, int(w * 0.002))
+    runs, cur = [], None
+    for x in range(cw):
+        if ratio[x] > thr:
+            cur = [x, x] if cur is None else [cur[0], x]
+        else:
+            if cur:
+                runs.append(cur)
+                cur = None
+    if cur:
+        runs.append(cur)
+    merged = []
+    for r in runs:
+        if merged and r[0] - merged[-1][1] < w * 0.006:
+            merged[-1][1] = r[1]
+        else:
+            merged.append(list(r))
+    inner = [r for r in merged if r[0] > w * 0.01 and r[1] < w * 0.99]
+    bounds = [0] + [(r[0] + r[1]) // 2 for r in inner] + [w]
+    cells = [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
+    return im, (h, w), [c for c in cells if c[1] - c[0] > w * 0.05]
+
+
+def cut_views(cfg, paths, name, quiet=False):
+    """把设定卡裁成 views/front.jpg、side.jpg、back.jpg。
+
+    设定卡版式：大头 | 正面 | 侧面 | 背面 | 细节列（sheets）
+    或：大头 | 正 | 四分之三侧 | 侧 | 背（turnaround）
+    两种都取"中间那几格"当三视图。裁不准就返回空 dict，不影响主流程。
+    """
+    cdir = char_dir(paths, name)
+    card = os.path.join(cdir, "char_card.jpg")
+    if not os.path.exists(card):
+        return {}
+    try:
+        im, (h, w), cells = _card_panels(card)
+    except Exception as e:
+        warn("%s 设定卡分格定位失败（不影响出片）：%s" % (name, str(e)[:80]))
+        return {}
+    if len(cells) < 3:
+        warn("%s 设定卡只识别到 %d 格，跳过分角度参考图" % (name, len(cells)))
+        return {}
+    # 第 0 格是大头，中间是三视图，末格是细节列
+    mid = cells[1:-1]
+    if len(mid) == 4:          # turnaround 版式多一个四分之三侧，取后三个
+        mid = mid[-3:]
+    if len(mid) < 3:
+        return {}
+    vdir = os.path.join(cdir, "views")
+    os.makedirs(vdir, exist_ok=True)
+    made = {}
+    y0, y1 = int(h * 0.02), int(h * 0.62)
+    for nm, (x0, x1) in zip(VIEW_NAMES, mid[:3]):
+        dst = os.path.join(vdir, nm + ".jpg")
+        try:
+            crop = im.crop((x0, y0, x1, y1))
+            # 裁完缩到长边 1024，喂参考图不必给太大
+            sc = 1024.0 / max(crop.size)
+            if sc < 1:
+                crop = crop.resize((max(1, int(crop.width * sc)),
+                                    max(1, int(crop.height * sc))))
+            crop.convert("RGB").save(dst, "JPEG", quality=92)
+            made[nm] = dst
+        except Exception as e:
+            warn("%s 裁 %s 失败：%s" % (name, nm, str(e)[:60]))
+    if made and not quiet:
+        info("%s 已分出角度参考图: %s" % (name, " / ".join(made)))
+    return made
+
+
+def view_for_angle(paths, name, angle):
+    """按机位挑角度参考图；没有就回落到 face_ref.jpg。
+
+    只在"确实要看到脸"的机位才用角度图：
+    - front / eye / close → 正面
+    - side / three_quarter → 侧面（四分之三）
+    - back → 背面
+    - 顶视/俯视/过肩等拿不准的，一律用 face_ref.jpg（最稳）
+    """
+    fref = os.path.join(char_dir(paths, name), "face_ref.jpg")
+    a = (angle or "").strip().lower()
+    pick = None
+    if a in ("back", "rear", "from_behind"):
+        pick = "back"
+    elif a in ("side", "profile", "three_quarter", "3q"):
+        pick = "side"
+    elif a in ("front", "eye", "close", "closeup", "portrait"):
+        pick = "front"
+    else:
+        return fref if os.path.exists(fref) else None
+    p = os.path.join(char_dir(paths, name), "views", pick + ".jpg")
+    if os.path.exists(p):
+        return p
+    return fref if os.path.exists(fref) else None
+
+
+def cmd_views(args):
+    """从已有设定卡重切角度参考图（改了版式或换了卡之后用）。"""
+    cfg, paths = load_project(args.dir)
+    names = []
+    if args.name:
+        names = [args.name]
+    else:
+        cdir = paths["chars"]
+        if os.path.isdir(cdir):
+            names = [d for d in sorted(os.listdir(cdir))
+                     if os.path.isdir(os.path.join(cdir, d))]
+    if not names:
+        die("没有可用角色（先跑 char-gen）")
+    for n in names:
+        made = cut_views(cfg, paths, n)
+        if not made:
+            print("  %s: 没有可用设定卡，跳过" % n)
+    info("完成。角度图在各角色的 views/ 下。")
+
+
 # 角色设定卡（character sheet）的分格布局。
 # 参考的是常见的国漫/游戏角色设定稿：大头 + 多角度 + 表情行 + 细节特写。
 # 实测 agnes-image-2.5-flash 能稳定复刻这种排版，且每格人脸一致。
@@ -2120,8 +2271,13 @@ def do_char_gen(cfg, paths, name, desc, with_turnaround=False, outfit="",
     save_image_bytes(raw, os.path.join(cdir, "source.jpg"), exe)
     shutil.copy2(os.path.join(cdir, "source.jpg"), os.path.join(cdir, "face_ref.jpg"))
     if card:
-        make_char_card(cfg, paths, name, os.path.join(cdir, "face_ref.jpg"),
-                       desc=desc, outfit=outfit, style=card_style, channel=ch)
+        card_path = make_char_card(cfg, paths, name, os.path.join(cdir, "face_ref.jpg"),
+                                   desc=desc, outfit=outfit, style=card_style, channel=ch)
+        # 设定卡里已有正/侧/背三视图，裁成独立小图供首帧按机位取用。
+        # 裁不出来不影响出片，首帧会照旧用 face_ref.jpg。
+        views = cut_views(cfg, paths, name)
+    else:
+        card_path, views = "", {}
     if with_turnaround:
         make_turnaround(cfg, paths, name)
     save_json(os.path.join(cdir, "meta.json"), {
@@ -2134,10 +2290,14 @@ def do_char_gen(cfg, paths, name, desc, with_turnaround=False, outfit="",
         "face_ref": "face_ref.jpg",
         "char_card": "char_card.jpg" if card else "",
         "card_style": card_style if card else "",
+        "views": {k: os.path.relpath(v, cdir).replace(os.sep, "/")
+                  for k, v in (views or {}).items()},
         "rule": "所有首帧一律以 face_ref.jpg 为参考图；禁止用上一段尾帧接力（会累积漂移）",
         "card_rule": "char_card.jpg 是设定稿，给人看造型用；不要拿它当首帧参考图，"
                      "多格排版会污染单镜头构图",
         "channel_rule": "face_ref 与 char_card 必须在同一条出图通道上生成（换通道 = 换脸）",
+        "view_rule": "views/ 是从设定卡裁出的角度图，首帧按机位自动取；"
+                     "拿不准的机位仍走 face_ref.jpg",
     })
     info("角色资产完成: assets/characters/%s/" % name)
 
@@ -2228,6 +2388,16 @@ def _copy_char(src_chars, dst_lib, name, force=False):
     for f in ("source.jpg", "face_ref.jpg", "turnaround.jpg", "meta.json"):
         if os.path.exists(os.path.join(s, f)):
             shutil.copy2(os.path.join(s, f), os.path.join(d, f))
+    # 设定卡与角度图也要带过去，否则第 2 集得多花一次生图重出
+    if os.path.exists(os.path.join(s, "char_card.jpg")):
+        shutil.copy2(os.path.join(s, "char_card.jpg"), os.path.join(d, "char_card.jpg"))
+    sv = os.path.join(s, "views")
+    if os.path.isdir(sv):
+        dv = os.path.join(d, "views")
+        os.makedirs(dv, exist_ok=True)
+        for f in os.listdir(sv):
+            if f.lower().endswith((".jpg", ".jpeg", ".png")):
+                shutil.copy2(os.path.join(sv, f), os.path.join(dv, f))
     return True
 
 
@@ -2598,11 +2768,14 @@ def _frame_for_shot(cfg, paths, shot, exe, chars=None, dry=False):
     # shot.faces：只把“画面里真露脸”的角色参考图喂进去。过肩镜头前景那人背对镜头，
     # 喂了他的脸就会被复制成第二个人（实测事故），所以允许按镜收窄。
     face_cast = shot.get("faces") or shot.get("cast") or [cname]
+    ang = (shot.get("angle") or "").strip()
     refs = []
     if not is_empty_gen:
         for n in face_cast:
-            p = os.path.join(char_dir(paths, n), "face_ref.jpg")
-            if os.path.exists(p):
+            # 按机位取对应角度的参考图：侧面机位喂侧脸、背面机位喂背影，
+            # 没裁出来或机位不明确就回落到 face_ref.jpg（最稳）。
+            p = view_for_angle(paths, n, ang)
+            if p and os.path.exists(p):
                 refs.append(p)
         if not refs:
             refs = [face_ref]
@@ -2635,9 +2808,18 @@ def _frame_for_shot(cfg, paths, shot, exe, chars=None, dry=False):
         return None
 
     require_agnes_creds(cfg)
-    n_face = len([r for r in refs if os.path.basename(r) == "face_ref.jpg"])
-    info("%s 生成首帧（机位 %s，参考图 %d 张：人脸 %d + 场景 %d）"
-         % (sid, shot.get("angle") or "wide", len(refs), n_face, 1 if plate else 0))
+    n_face = len([r for r in refs
+                  if os.path.basename(r) == "face_ref.jpg"
+                  or os.path.basename(os.path.dirname(r)) == "views"])
+    # 机位决定了喂哪张角度图，日志要能看出来
+    used_view = ""
+    for r in refs:
+        if os.path.basename(os.path.dirname(r)) == "views":
+            used_view = os.path.splitext(os.path.basename(r))[0]
+            break
+    info("%s 生成首帧（机位 %s，参考图 %d 张：人脸 %d%s + 场景 %d）"
+         % (sid, shot.get("angle") or "wide", len(refs), n_face,
+            ("/" + used_view) if used_view else "", 1 if plate else 0))
     raw, _ = agnes_image_generate(cfg, prompt, ref_paths=refs, project_paths=paths)
     save_image_bytes(raw, out, exe)
     info("%s 首帧 -> frames/%s.jpg" % (sid, sid))
@@ -6010,6 +6192,11 @@ def main():
     p.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
     p.add_argument("--dir", default="", help="当前项目目录，页面自动填入「项目级选择」")
     p.set_defaults(func=cmd_config_ui)
+
+    p = sub.add_parser("views", help="从已有设定卡重切角度参考图（views/front|side|back）")
+    p.add_argument("dir")
+    p.add_argument("--name", default="", help="只处理某个角色；不给则处理全部")
+    p.set_defaults(func=cmd_views)
 
     p = sub.add_parser("pick-image", help="给单个项目指定出图通道（不写全局配置）")
     p.add_argument("dir")

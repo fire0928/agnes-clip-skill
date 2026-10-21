@@ -159,6 +159,11 @@ python scripts/ac.py char-add "<dir>" "C:/photos/me.jpg" --name hero   # 真人�
   和隔壁格的人一起喂进首帧。单镜头构图会直接崩。只用 `face_ref.jpg`。
 - `char-add`（真人照片）只出 `face_ref.jpg`，没有设定卡。要补就拿同一张人像当参考
   跑一次 `make_char_card()`。
+- **首帧按机位取角度图**：`char-gen` 出完设定卡会自动把正/侧/背三格裁进
+  `views/`，首帧按 `shot.angle` 取：`front/eye/close`→front，`side/profile/three_quarter`→side，
+  `back/rear`→back，其余一律 `face_ref.jpg`。以前所有机位都只喂正面照，
+  侧背面镜头模型得自己脑补 → 转角度脸就飘。裁切靠白底分隔带自动定位，不写死比例。
+  换了卡想重切：`python scripts/ac.py views "<dir>"`（裁不准会跳过，不影响出片）。
 
 **出图通道**：`char-gen` 走哪条通道由 `--channel` 决定（不给就跟随配置，项目级优先于全局）。
 Agnes（`agnes-image-2.5-flash`）快且额度够，GPT Image 分格更直、三视图透视更准。

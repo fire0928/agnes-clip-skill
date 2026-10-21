@@ -172,6 +172,7 @@ $AC char-gen <项目目录> --name 小林 --desc "..."   # 角色定妆（正脸
 $AC char-gen <项目目录> --name 小林 --card-style turnaround   # 换设定卡版式
 $AC char-gen <项目目录> --name 小林 --no-card         # 只出正脸
 $AC char-gen <项目目录> --name 小林 --channel gpt-image # 指定通道（两段必须同通道）
+$AC views <项目目录>                          # 从设定卡重切角度参考图
 $AC prop-gen <项目目录> --name 药盒 --desc "..."   # 道具图
 $AC scene-gen <项目目录>                # 场景板
 $AC frame <项目目录> --dry-run          # 先看提示词
@@ -205,6 +206,7 @@ projects/我的片子/
 ├── assets/
 │   ├── characters/<名>/face_ref.jpg   角色正脸（首帧锁脸锚点，必须用它）
 │   ├── characters/<名>/char_card.jpg  多格设定稿（大头+三视图+表情+细节，给人看）
+│   ├── characters/<名>/views/{front,side,back}.jpg  从设定卡裁的角度图，首帧按机位自动取
 │   ├── props/*.jpg                    道具图
 │   └── scenes/<场景>__<机位>.jpg      场景板
 ├── frames/S01.jpg ...    逐镜首帧

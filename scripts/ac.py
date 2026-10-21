@@ -671,6 +671,10 @@ def agnes_text(cfg, messages, temperature=0.7, timeout=300, max_tokens=8000):
         die("Agnes 文本返回格式异常: " + json.dumps(d, ensure_ascii=False)[:500])
 
 
+# 支持的出图通道。角色卡的 face_ref 与 char_card 必须同通道，否则会串脸。
+IMAGE_CHANNELS = {"agnes", "gpt-image", "openai", "banana", "nano-banana", "gemini"}
+
+
 def image_channel(cfg, paths=None):
     """本项目实际用哪条出图通道。
 
@@ -678,6 +682,8 @@ def image_channel(cfg, paths=None):
     项目级选择让同一个 skill 能同时跑不同通道的项目，不用反复改全局配置。
     """
     ch = ((cfg.get("image") or {}).get("provider") or "agnes").strip() or "agnes"
+    if ch not in IMAGE_CHANNELS:
+        ch = "agnes"
     if paths:
         try:
             pj = load_json(os.path.join(paths.get("root", ""), "project.json"), {})
@@ -2053,10 +2059,14 @@ CHAR_CARD_STYLES = {
 }
 
 
-def make_char_card(cfg, paths, name, face_ref, desc="", outfit="", style="sheets"):
+def make_char_card(cfg, paths, name, face_ref, desc="", outfit="", style="sheets",
+                   channel=None):
     """以正脸为参考，生成多格角色设定卡（大头 + 多角度 + 表情 + 细节）。
 
     face_ref 必须是干净的正脸单图——设定卡里每一格都要靠它保持同一个人。
+
+    channel：留空 = 跟随项目/全局出图通道。但**必须与生成 face_ref 的通道一致**，
+    否则两张图是两张脸，卡上的人会对不上锚点。传了 channel 就强制走它。
     """
     base = CHAR_CARD_STYLES.get(style) or CHAR_CARD_STYLES["sheets"]
     who = "East Asian Chinese person"
@@ -2071,14 +2081,15 @@ def make_char_card(cfg, paths, name, face_ref, desc="", outfit="", style="sheets
     out = os.path.join(cdir, "char_card.jpg")
     info("%s 生成角色设定卡 ..." % name)
     raw, _ = agnes_image_generate(cfg, prompt, ref_paths=[face_ref],
-                                  size="2K", ratio="1:1", project_paths=paths)
+                                  size="2K", ratio="1:1", project_paths=paths,
+                                  force_channel=channel)
     save_image_bytes(raw, out, have_ffmpeg(cfg))
     info("%s 设定卡 -> assets/characters/%s/char_card.jpg" % (name, name))
     return out
 
 
 def do_char_gen(cfg, paths, name, desc, with_turnaround=False, outfit="",
-                card=True, card_style="sheets"):
+                card=True, card_style="sheets", channel=None):
     """生成角色资产。
 
     两段式：
@@ -2086,11 +2097,15 @@ def do_char_gen(cfg, paths, name, desc, with_turnaround=False, outfit="",
          （这张是首帧的锁脸锚点，必须干净、单人、正面）
       2. 再以它为参考出多格角色设定卡 → char_card.jpg
          （大头 + 多角度 + 表情行 + 细节特写，给人看设定用，不参与锁脸）
+
+    channel：None=跟随配置；"agnes"/"gpt-image"/"banana" 可显式指定。
+    两段必须同通道，所以先定下 channel 再两段都用它。
     """
     require_agnes_creds(cfg)
     exe = have_ffmpeg(cfg)
     cdir = os.path.join(paths["chars"], name)
     os.makedirs(cdir, exist_ok=True)
+    ch = (channel or "").strip() or image_channel(cfg, paths)
     # 定妆图的服装必须和全片 outfit_en 一致，否则首帧会照着参考图穿错衣服。
     wear = ("Wearing exactly this outfit: %s. " % outfit.strip()) if (outfit or "").strip() else ""
     prompt = ("Character reference portrait of an East Asian Chinese person: %s. "
@@ -2100,13 +2115,13 @@ def do_char_gen(cfg, paths, name, desc, with_turnaround=False, outfit="",
               "soft even lighting, photorealistic cinematic look, natural skin texture, "
               "sharp facial features. Single person only, plain backdrop, "
               "no text, no watermark." % (desc, wear))
-    info("生成角色形象 %s ..." % name)
-    raw, _ = agnes_image_generate(cfg, prompt, project_paths=paths)
+    info("生成角色形象 %s（通道 %s）..." % (name, ch))
+    raw, _ = agnes_image_generate(cfg, prompt, project_paths=paths, force_channel=ch)
     save_image_bytes(raw, os.path.join(cdir, "source.jpg"), exe)
     shutil.copy2(os.path.join(cdir, "source.jpg"), os.path.join(cdir, "face_ref.jpg"))
     if card:
         make_char_card(cfg, paths, name, os.path.join(cdir, "face_ref.jpg"),
-                       desc=desc, outfit=outfit, style=card_style)
+                       desc=desc, outfit=outfit, style=card_style, channel=ch)
     if with_turnaround:
         make_turnaround(cfg, paths, name)
     save_json(os.path.join(cdir, "meta.json"), {
@@ -2114,6 +2129,7 @@ def do_char_gen(cfg, paths, name, desc, with_turnaround=False, outfit="",
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "desc": desc,
         "outfit": outfit,
+        "channel": ch,
         "source": "source.jpg",
         "face_ref": "face_ref.jpg",
         "char_card": "char_card.jpg" if card else "",
@@ -2121,6 +2137,7 @@ def do_char_gen(cfg, paths, name, desc, with_turnaround=False, outfit="",
         "rule": "所有首帧一律以 face_ref.jpg 为参考图；禁止用上一段尾帧接力（会累积漂移）",
         "card_rule": "char_card.jpg 是设定稿，给人看造型用；不要拿它当首帧参考图，"
                      "多格排版会污染单镜头构图",
+        "channel_rule": "face_ref 与 char_card 必须在同一条出图通道上生成（换通道 = 换脸）",
     })
     info("角色资产完成: assets/characters/%s/" % name)
 
@@ -2142,8 +2159,12 @@ def cmd_char_gen(args):
     style = getattr(args, "card_style", "") or "sheets"
     if style not in CHAR_CARD_STYLES:
         die("--card-style 只能是：%s" % " / ".join(CHAR_CARD_STYLES))
+    chan = getattr(args, "channel", "") or ""
+    if chan and chan not in IMAGE_CHANNELS:
+        die("--channel 只能是：%s" % " / ".join(sorted(IMAGE_CHANNELS)))
     do_char_gen(cfg, paths, name, desc, with_turnaround=args.tri, outfit=outfit,
-                card=not getattr(args, "no_card", False), card_style=style)
+                card=not getattr(args, "no_card", False), card_style=style,
+                channel=chan or None)
 
 
 def cmd_char_add(args):
@@ -5862,6 +5883,7 @@ def main():
     p.add_argument("--tri", action="store_true")
     p.add_argument("--no-card", action="store_true", help="只出正脸，不生成多格设定卡")
     p.add_argument("--card-style", default="sheets", help="设定卡版式：sheets / turnaround")
+    p.add_argument("--channel", default="", help="出图通道：agnes / gpt-image / banana；默认跟随配置")
     p.set_defaults(func=cmd_char_gen)
 
     p = sub.add_parser("char-add", help="导入已有照片作为角色")

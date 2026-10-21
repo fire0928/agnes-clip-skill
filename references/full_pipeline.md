@@ -160,6 +160,12 @@ python scripts/ac.py char-add "<dir>" "C:/photos/me.jpg" --name hero   # 真人�
 - `char-add`（真人照片）只出 `face_ref.jpg`，没有设定卡。要补就拿同一张人像当参考
   跑一次 `make_char_card()`。
 
+**出图通道**：`char-gen` 走哪条通道由 `--channel` 决定（不给就跟随配置，项目级优先于全局）。
+Agnes（`agnes-image-2.5-flash`）快且额度够，GPT Image 分格更直、三视图透视更准。
+**两段必须同通道**——换通道就是换人，所以代码强制：`--channel` 一旦指定，
+正脸和设定卡都用它；`meta.json` 的 `channel` 字段记了实际值，串脸时先查它。
+注意 `agnes-image-2.5`（非 flash）多数账号不可用，会报 404 `model_not_found`。
+
 **为什么设定卡能锁住脸**：它是两段式生成的——先出一张正脸，再以这张正脸为
 参考图（`ref_paths`）出整张卡。模型在每一格里都看到同一张脸，所以不会各画各的。
 这也是为什么**正脸那步不能用多格图当参考**，那会让锚点本身就糊掉。

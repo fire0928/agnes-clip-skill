@@ -6,7 +6,7 @@ description: 用 Agnes 云端算力全自动做竖屏短剧/长视频——一�
 description_zh: 一句话创意自动做成有对白、会说话的竖屏短剧。全流程 15 步：写剧本、分镜、角色定妆、场景板、逐镜首帧、批量出视频、配乐音效字幕、合成成片，人脸全程锁死不怕换脸。视频走云端算力，不占本地显卡。适合做催泪短剧、漫剧、系列连续剧，也支持同系列多集复用同一张脸。
 description_en: Turn a one-line idea into a vertical short drama with real dialogue. A 15-stage pipeline handles scripting, storyboarding, character sheets, scene boards, first frames, batch video generation, music, sound effects, subtitles and final cut — with character faces locked across every shot so nobody switches faces mid-story. Video runs on cloud GPUs, so no local hardware needed. Great for tearjerkers, anime shorts and serialized episodes that reuse the same face across episodes.
 agent_created: true
-version: 1.3.0
+version: 1.3.1
 ---
 
 # Agnes Clip · 一句话成片
@@ -133,7 +133,24 @@ python scripts/ac.py pick-image <项目目录> --channel agnes      # 或 gpt-im
 python scripts/ac.py char-gen "<dir>" --name hero                      # 默认出设定卡
 python scripts/ac.py char-gen "<dir>" --name hero --card-style turnaround
 python scripts/ac.py char-gen "<dir>" --name hero --no-card            # 只出正脸，省一次生图
+python scripts/ac.py char-gen "<dir>" --name hero --channel gpt-image # 指定出图通道
 ```
+
+### 出图通道：Agnes 与 GPT Image 都能出设定卡
+
+实测两条路都稳定复刻这种多格排版，各有优势：
+
+| 通道 | 特点 | 适合 |
+|---|---|---|
+| `agnes`（`agnes-image-2.5-flash`） | 出图快、额度够用，中文描述认得住 | 批量出角色、赶工期 |
+| `gpt-image`（`gpt-image-2.5-*`） | 分格更笔直、三视图透视更准、服装细节更细 | 主角、主要角色、给客户看 |
+
+不加 `--channel` 就跟随配置（项目 `project.json` 的 `image_channel` > 全局 `image.provider`）。
+
+⚠️ **正脸和设定卡必须在同一条通道上生成。** 换通道等于换人——用 Agnes 出的正脸
+去让 gpt-image 画设定卡，卡上会是另一张脸。代码已经强制锁定：
+一旦指定 `--channel`，两段都用它；不指定就两段都跟随同一个配置值。
+`meta.json` 里记了实际用的通道，排查换脸问题时先看这个字段。
 
 **关键纪律：`char_card.jpg` 绝不能拿去当首帧参考图。** 它是多格排版，
 当参考图会把分格线和其他格的人一起喂进首帧，构图直接崩。只用 `face_ref.jpg`。
@@ -464,6 +481,7 @@ python scripts/ac.py char-gen "<dir>" --name girl            # 从 shots.json �
 python scripts/ac.py char-gen "<dir>" --name boss --desc "50岁女性，盘发，深蓝围裙"
 python scripts/ac.py char-gen "<dir>" --name hero --card-style turnaround   # 换设定卡版式
 python scripts/ac.py char-gen "<dir>" --name hero --no-card                 # 只出正脸，跳过设定卡
+python scripts/ac.py char-gen "<dir>" --name hero --channel gpt-image        # 指定出图通道（agnes/gpt-image/banana）
 python scripts/ac.py char-add "<dir>" "C:/photos/me.jpg" --name hero   # 真人照片锁脸
 python scripts/ac.py cast "<dir>" [list|init|push] [--name girl] [--all]  # 共享角色库（多集复用同一张脸）
 python scripts/ac.py episode-new "<第1集目录>" --name ep02 --title "第二集"  # 新建一集并继承全部角色形象

@@ -171,6 +171,7 @@ $AC init <项目目录> --title "片名"      # 立项
 $AC char-gen <项目目录> --name 小林 --desc "..."   # 角色定妆（正脸 + 设定卡）
 $AC char-gen <项目目录> --name 小林 --card-style turnaround   # 换设定卡版式
 $AC char-gen <项目目录> --name 小林 --no-card         # 只出正脸
+$AC char-gen <项目目录> --name 小林 --channel gpt-image # 指定通道（两段必须同通道）
 $AC prop-gen <项目目录> --name 药盒 --desc "..."   # 道具图
 $AC scene-gen <项目目录>                # 场景板
 $AC frame <项目目录> --dry-run          # 先看提示词

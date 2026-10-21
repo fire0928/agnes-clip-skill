@@ -6,7 +6,7 @@ description: 用 Agnes 云端算力全自动做竖屏短剧/长视频——一�
 description_zh: 一句话创意自动做成有对白、会说话的竖屏短剧。全流程 15 步：写剧本、分镜、角色定妆、场景板、逐镜首帧、批量出视频、配乐音效字幕、合成成片，人脸全程锁死不怕换脸。视频走云端算力，不占本地显卡。适合做催泪短剧、漫剧、系列连续剧，也支持同系列多集复用同一张脸。
 description_en: Turn a one-line idea into a vertical short drama with real dialogue. A 15-stage pipeline handles scripting, storyboarding, character sheets, scene boards, first frames, batch video generation, music, sound effects, subtitles and final cut — with character faces locked across every shot so nobody switches faces mid-story. Video runs on cloud GPUs, so no local hardware needed. Great for tearjerkers, anime shorts and serialized episodes that reuse the same face across episodes.
 agent_created: true
-version: 1.4.0
+version: 1.5.0
 ---
 
 # Agnes Clip · 一句话成片
@@ -968,7 +968,8 @@ python <skill-creator>/scripts/quick_validate.py <skill目录>   # 必须输出 
 | **旁白有两重人声** | 模型念了一遍 + TTS 又混一遍 | 该镜音轨换静音只留 TTS，或去掉 `--voice` |
 | **台词后的表演被剪掉** | tighten 按「人声结束+0.9s」裁尾 | 该镜 `"tighten": false`（拿不准就全片关） |
 | **叠化报 `size 704x1280 do not match 720x1280`** | 同一片里混了 flash（704）和付费版（720） | 已修：转场前统一按「出现最多的尺寸」缩放+裁切 |
-| **flash 提交一直 429/503** | 免费额度排队 | 换 `agnes-video-2.5`（付费，同接口）；并发额度是账号级，别同时开两个 `video` 进程 |
+| **flash 提交一直 429/503** | 免费额度排队 | 429 会自动退避重试；503（队列满）在免费档上直接换下一档。仍排不上就加 `--allow-paid` 用付费档，或改 `video.tiers` 调优先级 |
+| **提示「需要付费档确认」** | 免费通道全排不上，程序**故意不自动降级**（怕烧钱） | 本次加 `--allow-paid`，或把 `video.paid_requires_confirm` 设 false |
 | **桌上多出剧本没有的食物** | 首帧提示词写过 / `scene.set` 漏 / 旧的全局面馆锚 | 改 prompt 明令禁止该道具，重跑该镜 frame+video |
 | **同一镜出现两个同一人** | 过肩镜把前景那张脸也喂进参考图 | `faces` 只留露脸的人 |
 | **每镜都换一间店** | 场景板按镜头出而非按机位 | 写 `scene.set` + `scene.angles` 后 `scene-gen --force` |

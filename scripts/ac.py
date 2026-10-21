@@ -935,6 +935,16 @@ class SubmitError(Exception):
     pass
 
 
+class PaidTierNeedsConfirm(Exception):
+    """免费通道都排不上，需要用付费档，但当前策略要求人工确认。
+
+    不自动降级到付费档，是为了不烧钱。调用方捕获它之后，
+    要么让用户确认（把 video.paid_requires_confirm 改 false，或本次加 --allow-paid），
+    要么把这一镜留到后面再跑。
+    """
+    pass
+
+
 def _video_payload(cfg, model, prompt, seconds, aspect_ratio,
                    first_frame, last_frame, images, audios, seed):
     payload = {"model": model, "prompt": prompt, "size": "720P", "n": 1}
@@ -961,13 +971,17 @@ def _video_payload(cfg, model, prompt, seconds, aspect_ratio,
 
 def _submit_on_tier(cfg, tier, prompt, seconds, aspect_ratio,
                     first_frame=None, last_frame=None, images=None,
-                    audios=None, seed=None, quick=False):
-    """在指定档位上提交一次。quick=True 时少试几轮（用于试探下一档）。"""
+                    audios=None, seed=None, quick=False, max_attempts=None):
+    """在指定档位上提交一次。quick=True 时少试几轮（用于试探下一档）。
+    max_attempts 显式指定时覆盖配置里的 submit_attempts（免费档省着用）。"""
     a = cfg["agnes"]
     payload = _video_payload(cfg, _tier_model(cfg, tier), prompt, seconds, aspect_ratio,
                              first_frame, last_frame, images, audios, seed)
     url = _tier_base(cfg, tier) + "/videos"
-    attempts = 2 if quick else int(a.get("submit_attempts", 8))
+    if max_attempts is not None:
+        attempts = max(1, int(max_attempts))
+    else:
+        attempts = 2 if quick else int(a.get("submit_attempts", 8))
     last = ""
     for i in range(attempts):
         try:
@@ -982,7 +996,21 @@ def _submit_on_tier(cfg, tier, prompt, seconds, aspect_ratio,
             # 403/404 基本是这档不通（没额度/没这个模型），别死磕，直接换下一档
             if e.code in (400, 401, 403, 404):
                 break
+            # 队列满（503）也不值得在免费档上死磕
+            if e.code == 503 and max_attempts is not None:
+                break
+            # 429 = 速率限制（不是队列满）。退避要长得多，否则继续撞墙。
+            if e.code == 429:
+                # 只试一次（分档配额模式）时别 sleep —— 立刻返回让调度器换档
+                if attempts <= 1:
+                    break
+                wait = min(180, 30 * (2 ** i))
+                info("  速率限制（HTTP 429），%ds 后重试（%d/%d）" % (wait, i + 1, attempts))
+                time.sleep(wait)
+                continue
             wait = min(60, 2 * (2 ** i))
+            if attempts <= 1:
+                break
             info("  排队中（HTTP %s），%ds 后重试（%d/%d）" % (e.code, wait, i + 1, attempts))
             time.sleep(wait)
         except Exception as e:
@@ -994,8 +1022,22 @@ def _submit_on_tier(cfg, tier, prompt, seconds, aspect_ratio,
 
 
 def agnes_video_submit(cfg, prompt, seconds, aspect_ratio, first_frame=None,
-                       last_frame=None, images=None, audios=None, seed=None):
-    """按 video.tiers 的优先级提交：订阅额度 → 免费额度 → 付费。成功一档就记住它。"""
+                       last_frame=None, images=None, audios=None, seed=None,
+                       force_tier=None, force_max_attempts=None):
+    """按 video.tiers 的优先级提交：订阅额度 → 免费额度 → 付费。成功一档就记住它。
+
+    省钱的两个开关（写在全局配置 video 下）：
+      free_tier_max_attempts : 免费档单次提交最多试几轮（默认 1）。
+                               队列满就立刻换下一档，不在免费档上死磕。
+      paid_requires_confirm  : True 时付费档不会自动降级命中，
+                               而是抛 PaidTierNeedsConfirm，由人工放行后才用。
+
+    force_tier : 指定只用这一档提交（不降级）。调度器用它实现
+                 「免费档 N 路 + 付费档 M 路」的分档并行配额。
+    force_max_attempts : 配合 force_tier 用，限制内部重试次数。
+                 分档配额模式下应传 1 —— 让这一档快速失败，
+                 调度器好立刻换下一档，而不是在限流退避里把线程堵死。
+    """
     tiers = video_tier_list(cfg)
     if not tiers:
         d = _submit_on_tier(cfg, None, prompt, seconds, aspect_ratio,
@@ -1003,13 +1045,46 @@ def agnes_video_submit(cfg, prompt, seconds, aspect_ratio, first_frame=None,
         d["_tier"] = None
         return d
 
+    vcfg = cfg.get("video") or {}
+    free_max = max(1, int(vcfg.get("free_tier_max_attempts") or 1))
+    paid_confirm = bool(vcfg.get("paid_requires_confirm"))
+    # 付费档 = 非 flash 的那些（按量计价的模型）
+    def is_paid(t):
+        return not str(t.get("model") or "").endswith("-flash")
+
+    # ---- 分档配额：只打指定那一档，不降级 ----
+    if force_tier is not None:
+        idx = max(0, min(int(force_tier), len(tiers) - 1))
+        tier = tiers[idx]
+        d = _submit_on_tier(cfg, tier, prompt, seconds, aspect_ratio,
+                            first_frame, last_frame, images, audios, seed,
+                            max_attempts=force_max_attempts)
+        d["_tier"] = idx
+        return d
+
     start = min(_VIDEO_TIER.get("idx", 0), len(tiers) - 1)
     errors = []
     for idx in range(start, len(tiers)):
         tier = tiers[idx]
+        paid = is_paid(tier)
+        if paid and paid_confirm:
+            # 不自动烧钱：把免费档的失败原因留档，等人工确认
+            raise PaidTierNeedsConfirm(
+                "免费视频通道都排不上，需要用付费档「%s（%s）」才能继续。\n"
+                "  已尝试：%s\n"
+                "  确认要用付费档的话，把全局配置 ~/.workbuddy/agnes-clip.json 里\n"
+                "  video.paid_requires_confirm 改成 false，或用 --allow-paid 提交本次任务。"
+                % (tier["name"], tier["model"],
+                   ("; ".join(errors) if errors else "无")))
+
+        # 免费档：少试几轮，队列满就换下一档
+        attempts = None
+        if not paid:
+            attempts = free_max
         try:
             d = _submit_on_tier(cfg, tier, prompt, seconds, aspect_ratio,
-                                first_frame, last_frame, images, audios, seed)
+                                first_frame, last_frame, images, audios, seed,
+                                max_attempts=attempts)
             if idx != _VIDEO_TIER.get("idx"):
                 info("  视频通道切到第 %d 档：%s（%s）"
                      % (idx + 1, tier["name"], tier["model"]))
@@ -1796,9 +1871,20 @@ def normalize_story(data, n_shots, seconds, title=None):
             timed = (' Timing: the character starts speaking at about %.1fs and finishes the line by %.1fs; '
                      'after %.1fs only a silent reaction — never delay the line to the end of the shot.'
                      % (lead, speak_end, speak_end))
-            lips = (' The character speaks in Mandarin Chinese with precise lip-sync: "%s" — '
-                    'mouth shapes each syllable clearly, jaw and lips move naturally; '
-                    'keep the face turned toward the listener or camera so the mouth stays visible.' % line)
+            # 口型指令：默认普通话；镜头规格里写了 dialect 就换成对应方言，
+            # 让画面里的人自己就在说那种话，口型和叠上去的方言 TTS 对得上。
+            dialect = (s.get("dialect") or "").strip()
+            if dialect:
+                lang = ("%s with precise lip-sync" % dialect)
+                extra = ("the accent is clearly audible in the mouth shapes, "
+                         "the tongue and jaw follow the local pronunciation, not standard Mandarin")
+            else:
+                lang = "Mandarin Chinese with precise lip-sync"
+                extra = "mouth shapes each syllable clearly, jaw and lips move naturally"
+            lips = (' The character speaks in %s: "%s" — '
+                    '%s; '
+                    'keep the face turned toward the listener or camera so the mouth stays visible.'
+                    % (lang, line, extra))
             low = vp.lower()
             if "precise lip-sync" not in low and "lip sync" not in low:
                 vp = vp.rstrip() + timed + lips
@@ -2620,6 +2706,8 @@ def do_scenes(cfg, paths, force=False):
                 "%s"
                 "Camera: %s. Time: %s, %s. Lighting: %s. Location: %s. "
                 "Cinematic realism, 35mm lens, natural depth of field, vertical composition. "
+                "ONE single continuous full-frame photograph of ONE room from ONE camera position - "
+                "no collage, no grid, no split panels, no borders, no multiple views stacked together. "
                 "No people, no hands, no readable text or lettering on signs (blank signboards), no watermark."
                 % (anchor, set_clause, desc, time_, weather, light, place)
             )
@@ -2879,7 +2967,7 @@ def extract_tail_frame(clip, dst, exe, back=0.4):
                  "-frames:v", "1", "-q:v", "2", dst])
 
 
-def _submit_one(cfg, task):
+def _submit_one(cfg, task, force_tier=None, force_max_attempts=None):
     a = cfg["agnes"]
     sid = task["shot"]
     prev = task.get("link_prev")
@@ -2893,10 +2981,16 @@ def _submit_one(cfg, task):
     if task.get("tail"):
         last = frame_source(cfg, task["tail"])
         info("%s 尾帧 = %s（落点钉在下一镜的构图上）" % (sid, os.path.basename(task["tail"])))
-    info("%s 提交 Agnes（%ss, %s, 720P）..." % (sid, task["seconds"], a.get("aspect_ratio", "9:16")))
+    if force_tier is not None:
+        tiers = video_tier_list(cfg)
+        tn = tiers[force_tier]["name"] if 0 <= force_tier < len(tiers) else "?"
+        info("%s 提交 Agnes（%ss, %s, 720P）→ %s ..." % (sid, task["seconds"], a.get("aspect_ratio", "9:16"), tn))
+    else:
+        info("%s 提交 Agnes（%ss, %s, 720P）..." % (sid, task["seconds"], a.get("aspect_ratio", "9:16")))
     d = agnes_video_submit(cfg, task["prompt"], task["seconds"],
                            a.get("aspect_ratio", "9:16"),
-                           first_frame=first, last_frame=last, seed=task.get("seed"))
+                           first_frame=first, last_frame=last, seed=task.get("seed"),
+                           force_tier=force_tier, force_max_attempts=force_max_attempts)
     vid = d.get("video_id") or d.get("id")
     info("%s 已入队 video_id=%s" % (sid, vid))
     return {"shot": sid, "video_id": vid, "seconds": task["seconds"],
@@ -2975,11 +3069,23 @@ def do_videos(cfg, paths, only=None, force=False, wait=False, allow_partial=Fals
         try:
             for t in runnable[:slots]:
                 jobs.append(_submit_one(cfg, t))
+        except PaidTierNeedsConfirm as e:
+            die(str(e))
         except SubmitError as e:
             die("Agnes 队列已满，提交失败：%s。稍后重跑，或用 --wait 让脚本排队等待" % str(e)[:200])
         done_ids = {j["shot"] for j in jobs}
-        save_json(os.path.join(paths["clips"], "_pending.json"),
-                  {"jobs": jobs, "queue": [t for t in tasks if t["shot"] not in done_ids]})
+        # 注意：这里必须跟已有的 _pending.json 合并。分几批 --only 提交时如果直接覆盖，
+        # 前一批「待补位」的镜头就永久丢了（fetch 只会跑最后一批，然后清空文件）。
+        pend_path = os.path.join(paths["clips"], "_pending.json")
+        old = load_json(pend_path, {}) or {}
+        keep_jobs = [j for j in (old.get("jobs") or [])
+                     if j.get("status") != "completed" and j.get("shot") not in done_ids]
+        keep_queue = [t for t in (old.get("queue") or [])
+                      if t["shot"] not in done_ids
+                      and t["shot"] not in {j["shot"] for j in keep_jobs}]
+        save_json(pend_path,
+                  {"jobs": keep_jobs + jobs,
+                   "queue": keep_queue + [t for t in tasks if t["shot"] not in done_ids]})
         info("已提交 %d 个任务（并发上限 %d），其余 %d 个待补位。用 fetch 继续"
              % (len(jobs), slots, len(tasks) - len(jobs)))
         return jobs
@@ -3006,6 +3112,40 @@ def _run_scheduler(cfg, paths, jobs, queue):
     next_fill = 0.0
     rounds = max(1, int(a.get("submit_rounds", 10)))
 
+    # ---- 分档并行配额 ----
+    # video.tier_slots = {"0": 3, "2": 3}  表示第 1 档（免费）开 3 路、第 3 档（付费）再开 3 路，
+    # 两组同时跑，总并发 = 各档配额之和。空缺或没配就退回全局 slots。
+    vcfg = cfg.get("video") or {}
+    tier_slots = vcfg.get("tier_slots") or {}
+    use_quota = bool(tier_slots) and bool(vcfg.get("paid_requires_confirm") is False)
+    # 每档当前占用的槽位数
+    tier_used = {}
+    # 档位轮转指针：分档配额模式下从哪一档开始试
+    tier_rr = 0
+    # 各档限流冷却：某档 429 后，冷却期内不再投喂它（速率限制要等窗口恢复）
+    tier_cooldown = {}
+
+    def _tier_ready(idx, now):
+        until = tier_cooldown.get(idx)
+        return not (until and now < until)
+
+    def _tier_cap(idx):
+        """这一档能占几个槽位；没配就返回 0（表示不参与配额）。"""
+        for k, v in tier_slots.items():
+            if int(k) == int(idx):
+                return max(0, int(v))
+        return 0
+
+    def _pick_task_for_tier(idx):
+        """给指定档位挑一个还没分配过档位的任务。"""
+        for t in queue:
+            if t.get("assigned_tier") is None:
+                if t.get("link_prev") and not os.path.exists(t["link_prev"]):
+                    continue
+                t["assigned_tier"] = int(idx)
+                return t
+        return None
+
     while inflight or queue:
         # 补位：有空槽就提交下一个；队列满时等一会儿重新排队，不丢任务
         if queue and len(inflight) < slots:
@@ -3016,10 +3156,71 @@ def _run_scheduler(cfg, paths, jobs, queue):
                 runnable = [t for t in queue if not t.get("link_prev") or os.path.exists(t["link_prev"])]
                 if not runnable:
                     break
-                task = runnable[0]
-                queue.remove(task)
+
+                # ---- 分档配额模式：按各档配额分别投喂 ----
+                if use_quota:
+                    # 从上次成功的档开始试；失败时不推进指针，下一轮自然换到另一档，
+                    # 避免总是先撞同一个限流档（限流是速率问题，不是队列满）
+                    tl = video_tier_list(cfg)
+                    n_tier = len(tl)
+                    order = [(tier_rr + k) % n_tier for k in range(n_tier)] if n_tier else []
+                    placed = False
+                    for tidx in order:
+                        cap = _tier_cap(tidx)
+                        if cap <= 0:
+                            continue
+                        if tier_used.get(tidx, 0) >= cap:
+                            continue
+                        # 限流冷却中的档位直接跳过，别再拿请求去撞墙
+                        if not _tier_ready(tidx, time.time()):
+                            continue
+                        task = _pick_task_for_tier(tidx)
+                        if task is None:
+                            continue
+                        queue.remove(task)
+                        try:
+                            # force_max_attempts=1 → 这一档只试一次就换下一档，
+                            # 不在限流退避里把整个调度线程堵死
+                            inflight.append(_submit_one(cfg, task, force_tier=tidx,
+                                                        force_max_attempts=1))
+                            tier_used[tidx] = tier_used.get(tidx, 0) + 1
+                            tier_rr = tidx          # 记住这一档可用，下一轮先用它
+                        except SubmitError as e:
+                            # 这一档排不上：任务放回队列，交给下一档或下一轮
+                            task["assigned_tier"] = None
+                            queue.append(task)
+                            # tier_rr 不动 → 下一轮从别档开始
+                            if "429" in str(e):
+                                # 速率限制：冷却 3 分钟，别再拿请求去撞墙
+                                tier_cooldown[tidx] = time.time() + 180
+                                info("  %s 档被限流，冷却 180s" % tl[tidx]["name"])
+                            info("  %s 档排不上（%s），换下一档"
+                                 % (tl[tidx]["name"], str(e)[:70]))
+                        placed = True
+                        break
+                    if placed:
+                        continue
+                    # 所有配额档都在冷却 → 等最早的冷却结束，别空转刷请求
+                    if tier_cooldown:
+                        soonest = min(tier_cooldown.values())
+                        wait_cd = max(5.0, min(180.0, soonest - time.time()))
+                        info("  各档都在限流冷却，%.0fs 后再试" % wait_cd)
+                        next_fill = max(next_fill, time.time() + wait_cd)
+                        break
+                    # 没有冷却信息 → 回落到普通降级链
+                    task = runnable[0]
+                    queue.remove(task)
+                else:
+                    task = runnable[0]
+                    queue.remove(task)
+
                 try:
                     inflight.append(_submit_one(cfg, task))
+                except PaidTierNeedsConfirm as e:
+                    # 免费通道都排不上，要用付费档 —— 按策略停下来等人工确认
+                    save_json(os.path.join(paths["clips"], "_pending.json"),
+                              {"jobs": inflight, "queue": queue})
+                    die(str(e))
                 except SubmitError as e:
                     tries = int(task.get("tries", 0)) + 1
                     task["tries"] = tries
@@ -3029,10 +3230,14 @@ def _run_scheduler(cfg, paths, jobs, queue):
                         finished.append({"shot": task["shot"], "status": "failed",
                                          "clip": task["clip"]})
                     else:
-                        info("  %s 队列满，45s 后重新排队（第 %d/%d 轮）"
-                             % (task["shot"], tries, rounds))
+                        # 429 是速率限制：退避要长得多，别继续撞墙
+                        is_rl = "429" in str(e)
+                        wait_s = 120 if is_rl else 45
+                        info("  %s 提交 %d 轮仍失败（%s），%ds 后重新排队（第 %d/%d 轮）"
+                             % (task["shot"], tries,
+                                "速率限制" if is_rl else "队列满", wait_s, tries, rounds))
                         queue.append(task)
-                        next_fill = time.time() + 45
+                        next_fill = time.time() + wait_s
                         break
 
         if not inflight:
@@ -3076,11 +3281,18 @@ def _run_scheduler(cfg, paths, jobs, queue):
             info("  %s 完成 -> clips/%s.mp4 (%.1f MB)" % (job["shot"], job["shot"], size / 1e6))
             job["status"] = "completed"
             finished.append(job)
+            # 释放该档的槽位配额，让这一档能继续投喂新任务
+            tidx = job.get("tier")
+            if tidx is not None and tier_used.get(tidx, 0) > 0:
+                tier_used[tidx] -= 1
         elif st == "failed":
             err = d.get("error") or d.get("message") or json.dumps(d, ensure_ascii=False)[:300]
             info("  %s 失败: %s" % (job["shot"], str(err)[:300]))
             job["status"] = "failed"
             finished.append(job)
+            tidx = job.get("tier")
+            if tidx is not None and tier_used.get(tidx, 0) > 0:
+                tier_used[tidx] -= 1
         else:
             if pg != job["progress"]:
                 job["progress"] = pg
@@ -3115,6 +3327,10 @@ def cmd_fetch(args):
 
 def cmd_video(args):
     cfg, paths = load_project(args.dir)
+    if getattr(args, "allow_paid", False):
+        # 本次任务临时放行付费档（不写回全局配置）
+        cfg.setdefault("video", {})["paid_requires_confirm"] = False
+        info("已放行付费档（仅本次任务）")
     do_videos(cfg, paths, args.only, args.force, args.wait)
 
 
@@ -3242,7 +3458,13 @@ def _voice_for(cfg, speaker):
     else:
         c = v.get(speaker) or v.get("default")
     if isinstance(c, dict):
-        return c.get("voice") or v.get("default") or "zh-CN-XiaoxiaoNeural"
+        # 角色配置写成对象时，voice 可能故意留空（走豆包靠 style 描述音色）。
+        # 这时日志如果回落到 voices.default 会显示成别人的音色，非常容易误判，所以标出来。
+        if c.get("voice"):
+            return c.get("voice")
+        if c.get("style"):
+            return "doubao:%s" % c["style"][:12]
+        return v.get("default") or "zh-CN-XiaoxiaoNeural"
     return c or "zh-CN-XiaoxiaoNeural"
 
 
@@ -3345,12 +3567,29 @@ def _tts_one(cfg, voice, txt, dst, rate_pct=None, pitch=None, spk=None):
     cmd = [sys.executable, "-m", "edge_tts", "--voice", voice,
            "--text", txt, "--write-media", dst]
     if rate_pct is not None:
-        r = "%+d%%" % int(rate_pct)
+        # edge-tts 的语速解析要求 "+N%" / "-N%"，但 N 为负时微软端会返回
+        # "No audio was received"（负语速在 SSML 里是非法值）。
+        # 降速改用 pitch 补偿：语速夹到 0%，靠降调实现"念得更慢更沉"的效果。
+        slow = 0
+        pct = int(rate_pct)
+        if pct < 0:
+            slow = -pct               # 降速幅度记下来，用 pitch 补
+            pct = 0
+        r = "%+d%%" % pct
     else:
         r = spk.get("rate", vcfg.get("rate"))
     if r:
         cmd += ["--rate=%s" % str(r)]
     pt = pitch if pitch is not None else spk.get("pitch", vcfg.get("pitch"))
+    if slow:
+        # 降速对应的降调：每 10% 降速约降 2Hz 音高
+        base_pt = 0
+        if pt:
+            try:
+                base_pt = int(str(pt).replace("%", "").replace("+", "").replace("Hz", "") or 0)
+            except ValueError:
+                base_pt = 0
+        pt = "%+dHz" % (base_pt - 2 * (slow // 10))
     if pt:
         cmd += ["--pitch=%s" % str(pt)]
     # 注意：voices.volume 是混音时的增益倍数（如 1.6），不是 edge-tts 的 "+10%"。
@@ -3360,7 +3599,15 @@ def _tts_one(cfg, voice, txt, dst, rate_pct=None, pitch=None, spk=None):
         cmd += ["--volume=%s" % str(tv)]
     pr = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if pr.returncode != 0 or not os.path.exists(dst):
-        return False, pr.stderr.decode("utf-8", "ignore")[-200:]
+        err = pr.stderr.decode("utf-8", "ignore")[-200:]
+        # 回退：带 rate/pitch 失败时，去掉这两个参数再试一次（至少要出人声）
+        if any(a.startswith("--rate") or a.startswith("--pitch") for a in cmd):
+            cmd2 = [a for a in cmd if not a.startswith("--rate") and not a.startswith("--pitch")]
+            pr2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if pr2.returncode == 0 and os.path.exists(dst):
+                return True, ""
+            err = err + " | 回退后仍失败: " + pr2.stderr.decode("utf-8", "ignore")[-120:]
+        return False, err
     return True, ""
 
 
@@ -6112,6 +6359,8 @@ def main():
     p.add_argument("--only", default=None)
     p.add_argument("--wait", action="store_true")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--allow-paid", action="store_true",
+                   help="本次任务允许在免费通道排不上时用付费档（默认要人工确认）")
     p.set_defaults(func=cmd_video)
 
     p = sub.add_parser("fetch", help="续查已提交任务并下载（读 clips/_pending.json）")

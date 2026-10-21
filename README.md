@@ -141,7 +141,7 @@ python scripts/ac.py music <项目目录> --provider volc --duration 104 --capti
 | 0 | 立项 | `init` | `project.json` | `status` 不报错 |
 | 1 | 剧本骨架 | `story`（建议手改） | `script/story.md` | 有高低点、母题回环、做过删一镜测试 |
 | 2 | 镜头表 | 手写 `shots.json` | 全片字段表 | 每镜有动作、有布景、双人镜有人数 |
-| 3 | 角色 | `char-gen` / `char-add` | `assets/characters/` | **亲眼看定妆图**，脸不能撞 |
+| 3 | 角色 | `char-gen` / `char-add` | `assets/characters/` | **亲眼看定妆图**，脸不能撞；设定卡每一格都得是同一个人 |
 | 4 | 道具 | `prop-gen` | `assets/props/` | 只建近景看得清的 |
 | 5 | 场景板 | `scene-gen` | `assets/scenes/` | 同场景各机位墙和家具一致 |
 | 6 | 首帧 | `frame` | `frames/S*.jpg` | 人数对、无多余人、左右站位对 |
@@ -168,7 +168,9 @@ $AC setup                              # 首次配置密钥
 $AC config-ui                          # 打开配置界面
 $AC pick-image <项目目录> --channel gpt-image   # 换出图通道
 $AC init <项目目录> --title "片名"      # 立项
-$AC char-gen <项目目录> --name 小林 --desc "..."   # 角色定妆
+$AC char-gen <项目目录> --name 小林 --desc "..."   # 角色定妆（正脸 + 设定卡）
+$AC char-gen <项目目录> --name 小林 --card-style turnaround   # 换设定卡版式
+$AC char-gen <项目目录> --name 小林 --no-card         # 只出正脸
 $AC prop-gen <项目目录> --name 药盒 --desc "..."   # 道具图
 $AC scene-gen <项目目录>                # 场景板
 $AC frame <项目目录> --dry-run          # 先看提示词
@@ -200,7 +202,8 @@ projects/我的片子/
 │   ├── story.md          人读剧本
 │   └── shots.json        机器读镜头表（驱动全部后续步骤）
 ├── assets/
-│   ├── characters/<名>/face_ref.jpg   角色定妆图
+│   ├── characters/<名>/face_ref.jpg   角色正脸（首帧锁脸锚点，必须用它）
+│   ├── characters/<名>/char_card.jpg  多格设定稿（大头+三视图+表情+细节，给人看）
 │   ├── props/*.jpg                    道具图
 │   └── scenes/<场景>__<机位>.jpg      场景板
 ├── frames/S01.jpg ...    逐镜首帧

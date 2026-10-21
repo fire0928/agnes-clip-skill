@@ -139,15 +139,30 @@ python scripts/ac.py story "<dir>" --idea "一句话创意" --shots 8
 
 ```bash
 python scripts/ac.py char-gen "<dir>" --name girl          # 从 shots.json 读描述与服装
+python scripts/ac.py char-gen "<dir>" --name hero --card-style turnaround  # 换设定卡版式
+python scripts/ac.py char-gen "<dir>" --name hero --no-card                # 只出正脸
 python scripts/ac.py char-add "<dir>" "C:/photos/me.jpg" --name hero   # 真人照片锁脸
 ```
 
-产物：`assets/characters/<name>/` 下 `source.jpg` + `face_ref.jpg`（+ `turnaround.jpg` 三视图）。
+产物：`assets/characters/<name>/` 下
+- `source.jpg` = `face_ref.jpg`：一张干净正脸半身照，**全片首帧的锁脸锚点**
+- `char_card.jpg`：多格设定稿（大头 + 三视图 + 表情行 + 细节特写），给人看造型用
+- `turnaround.jpg`：只有加 `--tri` 才有
 
 规则：
 - `char-gen` 的提示词里**必须带 `outfit_en`**，否则定妆图穿的和你片里要穿的不是一套，首帧会照抄错衣服。
 - 生成后**亲眼看一下** `face_ref.jpg`：脸型、年龄、气质是否贴人设。这张图错了，后面 20 镜全错。
+- 再扫一眼 `char_card.jpg`：**每一格必须是同一个人**。设定卡是「拿正脸当参考图生成的」，
+  所以它天然锁脸——如果发现某一格脸变了，说明描述里有特征不够distinct，加特征重跑。
 - 主要人物一律 `East Asian Chinese`（代码会补），否则英文角色名容易出欧美脸。
+- ⚠️ **`char_card.jpg` 绝不能当首帧参考图**。它是多格排版，当参考图会把分格线
+  和隔壁格的人一起喂进首帧。单镜头构图会直接崩。只用 `face_ref.jpg`。
+- `char-add`（真人照片）只出 `face_ref.jpg`，没有设定卡。要补就拿同一张人像当参考
+  跑一次 `make_char_card()`。
+
+**为什么设定卡能锁住脸**：它是两段式生成的——先出一张正脸，再以这张正脸为
+参考图（`ref_paths`）出整张卡。模型在每一格里都看到同一张脸，所以不会各画各的。
+这也是为什么**正脸那步不能用多格图当参考**，那会让锚点本身就糊掉。
 
 ### 一集接一集：人物形象复用
 

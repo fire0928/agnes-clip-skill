@@ -6,7 +6,7 @@ description: 用 Agnes 云端算力全自动做竖屏短剧/长视频——一�
 description_zh: 一句话创意自动做成有对白、会说话的竖屏短剧。全流程 15 步：写剧本、分镜、角色定妆、场景板、逐镜首帧、批量出视频、配乐音效字幕、合成成片，人脸全程锁死不怕换脸。视频走云端算力，不占本地显卡。适合做催泪短剧、漫剧、系列连续剧，也支持同系列多集复用同一张脸。
 description_en: Turn a one-line idea into a vertical short drama with real dialogue. A 15-stage pipeline handles scripting, storyboarding, character sheets, scene boards, first frames, batch video generation, music, sound effects, subtitles and final cut — with character faces locked across every shot so nobody switches faces mid-story. Video runs on cloud GPUs, so no local hardware needed. Great for tearjerkers, anime shorts and serialized episodes that reuse the same face across episodes.
 agent_created: true
-version: 1.2.2
+version: 1.3.0
 ---
 
 # Agnes Clip · 一句话成片
@@ -94,7 +94,7 @@ python scripts/ac.py pick-image <项目目录> --channel agnes      # 或 gpt-im
 | 0 | 立项 | `init` | `project.json` | `status` 不报错；需要多集共用角色就先定 `cast_dir` |
 | 1 | 剧本骨架 | `story`（建议手改） | `script/story.md` | logline 四要素 + 情绪曲线有高低点 + 母题首尾回环 + 删一镜测试 |
 | 2 | 镜头表 | 手写 `shots.json` | 全片字段表 | 每镜有具体动作、有 `scene.set`、双人镜有 `cast`、总时长落在目标区间 |
-| 3 | 角色 | `char-gen` / `char-add` / `cast` | `assets/characters/<name>/` | 亲眼看过 `face_ref.jpg`，脸和年龄贴人设 |
+| 3 | 角色 | `char-gen` / `char-add` / `cast` | `assets/characters/<name>/` | 亲眼看过 `face_ref.jpg`，脸和年龄贴人设；再扫一眼 `char_card.jpg`，各格是同一个人 |
 | 4 | 道具 | `prop-gen` | `assets/props/*.jpg` | 只建近景会被看清的；母题道具必须在 |
 | 5 | 场景板 | `scene-gen` | `assets/scenes/<场景>__<机位>.jpg` | 逐张看：是这个地点、没有多余道具、同场景各机位墙与家具一致 |
 | 6 | 首帧 | `frame`（先 `--dry-run`） | `frames/S*.jpg` | 人数锁 N 对、参考图张数对、双人镜有 left/right；抽 3–5 张关键镜看 |
@@ -111,6 +111,35 @@ python scripts/ac.py pick-image <项目目录> --channel agnes      # 或 gpt-im
 逐步的命令、字段、踩坑与验证方法写在 **`references/full_pipeline.md`**，那是主作业手册；本文件给规则与硬约束。
 
 **人工介入只有五处**：剧本定稿、场景板验收、首帧验收、质检、精修（配乐/音效/转场/字幕）。其余都可以批量跑。
+
+## 角色设定卡（`char_card.jpg`）
+
+`char-gen` 出两个文件，用途完全不同，**别混用**：
+
+| 文件 | 是什么 | 干什么用 |
+|---|---|---|
+| `face_ref.jpg` | 一张干净正脸半身照 | **首帧锁脸锚点**，全片每一镜都拿它当参考图 |
+| `char_card.jpg` | 多格设定稿（大头 + 三视图 + 表情行 + 细节特写） | **给人看造型**：定妆确认、给客户过目、挑演员 |
+
+设定卡是这么出來的：先用一段文字描述生成正脸 → 再拿这张正脸当参考图，生成整张多格卡。
+这样每一格的人脸都锁在那张正脸上，不会各画各的。
+
+版式有两种，用 `--card-style` 切：
+
+- `sheets`（默认）：左大头 + 中间三视图（正/侧/背）+ 底部四表情 + 右侧细节格
+- `turnaround`：左大头 + 上排四个角度（正/四分之三侧/侧/背）+ 表情行 + 右侧全身站姿
+
+```bash
+python scripts/ac.py char-gen "<dir>" --name hero                      # 默认出设定卡
+python scripts/ac.py char-gen "<dir>" --name hero --card-style turnaround
+python scripts/ac.py char-gen "<dir>" --name hero --no-card            # 只出正脸，省一次生图
+```
+
+**关键纪律：`char_card.jpg` 绝不能拿去当首帧参考图。** 它是多格排版，
+当参考图会把分格线和其他格的人一起喂进首帧，构图直接崩。只用 `face_ref.jpg`。
+
+> `char-add`（真人照片导入）只会产出 `face_ref.jpg`，不会有设定卡——
+> 想补一张就用同一张人像当参考跑一次 `make_char_card`。
 
 ## 一集接一集：人物形象复用（同一系列不换脸）
 
@@ -206,6 +235,32 @@ python scripts/ac.py setup            # 交互里把「视频模型」改成 agn
 实测同一账号：flash 提交 6 次全 429；付费版**立即入队**，8 秒镜头约 3 分钟出片。
 
 ⚠️ **并发额度是账号级的，不分模型**。同时开两个 `ac.py video` 进程（每个内部 3 路）就会互相抢槽，付费版照样 429。要跑批量就**只开一个进程**，用 `--only` 一次把镜头列全。
+
+### 多档通道：订阅额度 → 免费额度 → 按量付费（推荐）
+
+一个账号往往同时有订阅额度、免费额度和余额。配 `video.tiers` 让它自己按顺序往下退，**能白嫖就白嫖，排不上才花钱**：
+
+```json
+"video": {
+  "tiers": [
+    {"name": "订阅·国际版", "endpoint": "https://apihub.agnes-ai.com/v1",
+     "key": "cpk-...", "model": "agnes-video-2.5-flash"},
+    {"name": "国内免费", "endpoint": "https://api.agnes-ai.cn/v1",
+     "key": "sk-...",  "model": "agnes-video-2.5-flash"},
+    {"name": "付费按量", "endpoint": "https://api.agnes-ai.cn/v1",
+     "key": "sk-...",  "model": "agnes-video-2.5"}
+  ]
+}
+```
+
+行为：
+
+- 提交时从当前档开始试；遇到 **429/503 排满**、或 **403/404 这档没额度/没这个模型**，自动换下一档，并打印「视频通道切到第 N 档」
+- 成功后**记住这一档**，后面的镜头都走它，不会每次都从第一档重新排
+- 每个任务在 `_pending.json` 里记着自己的档位，续查时用对应的 endpoint + key（不然查不到）
+- 不配 `tiers` 就退回旧的单通道行为（`video.endpoint` / `video.key` / `video.model`）
+
+⚠️ **订阅 key 不等于能调付费模型**。实测：`cpk-` 开头的国际版订阅 key 在 `apihub.agnes-ai.com/v1` 上能调 `agnes-video-2.5-flash`，但调 `agnes-video-2.5` 直接 404 `model not available for your current group`——订阅只覆盖 flash。所以别指望订阅档帮你省下付费模型的钱，它是"用订阅额度跑 flash"。
 
 ## ⛔ 开工前置：先有骨架，再写分镜
 
@@ -321,15 +376,18 @@ python scripts/ac.py setup            # 交互里把「视频模型」改成 agn
 python scripts/ac.py frame "<项目>" --only S03 --dry-run --force
 ```
 
-## 九条铁律（照做才不崩）
+## 十条铁律（照做才不崩）
 
 1. **一镜一个连续长镜头**。禁止 `cut to` / `jump cut`，只写 one continuous shot。硬切会让模型重建人脸。
 2. **首帧锁人，提示词只写动作**。脸的形状由 `face_ref.jpg` 决定，提示词不要描述五官。
 3. **接力只在同场景同机位之间用**。紧接的两镜如果是同一机位、同一组人在说话（正反打、接话），
    后一镜标 `"link": "prev"`，首帧直接取上一镜**最后一帧**，场景/站位/碗的位置全部接上。
    跨场景、换机位、跳时间**禁止**接力，否则会换人换景。
-   ⚠️ Agnes 视频接口只吃**一张首帧**，没有 H3 那种"人物参考 + 尾帧双输入（Ref2VA）"，单靠尾帧接力会一步步漂。
+   ⚠️ 单靠"尾帧当下一镜首帧"会一步步漂（B 的末帧→C 的首帧→C 的末帧→D 的首帧，越走越远）。
    对策：**只接一段**（不许 A→B→C→D 连传），并且接力镜提示词必须逐件锁服装（`keep exactly the same clothing as the reference frame: cream knit cardigan, dark navy dress`）；人物锚点仍由定妆图长期维护。
+
+   **更好的做法是反过来：把下一镜的首帧钉成本镜的尾帧**（`"tail_frame": "next"`，见下）。
+   两端都锚在"已经生成好、脸和景都正确"的首帧上，不会漂，而且剪辑点上真的接得住。
 4. **景别跨度不超过 2 倍**。安全区：中远景 ↔ 腰以上中景；不要直接怼脸特写。
 5. **微表情写成过程**。`she smiles` 会得到定格假笑；写「嘴角先起，再漫到眼底」才是活的。
 6. **双人镜头写清第二个人的服装**。参考图只锁主角的脸；同框的第二人不写发型服装会自己换衣服。
@@ -337,6 +395,22 @@ python scripts/ac.py frame "<项目>" --only S03 --dry-run --force
    每个机位一张空板；同一机位的所有镜头共用这张板。首帧只换机位，不换布景，画面才不会每镜换一间店。
 8. **环视镜头偶尔用**。全片 1–2 次 `slow arc / orbit`，用在情绪落点或三人同框；台词特写别环视，会晃。
 9. **人物一律是东亚/中国人长相**。角色名是英文时（xiao-man、chen-yu），模型很容易做成欧美人；每条人物/首帧/视频提示词都要写 `East Asian Chinese with East Asian facial features, black hair, dark eyes`。
+10. **发型和服装要单独锁死，`face_ref` 只管脸**。这是实测翻车过的一课：女主在 S09 是齐下巴短发、
+    S12 是过肩长发、S06 又变成牛仔裤——同一个角色在同一部片里换了三次造型，剪出来就是穿帮。
+    参考图只锁五官，**头发长度、有没有刘海、下装颜色、鞋**它一概不管。每条人物镜的 `frame.prompt`
+    末尾必须挂两段硬锁（写在 `frames` 之前，别只写在角色卡里）：
+
+    ```
+    HAIR LOCK, non-negotiable: her black hair is shoulder-length, the ends reach exactly the
+    collarbone, with slightly curled tips. It is never a short bob above the jaw, never cut at
+    the chin, and never long hair past the shoulders.
+    WARDROBE LOCK, non-negotiable: light gray-blue knit cardigan over a plain white t-shirt,
+    dark grey slim trousers (never blue jeans, never shorts, never a skirt), dark canvas sneakers.
+    ```
+
+    `video_prompt` 里再补一句"hair must stay shoulder-length the whole shot / outfit stays exactly
+    the same"。改完必须**重出首帧再重出视频**——只改提示词不重跑，旧片段里的错头发还在。
+    已经成片的项目会出现"改一镜、全剧集连带"：本集改了要重剪别的剧集对它的 `recall`，再各自重合成。
 
 ## 目录结构
 
@@ -388,6 +462,8 @@ python scripts/ac.py init  "<dir>" --title "片名"
 python scripts/ac.py story "<dir>" --idea "..." --shots 8 --seconds 7
 python scripts/ac.py char-gen "<dir>" --name girl            # 从 shots.json 读角色描述
 python scripts/ac.py char-gen "<dir>" --name boss --desc "50岁女性，盘发，深蓝围裙"
+python scripts/ac.py char-gen "<dir>" --name hero --card-style turnaround   # 换设定卡版式
+python scripts/ac.py char-gen "<dir>" --name hero --no-card                 # 只出正脸，跳过设定卡
 python scripts/ac.py char-add "<dir>" "C:/photos/me.jpg" --name hero   # 真人照片锁脸
 python scripts/ac.py cast "<dir>" [list|init|push] [--name girl] [--all]  # 共享角色库（多集复用同一张脸）
 python scripts/ac.py episode-new "<第1集目录>" --name ep02 --title "第二集"  # 新建一集并继承全部角色形象
@@ -491,13 +567,43 @@ python scripts/ac.py assemble "<dir>" --subs     # 只在合成阶段加字幕�
 
 - **单排不超过 14 个汉字**。长句在标点处拆成两条先后出现；ASS 里 `WrapStyle=2` 禁止自动换行，
   宁可拆两条，也不要让播放器折成两排（标题式字幕折行最出戏）。
-- **配音**：`voice` 用 edge-tts 把每句台词念成 `audio/vo/<sid>.mp3`，按 `speaker` 分配音色（`voices` 配置或角色 `voice` 字段）。
+- **配音**：`voice` 把每句台词念成 `audio/vo/<sid>.mp3`，按 `speaker` 分配音色（`voices` 配置或角色 `voice` 字段）。
 - **默认不混 TTS**：模型自己会出人声时，再叠 TTS 会双重人声。只有确认模型没开口才用 `assemble --voice`；
   此时字幕会对齐 TTS 的时长。
 - **某一镜模型念糊了**（关键词错、含糊）：该镜音轨换静音（`anullsrc` 替换），只留干净的 TTS，标 `"tts": true`。
   别在同一镜里既留模型人声又混 TTS——两重声音一听就露。
-- 音色表（`~/.workbuddy/agnes-clip.json` 的 `voices`）：`default`、`VO`、`rate`、`volume`，也可以按角色名逐个指定。
-  旁白（`VO`）默认音色可能是男声，内心独白要女声时按镜单独合成。
+- 音色表（`~/.workbuddy/agnes-clip.json` 的 `voices`）：`default`、`VO`、`rate`、`pitch`、`volume`，也可以按角色名逐个指定。
+  旁白（`VO`）不是默认男声，内心独白要女声时按镜单独指定。
+
+### 两条配音通道：edge-tts（免费） / 豆包 Seed-Audio（有情绪）
+
+`voices.provider` 选 `edge`（默认）或 `doubao`。**edge 的问题不是音色少，是它只会念稿**：语速音调能调，但句子之间没有呼吸、没有犹豫，听感"干"。豆包是生成式音频模型，用一句自然语言描述角色和情绪，它自己决定停顿和语气。
+
+```json
+"voices": {
+  "provider": "doubao",
+  "postfilter": "highpass=f=95,equalizer=f=260:t=q:w=1:g=-2,equalizer=f=3200:t=q:w=1.2:g=1.6,deesser=i=0.4,acompressor=threshold=-20dB:ratio=3:attack=8:release=190:makeup=3",
+  "doubao": {
+    "endpoint": "https://openspeech.bytedance.com/api/v3/tts/create",
+    "key": "<火山控制台 X-Api-Key>",
+    "model": "seed-audio-1.0",
+    "style": "一位二十八岁的中国女性，声音轻柔偏低，语速慢，像是在深夜对着手机录一段不想让人听见的语音。她轻声、克制地说道：",
+    "tail": "只有她的人声，不要背景音效，不要音乐，不要任何其他声音。",
+    "speech_rate": 0, "trim_pause": 0.45
+  }
+}
+```
+
+- `style` + 台词 + `tail` 拼成 `text_prompt` 一次发过去。**一定要写 `tail`**，否则模型可能自己加音效或配乐。
+- 豆包爱插戏：一句 30 字的话能给到 11 秒，中间 1.8s / 2.3s 的空白。`_trim_pauses()` 会把**超过 0.9 秒**的空白压到 `trim_pause`。
+  **别把阈值设成 0.45**——轻声、气声会被一起当静音切掉（实测 10.9s 变 3.66s，字都切没了）。
+- `voice --fit`（默认开）会保证每句都塞得进画面：超长就提语速重合成（edge 每步 +3% 上限 +16%，豆包每步 +8 上限 +48）。
+  这是"换音色不用回头重剪片子"的关键，关掉用 `--no-fit`。
+- 豆包这条入口**只有 `seed-audio-1.0` 能用**。`seed-audio-2.0` / `seed-tts-2.0` / `volc.service_type.*` 全报
+  `403 fail to convert model to resource_id`（资源映射里没挂 2.0）；名字里带 `seed-audio-1.0` 前缀的会映射到同一资源。
+  要 2.0 得走另一套（appid + token）的标准语音合成接口，跟这条 X-Api-Key 不是一条线。
+- 豆包生成的是"带空间的声音"，通常**不需要**再加混响。edge 才需要 `aecho` 那层小房间感。
+
 
 ## 配乐通道：有卡走 ComfyUI，没卡走火山
 
@@ -616,6 +722,39 @@ python scripts/ac.py sfx "<dir>" --into out/final.mp4 --out out/final-sfx.mp4
 
 **验证方法**：新成片与旧成片反相相减，残差就是纯音效层；再逐点测响度，确认"该响的点抬起来了、对白段只抬 1–2dB（没盖人声）"。总电平不应变化（本项目 mean −22.7dB、max −1.5dB，与加音效前一致）。
 
+
+## 尾帧桥接：让剪辑点真的接得住（`tail_frame`）
+
+同场景的连续几镜，最稳的做法不是"上一镜尾帧当下一镜首帧"（会一镜一镜往下漂），
+而是**反过来：把下一镜已经生成好的首帧，钉成本镜的结尾落点**。
+
+```json
+{"id": "S29", "tail_frame": "S30"}     // 明确指定：S29 的最后一帧 = S30 的首帧
+{"id": "S29", "tail_frame": "next"}    // 同上，自动取下一镜
+```
+
+Agnes 的 `/videos` 本来就吃 `first_frame` + `last_frame`（`mode: "keyframe"`），只是以前流程没用上。
+
+为什么这个方向对：
+
+| | 尾帧当下一镜首帧 | 下一镜首帧当本镜尾帧 |
+|---|---|---|
+| 两端锚点 | 只有起点是锚，终点自由发挥 | 起点和终点都是**已生成好的正确首帧** |
+| 误差 | 一镜一镜累积，越走越漂 | 不累积，每镜独立收敛 |
+| 剪辑点 | 靠运气 | 数学上 A 末帧 == B 首帧 |
+
+**什么时候该用**：同场景、同机位（或机位变但画面内容连续，比如中景→特写同一个动作）、
+时间连续、动作幅度不大。典型场景：擦桌子→擦完抬头、递杯子→对方接过、写到一半→特写笔尖。
+
+**什么时候别用**：跨场景/跳时间；两镜构图差太远（一个大全一个怼脸）——模型会为了"落到那张图"
+把中间过程扭变形，人脸会拧；人物正在做大幅度动作（转身、走位）也不行。
+
+**验收不要靠眼睛**：`ac.py seam` 会逐对量"上一镜末帧 vs 下一镜首帧"的灰度差，
+60 以上就是硬跳。没做过桥接的片子平均在 60–70，加了桥接的那几对会掉到个位数。
+
+```bash
+python scripts/ac.py seam "<dir>"
+```
 
 ## 转场：别一路硬切，也别逢切必叠
 

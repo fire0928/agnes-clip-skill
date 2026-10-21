@@ -503,8 +503,10 @@ def normalize_loudness(path, exe, target=-16.0, ceiling=-1.5):
         warn("测不到响度，跳过响度归一")
         return
     gain = target - cur
-    if tp is not None and tp + gain > ceiling:
-        gain = ceiling - tp
+    # 不要因为峰值已经很高就把增益压回去——那会得到"又小声又顶着"的结果。
+    # 增益照给，峰交给 limiter 兜（对话片偶尔限掉一点峰，听不出来）。
+    if gain > 6.0:
+        gain = 6.0
     if gain < 0.5:
         info("响度 %.1f LUFS（峰值 %s dBTP），不再调整" % (cur, tp))
         return
@@ -602,6 +604,50 @@ def video_model(cfg):
 def video_jobs(cfg):
     v = cfg.get("video") or {}
     return max(1, int(v.get("jobs") or cfg["agnes"].get("jobs", 3)))
+
+
+# ---- 视频通道优先级链 ---------------------------------------------------------
+# 一个账号可能同时有：订阅额度、国内免费额度、按量付费。开一个片时当然先用不花钱的。
+# video.tiers 按顺序排，一档一个 {name, endpoint, key, model}；
+# 提交遇到队列满就顺延到下一档，成功后就记住这一档，后面的镜头都走它。
+_VIDEO_TIER = {"idx": 0}
+
+
+def video_tier_list(cfg):
+    v = cfg.get("video") or {}
+    raw = v.get("tiers") or cfg.get("video_tiers") or []
+    out = []
+    for t in raw:
+        if not str(t.get("key") or "").strip():
+            continue
+        out.append({
+            "name": t.get("name") or t.get("model") or "tier",
+            "endpoint": (t.get("endpoint") or "").rstrip("/"),
+            "key": str(t.get("key")).strip(),
+            "model": t.get("model") or "agnes-video-2.5-flash",
+        })
+    return out
+
+
+def _tier_at(cfg, idx):
+    tiers = video_tier_list(cfg)
+    if tiers and idx is not None and 0 <= int(idx) < len(tiers):
+        return tiers[int(idx)]
+    return None
+
+
+def _tier_base(cfg, tier):
+    return ((tier or {}).get("endpoint") or agnes_video_base(cfg)).rstrip("/")
+
+
+def _tier_headers(tier, cfg=None):
+    if tier:
+        return {"Authorization": "Bearer " + tier["key"]}
+    return agnes_headers(cfg, "video")
+
+
+def _tier_model(cfg, tier):
+    return ((tier or {}).get("model") or video_model(cfg))
 
 
 def video_poll(cfg):
@@ -883,15 +929,9 @@ class SubmitError(Exception):
     pass
 
 
-def agnes_video_submit(cfg, prompt, seconds, aspect_ratio, first_frame=None,
-                       last_frame=None, images=None, audios=None, seed=None):
-    a = cfg["agnes"]
-    payload = {
-        "model": video_model(cfg),
-        "prompt": prompt,
-        "size": "720P",
-        "n": 1,
-    }
+def _video_payload(cfg, model, prompt, seconds, aspect_ratio,
+                   first_frame, last_frame, images, audios, seed):
+    payload = {"model": model, "prompt": prompt, "size": "720P", "n": 1}
     if first_frame or last_frame:
         payload["mode"] = "keyframe"
         if first_frame:
@@ -910,20 +950,30 @@ def agnes_video_submit(cfg, prompt, seconds, aspect_ratio, first_frame=None,
     payload["aspect_ratio"] = aspect_ratio
     if seed is not None:
         payload["seed"] = int(seed)
+    return payload
 
-    url = agnes_video_base(cfg) + "/videos"
-    attempts = int(a.get("submit_attempts", 8))
+
+def _submit_on_tier(cfg, tier, prompt, seconds, aspect_ratio,
+                    first_frame=None, last_frame=None, images=None,
+                    audios=None, seed=None, quick=False):
+    """在指定档位上提交一次。quick=True 时少试几轮（用于试探下一档）。"""
+    a = cfg["agnes"]
+    payload = _video_payload(cfg, _tier_model(cfg, tier), prompt, seconds, aspect_ratio,
+                             first_frame, last_frame, images, audios, seed)
+    url = _tier_base(cfg, tier) + "/videos"
+    attempts = 2 if quick else int(a.get("submit_attempts", 8))
     last = ""
     for i in range(attempts):
         try:
-            d = http_json(url, payload, headers=agnes_headers(cfg, "video"), timeout=90)
+            d = http_json(url, payload, headers=_tier_headers(tier, cfg), timeout=90)
             if d.get("video_id") or d.get("id"):
                 return d
             last = json.dumps(d, ensure_ascii=False)[:500]
             break
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "ignore")
-            last = "HTTP %s: %s" % (e.code, body[:500])
+            last = "HTTP %s: %s" % (e.code, body[:400])
+            # 403/404 基本是这档不通（没额度/没这个模型），别死磕，直接换下一档
             if e.code in (400, 401, 403, 404):
                 break
             wait = min(60, 2 * (2 ** i))
@@ -937,21 +987,52 @@ def agnes_video_submit(cfg, prompt, seconds, aspect_ratio, first_frame=None,
     raise SubmitError(last)
 
 
-def agnes_video_status(cfg, video_id):
-    a = cfg["agnes"]
-    q = urllib.parse.urlencode({
-        "video_id": video_id,
-        "model_name": video_model(cfg),
-    })
+def agnes_video_submit(cfg, prompt, seconds, aspect_ratio, first_frame=None,
+                       last_frame=None, images=None, audios=None, seed=None):
+    """按 video.tiers 的优先级提交：订阅额度 → 免费额度 → 付费。成功一档就记住它。"""
+    tiers = video_tier_list(cfg)
+    if not tiers:
+        d = _submit_on_tier(cfg, None, prompt, seconds, aspect_ratio,
+                            first_frame, last_frame, images, audios, seed)
+        d["_tier"] = None
+        return d
+
+    start = min(_VIDEO_TIER.get("idx", 0), len(tiers) - 1)
+    errors = []
+    for idx in range(start, len(tiers)):
+        tier = tiers[idx]
+        try:
+            d = _submit_on_tier(cfg, tier, prompt, seconds, aspect_ratio,
+                                first_frame, last_frame, images, audios, seed)
+            if idx != _VIDEO_TIER.get("idx"):
+                info("  视频通道切到第 %d 档：%s（%s）"
+                     % (idx + 1, tier["name"], tier["model"]))
+                _VIDEO_TIER["idx"] = idx
+            d["_tier"] = idx
+            return d
+        except SubmitError as e:
+            errors.append("%s: %s" % (tier["name"], str(e)[:120]))
+            if idx + 1 < len(tiers):
+                info("  第 %d 档 %s 排不上（%s），换下一档"
+                     % (idx + 1, tier["name"], str(e)[:80]))
+                # 降档后，之后都从这一档开始试
+                _VIDEO_TIER["idx"] = idx + 1
+    raise SubmitError("所有视频通道都失败：\n  " + "\n  ".join(errors))
+
+
+def agnes_video_status(cfg, video_id, tier_idx=None):
+    tier = _tier_at(cfg, tier_idx)
+    base = _tier_base(cfg, tier)
+    host = base[:-3] if base.endswith("/v1") else base
+    headers = _tier_headers(tier, cfg)
+    q = urllib.parse.urlencode({"video_id": video_id, "model_name": _tier_model(cfg, tier)})
     try:
-        return http_json(agnes_host(cfg) + "/agnesapi?" + q,
-                         headers=agnes_headers(cfg, "video"), timeout=60)
+        return http_json(host + "/agnesapi?" + q, headers=headers, timeout=60)
     except urllib.error.HTTPError as e:
         if e.code not in (404, 405):
             raise
     # 兜底：部分入口只有 OpenAI Videos 兼容的 /v1/videos/{id}
-    return http_json(agnes_video_base(cfg) + "/videos/" + video_id,
-                     headers=agnes_headers(cfg, "video"), timeout=60)
+    return http_json(base + "/videos/" + video_id, headers=headers, timeout=60)
 
 
 # ----------------------------------------------------------------------------- music (optional, comfy)
@@ -1947,7 +2028,65 @@ def make_turnaround(cfg, paths, name):
     info("%s 三视图 -> assets/characters/%s/turnaround.jpg" % (name, name))
 
 
-def do_char_gen(cfg, paths, name, desc, with_turnaround=False, outfit=""):
+# 角色设定卡（character sheet）的分格布局。
+# 参考的是常见的国漫/游戏角色设定稿：大头 + 多角度 + 表情行 + 细节特写。
+# 实测 agnes-image-2.5-flash 能稳定复刻这种排版，且每格人脸一致。
+CHAR_CARD_STYLES = {
+    "sheets": (
+        "Professional character design sheet, multi-panel layout on a pure white background. "
+        "Left third: one large head-and-shoulders portrait, facing the viewer. "
+        "Center: three full-body turnaround views side by side — front view, side view, back view. "
+        "Bottom row: four square expression close-ups — neutral, looking down, angry, faint smile. "
+        "Right edge: four small square detail crops — face close-up, hand, sleeve cuff, and one prop. "
+        "Every panel shows the identical person: same face, same hairstyle, same costume, same proportions. "
+        "Clean semi-realistic rendering, even flat lighting, thin neat panel dividers between panels."
+    ),
+    "turnaround": (
+        "Professional character turnaround sheet, multi-panel layout on a pure white background. "
+        "Left third: one large head-and-shoulders portrait. "
+        "Center: full-body front view, three-quarter view, side view and back view in one row. "
+        "Bottom row: four square expression close-ups — neutral, looking down, angry, faint smile. "
+        "Right edge: full-body standing pose. "
+        "Every panel shows the identical person: same face, same hairstyle, same costume. "
+        "Clean semi-realistic rendering, even flat lighting, thin neat panel dividers."
+    ),
+}
+
+
+def make_char_card(cfg, paths, name, face_ref, desc="", outfit="", style="sheets"):
+    """以正脸为参考，生成多格角色设定卡（大头 + 多角度 + 表情 + 细节）。
+
+    face_ref 必须是干净的正脸单图——设定卡里每一格都要靠它保持同一个人。
+    """
+    base = CHAR_CARD_STYLES.get(style) or CHAR_CARD_STYLES["sheets"]
+    who = "East Asian Chinese person"
+    bits = [base, who]
+    if desc.strip():
+        bits.append("Character details: " + desc.strip() + ".")
+    if outfit.strip():
+        bits.append("Wearing exactly this outfit in every panel: " + outfit.strip() + ".")
+    bits.append("No text, no letters, no captions, no watermark, no signature.")
+    prompt = " ".join(bits)
+    cdir = char_dir(paths, name)
+    out = os.path.join(cdir, "char_card.jpg")
+    info("%s 生成角色设定卡 ..." % name)
+    raw, _ = agnes_image_generate(cfg, prompt, ref_paths=[face_ref],
+                                  size="2K", ratio="1:1", project_paths=paths)
+    save_image_bytes(raw, out, have_ffmpeg(cfg))
+    info("%s 设定卡 -> assets/characters/%s/char_card.jpg" % (name, name))
+    return out
+
+
+def do_char_gen(cfg, paths, name, desc, with_turnaround=False, outfit="",
+                card=True, card_style="sheets"):
+    """生成角色资产。
+
+    两段式：
+      1. 先出一张干净正脸半身照 → source.jpg / face_ref.jpg
+         （这张是首帧的锁脸锚点，必须干净、单人、正面）
+      2. 再以它为参考出多格角色设定卡 → char_card.jpg
+         （大头 + 多角度 + 表情行 + 细节特写，给人看设定用，不参与锁脸）
+    """
     require_agnes_creds(cfg)
     exe = have_ffmpeg(cfg)
     cdir = os.path.join(paths["chars"], name)
@@ -1959,11 +2098,15 @@ def do_char_gen(cfg, paths, name, desc, with_turnaround=False, outfit=""):
               "East Asian facial features, black hair, dark eyes, natural East Asian skin tones. "
               "Front-facing half-body, neutral standing pose, clean neutral studio background, "
               "soft even lighting, photorealistic cinematic look, natural skin texture, "
-              "sharp facial features, no text, no watermark." % (desc, wear))
+              "sharp facial features. Single person only, plain backdrop, "
+              "no text, no watermark." % (desc, wear))
     info("生成角色形象 %s ..." % name)
     raw, _ = agnes_image_generate(cfg, prompt, project_paths=paths)
     save_image_bytes(raw, os.path.join(cdir, "source.jpg"), exe)
     shutil.copy2(os.path.join(cdir, "source.jpg"), os.path.join(cdir, "face_ref.jpg"))
+    if card:
+        make_char_card(cfg, paths, name, os.path.join(cdir, "face_ref.jpg"),
+                       desc=desc, outfit=outfit, style=card_style)
     if with_turnaround:
         make_turnaround(cfg, paths, name)
     save_json(os.path.join(cdir, "meta.json"), {
@@ -1973,7 +2116,11 @@ def do_char_gen(cfg, paths, name, desc, with_turnaround=False, outfit=""):
         "outfit": outfit,
         "source": "source.jpg",
         "face_ref": "face_ref.jpg",
+        "char_card": "char_card.jpg" if card else "",
+        "card_style": card_style if card else "",
         "rule": "所有首帧一律以 face_ref.jpg 为参考图；禁止用上一段尾帧接力（会累积漂移）",
+        "card_rule": "char_card.jpg 是设定稿，给人看造型用；不要拿它当首帧参考图，"
+                     "多格排版会污染单镜头构图",
     })
     info("角色资产完成: assets/characters/%s/" % name)
 
@@ -1992,7 +2139,11 @@ def cmd_char_gen(args):
                 break
     if not desc:
         die("缺少 --desc，且 shots.json 的 characters 里没有 %s 的描述" % name)
-    do_char_gen(cfg, paths, name, desc, with_turnaround=args.tri, outfit=outfit)
+    style = getattr(args, "card_style", "") or "sheets"
+    if style not in CHAR_CARD_STYLES:
+        die("--card-style 只能是：%s" % " / ".join(CHAR_CARD_STYLES))
+    do_char_gen(cfg, paths, name, desc, with_turnaround=args.tri, outfit=outfit,
+                card=not getattr(args, "no_card", False), card_style=style)
 
 
 def cmd_char_add(args):
@@ -2418,8 +2569,10 @@ def _frame_for_shot(cfg, paths, shot, exe, chars=None, dry=False):
         prompt += _position_clause(shot)
     # 室内镜头不要飘到街上（模型很容易把“面馆”画成灯笼街）
     if (shot.get("scene") or {}).get("interior", True):
-        prompt += (" This frame is INSIDE the shop: no street, no sidewalk, no outdoor view as the main "
-                   "background, no hanging lanterns, no shop sign, no passers-by.")
+        # 注意：这里不能写死 "the shop"——公寓、卧室这种内景会被推成店铺。
+        where = ((shot.get("scene") or {}).get("place") or "").strip() or "this interior"
+        prompt += (" This frame is INSIDE (%s): no street, no sidewalk, no outdoor view as the main "
+                   "background, no hanging lanterns, no shop sign, no passers-by." % where)
 
     # shot.faces：只把“画面里真露脸”的角色参考图喂进去。过肩镜头前景那人背对镜头，
     # 喂了他的脸就会被复制成第二个人（实测事故），所以允许按镜收窄。
@@ -2533,14 +2686,19 @@ def _submit_one(cfg, task):
             extract_tail_frame(prev, task["frame"], exe)
             info("%s 首帧 = %s 的尾帧（接力，不重新构图）" % (sid, os.path.basename(prev)))
     first = frame_source(cfg, task["frame"])
+    last = None
+    if task.get("tail"):
+        last = frame_source(cfg, task["tail"])
+        info("%s 尾帧 = %s（落点钉在下一镜的构图上）" % (sid, os.path.basename(task["tail"])))
     info("%s 提交 Agnes（%ss, %s, 720P）..." % (sid, task["seconds"], a.get("aspect_ratio", "9:16")))
     d = agnes_video_submit(cfg, task["prompt"], task["seconds"],
                            a.get("aspect_ratio", "9:16"),
-                           first_frame=first, seed=task.get("seed"))
+                           first_frame=first, last_frame=last, seed=task.get("seed"))
     vid = d.get("video_id") or d.get("id")
     info("%s 已入队 video_id=%s" % (sid, vid))
     return {"shot": sid, "video_id": vid, "seconds": task["seconds"],
-            "clip": task["clip"], "status": "queued", "progress": None}
+            "clip": task["clip"], "status": "queued", "progress": None,
+            "tier": d.get("_tier")}
 
 
 def do_videos(cfg, paths, only=None, force=False, wait=False, allow_partial=False):
@@ -2575,9 +2733,28 @@ def do_videos(cfg, paths, only=None, force=False, wait=False, allow_partial=Fals
         prev_clip = None
         if link in ("prev", "tail", "prev-tail", "prev_tail") and idx > 0:
             prev_clip = os.path.join(paths["clips"], shots[idx - 1]["id"] + ".mp4")
+
+        # 尾帧桥接：把"下一镜的首帧"钉成本镜的落点。
+        # 好处是剪辑点上 A 的最后一帧 == B 的第一帧，拼接处零跳变；
+        # 而且每镜两端都锚在已生成的首帧上，不像"尾帧接力"那样一镜一镜往下漂。
+        tail_spec = shot.get("tail_frame")
+        tail_path = None
+        if tail_spec:
+            key = str(tail_spec).strip().lower()
+            if key == "next":
+                if idx + 1 < len(shots):
+                    tail_path = os.path.join(paths["frames"], shots[idx + 1]["id"] + ".jpg")
+                    key = shots[idx + 1]["id"]
+            elif key not in ("", "false", "none"):
+                tail_path = os.path.join(paths["frames"], str(tail_spec).strip() + ".jpg")
+            if tail_path and not os.path.exists(tail_path):
+                warn("%s 的尾帧 %s 还没生成（tail_frame=%s），本次不挂尾帧"
+                     % (sid, os.path.basename(tail_path), tail_spec))
+                tail_path = None
         tasks.append({
             "shot": sid,
             "link_prev": prev_clip,
+            "tail": tail_path,
             "frame": frame_path,
             "clip": clip_path,
             "prompt": prompt,
@@ -2670,7 +2847,7 @@ def _run_scheduler(cfg, paths, jobs, queue):
 
         job = inflight.pop(0)   # 轮转，一次只查一个
         try:
-            d = agnes_video_status(cfg, job["video_id"])
+            d = agnes_video_status(cfg, job["video_id"], job.get("tier"))
             last_poll = time.time()
         except urllib.error.HTTPError as e:
             last_poll = time.time()
@@ -2840,31 +3017,52 @@ def have_edge_tts():
         return False
 
 
+def _spk_conf(cfg, speaker):
+    """取某个说话人的独立 TTS 配置（可以按角色换 provider / 音色 / 语速）。
+
+    以前 voices 下每个角色只能写一个音色名，provider 是全局的，
+    双人对白就没法做到"男的走豆包、女的走 edge"。现在允许写成对象：
+        "girl": {"provider": "edge", "voice": "zh-CN-XiaoyiNeural", "rate": "-12%"}
+    写字符串的旧配置继续兼容。
+    """
+    v = cfg.get("voices") or {}
+    c = v.get(speaker)
+    if speaker == "VO" and not isinstance(c, dict):
+        c = v.get("VO")
+    return c if isinstance(c, dict) else {}
+
+
 def _voice_for(cfg, speaker):
     v = cfg.get("voices") or {}
     if speaker == "VO":
-        return v.get("VO") or v.get("default") or "zh-CN-YunxiNeural"
-    return v.get(speaker) or v.get("default") or "zh-CN-XiaoxiaoNeural"
+        c = v.get("VO") or v.get("default")
+    else:
+        c = v.get(speaker) or v.get("default")
+    if isinstance(c, dict):
+        return c.get("voice") or v.get("default") or "zh-CN-XiaoxiaoNeural"
+    return c or "zh-CN-XiaoxiaoNeural"
 
 
-def _doubao_tts(cfg, txt, dst, rate_pct=0):
+def _doubao_tts(cfg, txt, dst, rate_pct=0, style=None, tail=None, model=None):
     """豆包 Seed-Audio 语音合成（https://openspeech.bytedance.com/api/v3/tts/create）。
 
     走 text_prompt：「角色描述 + 台词」一句自然语言，模型自己决定情绪和停顿，
     比 edge-tts 的逐字朗读强一个量级。返回 (ok, err)。
+
+    style / tail / model 可按角色覆盖（双人对白里男声走豆包、女声走 edge 时用得上）。
     """
     vcfg = cfg.get("voices") or {}
     db = vcfg.get("doubao") or {}
     key = (db.get("key") or "").strip()
     if not key:
         return False, "未配置 voices.doubao.key（豆包语音合成 API Key）"
-    style = (db.get("style") or "").strip()
-    tail = (db.get("tail") or "").strip()
+    style = (style if style is not None else (db.get("style") or "")).strip()
+    tail = (tail if tail is not None else (db.get("tail") or "")).strip()
     prompt = "%s“%s”" % (style, txt)
     if tail:
         prompt += "。" + tail
     body = {
-        "model": db.get("model") or "seed-audio-1.0",
+        "model": model or db.get("model") or "seed-audio-1.0",
         "text_prompt": prompt,
         "audio_config": {
             "format": "mp3",
@@ -2918,13 +3116,27 @@ def _trim_pauses(exe, src, dst, keep=0.45):
         return False
 
 
-def _tts_one(cfg, voice, txt, dst, rate_pct=None, pitch=None):
-    """跑一次 TTS。provider=edge（默认）走 edge-tts，provider=doubao 走豆包。"""
+def _tts_one(cfg, voice, txt, dst, rate_pct=None, pitch=None, spk=None):
+    """跑一次 TTS。provider=edge（默认）走 edge-tts，provider=doubao 走豆包。
+
+    spk：该说话人的独立配置（dict）。里面写了 provider 就按它走，
+    这样一集里可以男声豆包、女声 edge。
+    """
     vcfg = cfg.get("voices") or {}
-    if (vcfg.get("provider") or "edge") == "doubao":
+    spk = spk or {}
+    provider = (spk.get("provider") or vcfg.get("provider") or "edge")
+    if provider == "doubao":
+        # 语速：调用方已经算好的 rate_pct 优先；没给就用该角色的 rate / 全局 rate
         if rate_pct is None:
-            rate_pct = int(str(vcfg.get("rate") or "0").replace("%", "") or 0)
-        return _doubao_tts(cfg, txt, dst, rate_pct=rate_pct)
+            raw = spk.get("rate", vcfg.get("rate")) or "0"
+            rate_pct = int(str(raw).replace("%", "") or 0)
+        db = vcfg.get("doubao") or {}
+        return _doubao_tts(cfg, txt, dst, rate_pct=rate_pct,
+                           style=(spk.get("style") if spk.get("style") is not None
+                                  else db.get("style")),
+                           tail=(spk.get("tail") if spk.get("tail") is not None
+                                 else db.get("tail")),
+                           model=spk.get("model"))
 
     # ---- edge-tts：rate/pitch 必须用 = 连接（+/- 开头会被 argparse 当选项）
     cmd = [sys.executable, "-m", "edge_tts", "--voice", voice,
@@ -2932,15 +3144,15 @@ def _tts_one(cfg, voice, txt, dst, rate_pct=None, pitch=None):
     if rate_pct is not None:
         r = "%+d%%" % int(rate_pct)
     else:
-        r = vcfg.get("rate")
+        r = spk.get("rate", vcfg.get("rate"))
     if r:
         cmd += ["--rate=%s" % str(r)]
-    pt = pitch if pitch is not None else vcfg.get("pitch")
+    pt = pitch if pitch is not None else spk.get("pitch", vcfg.get("pitch"))
     if pt:
         cmd += ["--pitch=%s" % str(pt)]
     # 注意：voices.volume 是混音时的增益倍数（如 1.6），不是 edge-tts 的 "+10%"。
     # 要给 edge-tts 调音量得写 voices.tts_volume = "+10%"，别拿 volume 直接传。
-    tv = vcfg.get("tts_volume")
+    tv = spk.get("tts_volume", vcfg.get("tts_volume"))
     if tv and "%" in str(tv):
         cmd += ["--volume=%s" % str(tv)]
     pr = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -2989,7 +3201,10 @@ def do_voice(cfg, paths, force=False, only=None, fit=True):
             if (x.get("line") or "").strip():
                 parts.append((x.get("speaker") or speaker, x["line"]))
 
-        is_doubao = (vcfg.get("provider") or "edge") == "doubao"
+        # 每个说话人可能有自己的 provider / 语速（男声豆包、女声 edge 这类）
+        spk_confs = {spk: _spk_conf(cfg, spk) for spk, _ in parts}
+        is_doubao = ((vcfg.get("provider") or "edge") == "doubao"
+                     or any((c.get("provider") or "") == "doubao" for c in spk_confs.values()))
         if is_doubao:
             base_rate = float((vcfg.get("doubao") or {}).get("speech_rate") or 0)
             step, max_rate = 8.0, base_rate + 48
@@ -3004,9 +3219,18 @@ def do_voice(cfg, paths, force=False, only=None, fit=True):
             ok = True
             for k, (spk, txt) in enumerate(parts):
                 voice = char_voice.get(spk) or _voice_for(cfg, spk)
+                conf = spk_confs.get(spk) or {}
                 part = "%s.part%d.mp3" % (dst, k)
-                info("%s 配音（%s）：%s" % (sid, voice, txt))
-                good, err = _tts_one(cfg, voice, txt, part, rate_pct=_pct(rate_now))
+                info("%s 配音（%s）：%s" % (sid, conf.get("voice") or voice, txt))
+                # 各角色自己的基准语速 + 本次为塞进画面追加的量
+                try:
+                    pbase = float(str(conf.get("rate", vcfg.get("rate") or "+0%"))
+                                  .replace("%", "") or 0)
+                except Exception:
+                    pbase = base_rate
+                good, err = _tts_one(cfg, voice, txt, part,
+                                     rate_pct=_pct(pbase + (rate_now - base_rate)),
+                                     spk=conf)
                 if not good:
                     warn("%s 配音失败：%s" % (sid, err))
                     ok = False
@@ -3051,16 +3275,8 @@ def do_voice(cfg, paths, force=False, only=None, fit=True):
                 rate_now = min(max_rate, rate_now + step)
                 info("  %s 配音 %.2fs 超镜长 %.2fs，语速提到 %+d%% 重来"
                      % (sid, real, limit, _pct(rate_now)))
-                for tp in tmp_parts:
-                    try:
-                        os.remove(tp)
-                    except Exception:
-                        pass
-                if os.path.exists(raw) and raw != tmp_parts[-1]:
-                    try:
-                        os.remove(raw)
-                    except Exception:
-                        pass
+                # 不删中间文件（批量删除会被安全钩子拦下并中断进程），
+                # 临时名固定，下一轮直接覆盖写
                 attempt += 1
                 continue
             if fit and limit > 0 and real > limit:
@@ -3070,8 +3286,9 @@ def do_voice(cfg, paths, force=False, only=None, fit=True):
         if not ok:
             continue
 
-        # 后处理：房间感/压缩/去齿音（项目级 voices.postfilter）
-        pf = (vcfg.get("postfilter") or "").strip()
+        # 后处理：房间感/压缩/去齿音（角色级优先，其次项目级 voices.postfilter）
+        main_conf = spk_confs.get(parts[0][0]) or {}
+        pf = (main_conf.get("postfilter") or vcfg.get("postfilter") or "").strip()
         if pf and exe and os.path.exists(raw):
             try:
                 ff_run(exe, ["-y", "-loglevel", "error", "-i", raw, "-af", pf,
@@ -3079,21 +3296,11 @@ def do_voice(cfg, paths, force=False, only=None, fit=True):
             except SystemExit:
                 warn("%s 配音后处理失败，用干声" % sid)
                 shutil.copyfile(raw, dst)
-            for p in tmp_parts + [raw]:
-                if os.path.exists(p) and os.path.abspath(p) != os.path.abspath(dst):
-                    try:
-                        os.remove(p)
-                    except Exception:
-                        pass
+            pass
         else:
             if os.path.abspath(raw) != os.path.abspath(dst):
                 shutil.move(raw, dst)
-            for p in tmp_parts:
-                if os.path.exists(p) and os.path.abspath(p) != os.path.abspath(dst):
-                    try:
-                        os.remove(p)
-                    except Exception:
-                        pass
+            pass
         made.append(dst)
     info("配音 %d 句 -> audio/vo/" % len(made))
     return made
@@ -3554,6 +3761,29 @@ def do_sfx(cfg, paths, into=None, out=None):
     return dst
 
 
+def _clip_mean_db(exe, path, cache=None):
+    """量一条片段原声的平均电平（dBFS）。用来判断模型是不是自己念了台词。
+
+    视频模型（尤其是给「她说了一句话」这种提示词时）会自己生成英文人声，
+    纯环境镜通常 mean 在 -40 以下，带人声的一般 -32 以上。
+    """
+    if cache is not None and path in cache:
+        return cache[path]
+    lvl = None
+    try:
+        r = subprocess.run([exe, "-hide_banner", "-i", path, "-af", "volumedetect",
+                            "-f", "null", "-"], capture_output=True)
+        txt = r.stderr.decode("utf8", "ignore")
+        m = re.search(r"mean_volume:\s*(-?[\d.]+)", txt)
+        if m:
+            lvl = float(m.group(1))
+    except Exception:
+        lvl = None
+    if cache is not None:
+        cache[path] = lvl
+    return lvl
+
+
 def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, tighten=True):
     exe = have_ffmpeg(cfg)
     if not exe:
@@ -3727,6 +3957,7 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
 
     parts = []
     labels = []
+    mute_cache = {}
     parts.append("[%d:a]volume=0[bed]" % bed_idx)
     labels.append("[bed]")
     if any(has_audio) or mixed:
@@ -3737,7 +3968,35 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
             os.path.exists(os.path.join(paths["audio"], "vo", e["shot"]["id"] + ".mp3"))
             for e in line_shots)
         amb_vol = 0.22 if tts_full else (0.82 if bgm_idx is not None else 1.0)
-        parts.append("[0:a]volume=%.2f[amb]" % amb_vol)
+        # 双人对白集：模型会在「她开口说话」的镜头里自己念英文（训练偏英语），
+        # 压到 0.22 还是听得见。凡是有台词、而且已经配好 TTS 的镜头，把原声整段静音，
+        # 只留其余镜头的环境底噪。project.json audio.mute_native_on_dialogue=false 可关。
+        amb_chain = "[0:a]volume=%.2f" % amb_vol
+        mute_on_dlg = True
+        try:
+            mute_on_dlg = (pconf.get("audio") or {}).get("mute_native_on_dialogue", True)
+        except Exception:
+            pass
+        muted = []
+        if tts_full and mute_on_dlg:
+            for e in entries:
+                sid = e["shot"]["id"]
+                if not (e["shot"].get("line") or "").strip():
+                    continue
+                if not os.path.exists(os.path.join(paths["audio"], "vo", sid + ".mp3")):
+                    continue
+                # 只有「原声里真的有人声」才压；纯环境镜（安静的房间、空镜）保留底噪，
+                # 否则整片变成一条一条的真空，比英文更难听。
+                lvl = _clip_mean_db(exe, e["clip"], mute_cache)
+                if lvl is None or lvl < -33:
+                    continue
+                a0 = e["start"]
+                b0 = e["start"] + e["duration"]
+                amb_chain += ",volume=0.10:enable='between(t,%.3f,%.3f)'" % (a0, b0)
+                muted.append("%s(%.0fdB)" % (sid, lvl))
+        if muted:
+            info("压低原声 %d 镜（模型自念英文）：%s" % (len(muted), "、".join(muted)))
+        parts.append(amb_chain + "[amb]")
         labels.append("[amb]")
     if bgm_idx is not None:
         chain = build_bgm_chain(bgm_idx, entries, total)
@@ -3864,9 +4123,85 @@ def cmd_assemble(args):
                 tighten=not getattr(args, "no_tighten", False))
 
 
+def cmd_seam(args):
+    cfg, paths = load_project(args.dir)
+    do_seam(cfg, paths, window=args.window)
+
+
 def cmd_sfx(args):
     cfg, paths = load_project(args.dir)
     do_sfx(cfg, paths, into=args.into, out=args.out)
+
+
+def _gray_thumb(path, exe, w=48, h=80):
+    """把一帧缩成很小的灰度图，用来粗算两帧差多少（不依赖 numpy）。"""
+    tmp = path + ".thumb.ppm"
+    try:
+        ff_run(exe, ["-y", "-loglevel", "error", "-i", path, "-frames:v", "1",
+                     "-vf", "scale=%d:%d,format=gray" % (w, h), tmp])
+    except SystemExit:
+        return None
+    try:
+        with open(tmp, "rb") as f:
+            data = f.read()
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+    # 跳过 ppm 头（P5...\n）
+    i = 0
+    nl = 0
+    while i < len(data) and nl < 3:
+        if data[i:i+1] == b"\n":
+            nl += 1
+        i += 1
+    return data[i:i + w * h]
+
+
+def do_seam(cfg, paths, window=0.4):
+    """量相邻两镜的「接缝跳变」：上一镜最后一帧 vs 下一镜第一帧的灰度差。
+
+    数值越小剪起来越顺；60 以上基本就是硬跳（换景/换光/换机位）。
+    加了 tail_frame（尾帧桥接）的镜头，这个数会掉到个位数。
+    """
+    exe = have_ffmpeg(cfg)
+    shots = load_json(paths["shots"])["shots"]
+    rows = []
+    for i in range(len(shots) - 1):
+        a, b = shots[i], shots[i + 1]
+        ca = os.path.join(paths["clips"], a["id"] + ".mp4")
+        cb = os.path.join(paths["clips"], b["id"] + ".mp4")
+        if not os.path.exists(ca):
+            continue
+        fa = os.path.join(paths["out"], "_seam_a.png")
+        ff_run(exe, ["-y", "-loglevel", "error", "-sseof", "-%.2f" % window, "-i", ca,
+                     "-frames:v", "1", fa])
+        if os.path.exists(cb):
+            fb = os.path.join(paths["out"], "_seam_b.png")
+            ff_run(exe, ["-y", "-loglevel", "error", "-i", cb, "-frames:v", "1", fb])
+        else:
+            fb = os.path.join(paths["frames"], b["id"] + ".jpg")
+            if not os.path.exists(fb):
+                continue
+        ta, tb = _gray_thumb(fa, exe), _gray_thumb(fb, exe)
+        if not ta or not tb or len(ta) != len(tb):
+            continue
+        diff = sum(abs(x - y) for x, y in zip(ta, tb)) / float(len(ta))
+        rows.append((a["id"], b["id"], diff, bool(b.get("tail_frame")), b.get("kind")))
+    for r in sorted(rows, key=lambda x: -x[2])[:6]:
+        pass
+    print("接缝检查（上一镜末帧 vs 下一镜首帧，灰度差 0-255）")
+    print("%-6s %-6s %6s  %s" % ("前", "后", "差值", "备注"))
+    for a, b, d, bridged, kind in rows:
+        tag = "尾帧桥接" if bridged else ("回忆" if kind == "recall" else "")
+        mark = "  <<< 跳" if d >= 60 else ("  <" if d >= 35 else "")
+        print("%-6s %-6s %6.1f  %s%s" % (a, b, d, tag, mark))
+    if rows:
+        avg = sum(r[2] for r in rows) / len(rows)
+        worst = max(rows, key=lambda x: x[2])
+        print("\n平均 %.1f，最跳的一处 %s→%s %.1f" % (avg, worst[0], worst[1], worst[2]))
+    return rows
 
 
 def do_audit(cfg, paths):
@@ -5519,12 +5854,14 @@ def main():
     p.add_argument("--title", default=None)
     p.set_defaults(func=cmd_story)
 
-    p = sub.add_parser("char-gen", help="文本描述生成角色形象")
+    p = sub.add_parser("char-gen", help="文本描述生成角色形象（正脸 + 多格角色设定卡）")
     p.add_argument("dir")
     p.add_argument("--name", default="hero")
     p.add_argument("--desc", default=None)
     p.add_argument("--outfit", default=None, help="英文服装；不填则用 shots.json 里的 outfit_en")
     p.add_argument("--tri", action="store_true")
+    p.add_argument("--no-card", action="store_true", help="只出正脸，不生成多格设定卡")
+    p.add_argument("--card-style", default="sheets", help="设定卡版式：sheets / turnaround")
     p.set_defaults(func=cmd_char_gen)
 
     p = sub.add_parser("char-add", help="导入已有照片作为角色")
@@ -5576,6 +5913,11 @@ def main():
     p = sub.add_parser("fetch", help="续查已提交任务并下载（读 clips/_pending.json）")
     p.add_argument("dir")
     p.set_defaults(func=cmd_fetch)
+
+    p = sub.add_parser("seam", help="量相邻镜头的接缝跳变（上一镜末帧 vs 下一镜首帧）")
+    p.add_argument("dir")
+    p.add_argument("--window", type=float, default=0.4, help="取上一镜最后多少秒的帧")
+    p.set_defaults(func=cmd_seam)
 
     p = sub.add_parser("recall", help="把旧剧集片段剪成回忆（不调 Agnes，不花额度）")
     p.add_argument("dir")

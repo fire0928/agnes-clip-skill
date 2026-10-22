@@ -23,6 +23,44 @@ Windows 实际路径就是 `C:\Users\<你的用户名>\.workbuddy\skills\`。
 
 装完**重启一下 WorkBuddy**。
 
+### 第 1.5 步：接上自动更新（**建议做，一条命令**）
+
+这样以后作者更新了新版，你的 skill 会自动跟上，不用手动换文件：
+
+```bash
+python ~/.workbuddy/skills/agnes-clip-平哥分享版/tools/git_sync.py link
+```
+
+它会把当前目录接成一个 git 仓库并连到作者的公开仓库。接完之后：
+
+| 你的需求 | 怎么做 |
+|---|---|
+| 手动看一眼有没有新版 | `python tools/git_sync.py check` |
+| 手动更新 | `python tools/git_sync.py pull` |
+| **每天自动更新** | 见下面「挂成定时任务」 |
+
+> ⚠️ 接上之后，本地改过的 skill 文件会被 `pull` 覆盖（改之前会先自动暂存，不会真丢）。
+> 想自己改代码就别接，或者改完先 `git stash` 存着。
+
+#### 挂成定时任务（每天自动更新）
+
+**Windows**：
+
+```powershell
+$skill = "$env:USERPROFILE\.workbuddy\skills\agnes-clip-平哥分享版"
+$py = "C:\Users\<你的用户名>\.workbuddy\binaries\python\envs\default\Scripts\python.exe"
+# 每天 9:30 跑一次（--quiet 表示没更新就不出声）
+$action = New-ScheduledTaskAction -Execute $py -Argument "`"$skill\tools\git_sync.py`" pull --quiet" -WorkingDirectory $skill
+$trigger = New-ScheduledTaskTrigger -Daily -At 9:30am
+Register-ScheduledTask -TaskName "agnes-clip 自动更新" -Action $action -Trigger $trigger
+```
+
+**Linux / Mac**（加到 crontab，每天 9:30）：
+
+```cron
+30 9 * * * cd ~/.workbuddy/skills/agnes-clip-平哥分享版 && python3 tools/git_sync.py pull --quiet
+```
+
 ### 第 2 步：填密钥
 
 在对话框里直接说：

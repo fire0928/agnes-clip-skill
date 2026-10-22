@@ -98,6 +98,34 @@ Audio: steady rain on the awning, distant traffic, a soft door chime.
 | 一镜 4 段以上运镜 | 模型混乱、画面抽搐 |
 | 一镜 5 个以上表情 | 表情僵硬 |
 
+## 五点五、地域与时代锁定（**最重要的一条**）
+
+扩散模型对"东亚"有很强的默认先验。你不明确写，它会给你**日式**——
+木结构町屋、纸灯笼、鸟居、榻榻米、和式庭院。
+
+**实测踩过**：写 `An old city street corner at dusk`，出来的是日式町屋 + 灯笼，
+完全不是中国现代城市。
+
+**凡是中国当代题材，首帧提示词里必须带上这四句**（位置：场景描述之后、人物描述之前）：
+
+```text
+Setting: contemporary mainland China, modern Chinese city.
+Architecture and props are modern Chinese, NOT Japanese.
+No Japanese-style architecture, no wooden machiya townhouses, no paper lanterns,
+no torii gates, no tatami, no kimono, no shrine elements.
+```
+
+| 想要的 | 写 | 别写 |
+|---|---|---|
+| 中国老街 | `old Chinese alley, mid-20th-century Chinese brick housing, red lanterns, Chinese signage` | `old Asian street`（会出日式） |
+| 中国现代都市 | `contemporary Chinese city, glass high-rises, Chinese street signs` | `Asian metropolis` |
+| 中国乡村 | `rural Chinese village, whitewashed brick walls, tiled roofs` | `Asian countryside` |
+| 中国古风 | `ancient Chinese town, Ming-dynasty wooden architecture, Chinese courtyard` | `ancient Asian village` |
+
+**人物也不能是日式**：中国人物要写 `East Asian Chinese`，服饰要写具体的中式单品
+（`Chinese-style cotton-linen shirt` / `cheongsam` / `Chinese wool coat`），
+不要写 `traditional Asian attire`（会出和服/韩服）。
+
 ## 六、负面约束
 
 Agnes 没有独立 negative prompt，全部写成正向句子放结尾：
@@ -105,3 +133,10 @@ Agnes 没有独立 negative prompt，全部写成正向句子放结尾：
 ```text
 No text, no watermark, no burned-in subtitles. No camera cuts. Avoid flat graphic colour bands, avoid CG look, avoid plastic skin, avoid identity drift.
 ```
+
+**当代中国题材还要加**：
+
+```text
+No Japanese-style architecture, no wooden townhouses, no paper lanterns, no torii gates, no tatami, no kimono.
+```
+

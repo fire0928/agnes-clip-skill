@@ -51,6 +51,9 @@ import urllib.parse
 import urllib.request
 import uuid
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import region_lock
+
 # 部分中转（apibase.cc 等）用 Cloudflare 拦 python-urllib 默认 UA，会 403 / 读超时。
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -258,38 +261,34 @@ OUT_SIZE = {
 EAST_ASIAN = (" All characters are East Asian Chinese with East Asian facial features, "
               "black hair, dark eyes and natural East Asian skin tones.")
 
-# 场景风格锚：默认只保留「这是真实中国场景」这一层，不预设具体店铺类型。
-# 老版本这里硬编码了「中式老街面馆」，导致非面馆项目（公寓/咖啡店/公交站）都被喂进面馆陈设，
-# 是「画面里凭空多出不属于本片的道具」最常见的一个根因。
-CN_SHOP_ANCHOR = (
-    "Authentic contemporary Chinese setting with real, lived-in Chinese details. "
-    "NOT a Japanese izakaya, NOT a sushi bar, NOT a western restaurant, NOT a generic hotel lobby. "
-    "No noren curtains, no tatami, no sushi counter, no English-only signage."
+# 🔴 拟人动物项目（猫哥这种 3D 动漫短剧）不能加上面那句——
+# 「东亚人面部特征、黑色头发、人类肤色」会把猫拉回人样，长出人类五官。
+# 项目 project.json 写 "character_type": "anthropomorphic_animal" 时改用这一句。
+ANTHROPOMORPHIC = (" All characters are anthropomorphic animals with animal faces, fur, muzzles, "
+                    "paws and tails, never human skin, never human hair, never human facial features, "
+                    "never human hands, and they stand and walk upright on two legs like people.")
+
+# 拟人动物项目的整体渲染风格锚：动物城（Zootopia）级 3D 动画。
+ANIMAL_RENDER_ANCHOR = (
+    "High-end 3D animated feature film style, Zootopia-quality anthropomorphic animal animation, "
+    "soft subsurface-scattering fur shading, large expressive glossy eyes with catchlights, "
+    "stylized but believable proportions, cinematic lighting, high detail. "
 )
 
-# 需要特定场景气质时，在 project.json 写 "scene_anchor": "<preset 名>" 或直接写整句英文
-SCENE_ANCHOR_PRESETS = {
-    "cn_noodle_shop": (
-        "A tiny old Chinese street noodle shop (中式老街面馆) in a southern Chinese city at night. "
-        "Authentic Chinese details only — NOT a Japanese izakaya, NOT a sushi bar, NOT a café, "
-        "NOT a western restaurant. No noren curtains, no tatami, no sushi counter."
-    ),
-    "cn_apartment": (
-        "A small lived-in Chinese urban apartment, ordinary rented flat with simple modern furniture, "
-        "warm household clutter, real Chinese domestic details. NOT a showroom, NOT a hotel room, "
-        "NOT a western loft."
-    ),
-    "cn_cafe": (
-        "A small independent Chinese neighbourhood coffee shop, wooden tables, warm pendant lights, "
-        "plants by the window, handwritten menu board. NOT a Japanese kissaten, NOT a chain store, "
-        "NOT a European bistro."
-    ),
-}
+# 场景板也要用同一套渲染风格，否则场景板是实拍风、人物是 3D 动漫风，拼不上。
+ANIMAL_SCENE_ANCHOR = (
+    "High-end 3D animated feature film style, Zootopia-quality environment design, "
+    "stylized realistic set with soft volumetric light, cinematic lighting, high detail. "
+)
 
 
-def scene_anchor(cfg, paths=None):
-    """场景风格锚：项目 project.json 的 scene_anchor > 全局配置 > 中性中国场景锚。"""
-    anchor = cfg.get("scene_anchor") or CN_SHOP_ANCHOR
+def character_type_clause(cfg, paths=None):
+    """按项目配置返回角色外观硬约束句。
+
+    默认（没配 character_type）= EAST_ASIAN，人类项目行为完全不变。
+    配了 "anthropomorphic_animal" = 动物句，防止人被拉成猫/猫被拉成人。
+    """
+    ct = (cfg.get("character_type") or "human").strip().lower()
     root = (paths or {}).get("root") or (paths or {}).get("proj") or "."
     pconf_path = os.path.join(root, "project.json")
     if os.path.exists(pconf_path):
@@ -297,25 +296,57 @@ def scene_anchor(cfg, paths=None):
             pconf = load_json(pconf_path) or {}
         except Exception:
             pconf = {}
-        anchor = pconf.get("scene_anchor") or anchor
-    # 允许写 preset 名
-    anchor = SCENE_ANCHOR_PRESETS.get(anchor.strip(), anchor) if isinstance(anchor, str) else anchor
-    return anchor
+        ct = (pconf.get("character_type") or ct).strip().lower()
+    return ANTHROPOMORPHIC if ct in ("anthropomorphic_animal", "animal", "anthropomorphic") else EAST_ASIAN
 
-# 面馆专用兜底陈设：只有地点明确是「面馆」时才自动套用，不再作为全局默认。
-# 全局默认必须为空 —— 否则公寓 / 咖啡店 / 公交站的场景板会被塞进面锅和红塑料凳。
-NOODLE_SCENE_SET = [
-    "white square wall tiles",
-    "big stainless-steel noodle boiling pot with rising steam",
-    "stainless counter with bowls of chopped scallion and chili oil",
-    "red plastic menu board on the wall with unreadable characters",
-    "wooden square tables with red plastic stools",
-    "glass-fronted drink fridge with soda bottles",
-    "warm yellow pendant lamps hanging low",
-    "worn terrazzo floor",
-]
 
-DEFAULT_SCENE_SET = []
+def is_animal_project(cfg, paths=None):
+    """是否是拟人动物项目（决定用哪套渲染风格锚）。"""
+    root = (paths or {}).get("root") or (paths or {}).get("proj") or "."
+    pconf_path = os.path.join(root, "project.json")
+    ct = (cfg.get("character_type") or "human").strip().lower()
+    if os.path.exists(pconf_path):
+        try:
+            pconf = load_json(pconf_path) or {}
+        except Exception:
+            pconf = {}
+        ct = (pconf.get("character_type") or ct).strip().lower()
+    return ct in ("anthropomorphic_animal", "animal", "anthropomorphic")
+
+# 场景风格锚：默认只保留「这是真实中国场景」这一层，不预设具体店铺类型。
+# 老版本这里硬编码了「中式老街面馆」，导致非面馆项目（公寓/咖啡店/公交站）都被喂进面馆陈设，
+# 是「画面里凭空多出不属于本片的道具」最常见的一个根因。
+CN_SHOP_ANCHOR = region_lock.CN_SHOP_ANCHOR
+
+# 室外街道的地域锁定。
+#
+# ⚠ 关键：**这里必须全用正向描述，不能写排除项**。
+# 扩散模型读不懂否定 —— 实测写了 "no wooden machiya townhouses" 之后，
+# 出来的还是日式町屋，而且 "machiya" 这个词本身会激活町屋概念（越禁越来）。
+# 正确做法是把想要的画面说清楚，一个负面词都不提。
+# 用户级记忆里那条「拒绝日式视觉风格」也说了：负面约束对扩散模型无效。
+CN_STREET_ANCHOR = region_lock.CN_STREET_ANCHOR
+
+# 需要特定场景气质时，在 project.json 写 "scene_anchor": "<preset 名>" 或直接写整句英文
+SCENE_ANCHOR_PRESETS = region_lock.SCENE_ANCHOR_PRESETS
+
+
+def scene_anchor(cfg, paths=None, shot=None):
+    """场景风格锚：项目 project.json 的 scene_anchor > 全局配置 > 按场景类型自动选。
+
+    委托给 region_lock（两个 skill 共用同一套实现，避免两边规则漂移）。
+
+    自动选的理由：**室外的默认先验是日式**（町屋+灯笼），室内的排除词才管用。
+    实测写 "An old city street corner at dusk"，模型直接给了日式町屋 ——
+    因为没告诉它这是中国现代城市。所以室外一律用 CN_STREET_ANCHOR。
+    """
+    return region_lock.scene_anchor(cfg, paths, shot)
+
+
+# 判定室外/街道的关键词（中日文都认）
+# 判定室内的关键词
+
+
 
 
 def scene_set_for(place, slug=""):
@@ -588,7 +619,14 @@ def save_image_bytes(raw, dst, exe=None):
         with open(tmp, "wb") as f:
             f.write(raw)
         ff_run(exe, ["-y", "-loglevel", "error", "-i", tmp, "-q:v", "2", dst])
-        os.remove(tmp)
+        # ⚠️ 删临时文件失败**绝不能中断出图**：某些环境下 os.remove 会被系统的
+        # 回收站机制拦截并抛 OSError（SHFileOperationW 失败 0x2），
+        # 结果图已经写好了，却因为删不掉一个 .png 而整批任务崩掉。
+        # 残留一个临时 png 无害，让它留在 frames/ 里即可。
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
         return
     os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
     with open(dst, "wb") as f:
@@ -753,6 +791,86 @@ def image_channel(cfg, paths=None):
     return ch
 
 
+def check_channel_ready(cfg, ch):
+    """选中的出图通道是否配好了。**没配好就明确报错**，别偷偷拿别的地址凑。
+
+    踩过的坑：全局 image.provider 选了 gpt-image，但 image.endpoint / image.key 是空的，
+    代码就回退到 Agnes 的地址，却发 OpenAI 格式的请求（带参考图时用 input 数组）——
+    Agnes 不认这个格式，设定卡那一步就静默卡死（错误被 480s 超时吞掉）。
+    """
+    img = cfg.get("image") or {}
+    if ch in ("agnes", "", None):
+        if not (cfg.get("agnes") or {}).get("endpoint"):
+            die("出图通道是 Agnes，但没配 endpoint。运行: ac.py setup --agnes-endpoint <地址>")
+        return
+    if ch in ("gpt-image", "openai"):
+        if not img.get("endpoint"):
+            die("出图通道是 GPT Image，但没配 image.endpoint。\n"
+                "要么补上（ac.py setup 或 ~/.workbuddy/agnes-clip.json 里加 image.endpoint），"
+                "要么把通道改回 Agnes（image.provider 设为 \"agnes\"）。")
+        if not img.get("key"):
+            die("出图通道是 GPT Image，但没配 image.key。")
+        return
+    if ch in ("banana", "nano-banana", "gemini"):
+        b = cfg.get("banana") or {}
+        if not b.get("key"):
+            die("出图通道是 Nano Banana，但没配 banana.key。\n"
+                "要么补上，要么把通道改回 Agnes（image.provider 设为 \"agnes\"）。")
+        return
+
+
+# 通道健康度：某个通道连续失败后先跳过它，冷却一段时间再试。
+# 背景：中转站（apibase.cc）带参考图的请求有时挂 300s+ 没反应，
+# 每次都等满超时太浪费；直接失败回退又会让第一段白跑。
+_CHANNEL_HEALTH = {}          # {channel: {"fail": n, "until": ts}}
+_CHANNEL_COOLDOWN = 900       # 冷却 15 分钟
+
+
+def channel_is_sick(ch):
+    """通道是否处于冷却期（刚失败过）。"""
+    h = _CHANNEL_HEALTH.get(ch)
+    if not h:
+        return False
+    if h.get("fail", 0) >= 2 and time.time() < h.get("until", 0):
+        return True
+    return False
+
+
+def mark_channel_fail(ch):
+    h = _CHANNEL_HEALTH.setdefault(ch, {"fail": 0, "until": 0})
+    h["fail"] = h.get("fail", 0) + 1
+    h["until"] = time.time() + _CHANNEL_COOLDOWN
+
+
+def mark_channel_ok(ch):
+    _CHANNEL_HEALTH.pop(ch, None)
+
+
+def pick_working_channel(cfg, paths, force=None):
+    """挑一条现在能用、且没在冷却期的出图通道。
+
+    顺序：指定通道 > 项目设置 > 全局设置 > 依次尝试 agnes / banana / gpt-image。
+    """
+    if force:
+        return force
+    ch = image_channel(cfg, paths)
+    if not channel_is_sick(ch):
+        return ch
+    info("通道 %s 刚失败过，先跳过（%d 分钟后自动重试）" % (ch, _CHANNEL_COOLDOWN // 60))
+    for alt in ("agnes", "banana", "gpt-image"):
+        if alt == ch:
+            continue
+        if channel_is_sick(alt):
+            continue
+        try:
+            check_channel_ready(cfg, alt)
+        except SystemExit:
+            continue
+        info("改用 %s 通道" % alt)
+        return alt
+    return ch
+
+
 def _browser_headers(endpoint=""):
     """按目标域名拼一套完整浏览器头，绕过 Cloudflare 的 1010 签名校验。"""
     h = dict(BROWSER_HEADERS)
@@ -782,8 +900,15 @@ def gpt_image_generate(cfg, prompt, ref_paths=None, size=None, ratio=None,
     """
     img = cfg.get("image") or {}
     a = cfg["agnes"]
-    endpoint = (img.get("endpoint") or a.get("endpoint") or "").rstrip("/")
-    key = img.get("key") or a.get("key") or ""
+    # ⚠ 不要在没配 endpoint 时借用 Agnes 的地址：请求格式不同
+    # （这里发的是 OpenAI 风格的 input 数组，Agnes 不认），
+    # 失败会被 480s 超时吞掉，看起来像"卡死"。要么配好，要么换通道。
+    endpoint = (img.get("endpoint") or "").rstrip("/")
+    if not endpoint:
+        die("GPT Image 通道没有配 image.endpoint。\n"
+            "补上（~/.workbuddy/agnes-clip.json 里加 image.endpoint / image.key），"
+            "或把通道改回 Agnes（image.provider 设为 \"agnes\"）。")
+    key = img.get("key") or ""
     model = img.get("model") or "gpt-image-1"
 
     # 尺寸换算：2K / 9:16 这类值要转成 gpt-image 认识的像素值
@@ -814,10 +939,16 @@ def gpt_image_generate(cfg, prompt, ref_paths=None, size=None, ratio=None,
     headers = {"Authorization": "Bearer " + key}
     headers.update(_browser_headers(endpoint))
     last = ""
+    # 中转站有时会把带参考图的请求挂住（实测 apibase.cc 挂 300s+ 没反应）。
+    # 给足排队时间，但必须有提示 —— 否则用户只看到"卡住"，不知道在等什么。
+    wait = int(img.get("timeout") or 180)
     for attempt in range(3):
         try:
-            # 中转排队可能很久，超时给足 480s，别在 240s 就放弃一次排队机会
-            d = http_json(url, payload, headers=headers, timeout=480)
+            if attempt > 0:
+                info("第 %d 次重试（上次失败：%s）" % (attempt + 1, last[:80]))
+            else:
+                info("等中转站出图，最多 %ds（带参考图的中转有时会排队）…" % wait)
+            d = http_json(url, payload, headers=headers, timeout=wait)
             item = (d.get("data") or [{}])[0]
             if item.get("b64_json"):
                 return base64.b64decode(item["b64_json"]), {"provider": "gpt-image", "model": model}
@@ -841,6 +972,7 @@ def gpt_image_generate(cfg, prompt, ref_paths=None, size=None, ratio=None,
     # 中转站挂了不要连累整条链路：自动回退到 Agnes 出图
     if fallback:
         print("[ac] GPT Image 通道失败（%s），自动回退 Agnes 出图" % last[:120], flush=True)
+        mark_channel_fail("gpt-image")     # 记下来，下次先跳过它
         return agnes_image_generate(
             cfg, prompt, ref_paths=ref_paths, size=size, ratio=ratio,
             project_paths=project_paths, force_channel="agnes")
@@ -915,6 +1047,7 @@ def banana_image_generate(cfg, prompt, ref_paths=None, size=None, ratio=None,
             time.sleep(min(20, 4 * (attempt + 1)))
     if fallback:
         print("[ac] banana 通道失败（%s），自动回退 Agnes 出图" % last[:160], flush=True)
+        mark_channel_fail("banana")
         return agnes_image_generate(cfg, prompt, ref_paths=ref_paths, size=size,
                                     ratio=ratio, project_paths=project_paths,
                                     force_channel="agnes")
@@ -924,7 +1057,24 @@ def banana_image_generate(cfg, prompt, ref_paths=None, size=None, ratio=None,
 def agnes_image_generate(cfg, prompt, ref_paths=None, size=None, ratio=None,
                          project_paths=None, force_channel=None):
     """统一生图入口：按项目/全局配置走 banana / gpt-image / agnes 三条通道之一。"""
-    ch = force_channel or image_channel(cfg, project_paths)
+    ch = force_channel or pick_working_channel(cfg, project_paths)
+    # 通道没配好就早点说清楚，别让它跑到一半静默卡死
+    check_channel_ready(cfg, ch)
+    try:
+        raw, meta = _generate_via(cfg, ch, prompt, ref_paths, size, ratio, project_paths)
+        mark_channel_ok(ch)
+        return raw, meta
+    except SystemExit:
+        mark_channel_fail(ch)
+        raise
+    except Exception:
+        mark_channel_fail(ch)
+        raise
+
+
+def _generate_via(cfg, ch, prompt, ref_paths=None, size=None, ratio=None,
+                  project_paths=None):
+    """按通道实际出图。"""
     if ch in ("banana", "nano-banana", "gemini"):
         return banana_image_generate(cfg, prompt, ref_paths=ref_paths, size=size,
                                      ratio=ratio, project_paths=project_paths)
@@ -1996,8 +2146,8 @@ def normalize_story(data, n_shots, seconds, title=None):
                 vp = vp.rstrip() + timed
         if "no subtitles" not in vp.lower() and "no on-screen text" not in vp.lower():
             vp = vp.rstrip() + " No on-screen text, no subtitles, no captions, no watermark — clean image only."
-        if "east asian" not in vp.lower():
-            vp = vp.rstrip() + EAST_ASIAN
+        if "east asian" not in vp.lower() and "anthropomorphic animal" not in vp.lower():
+            vp = vp.rstrip() + character_type_clause(cfg, paths)
         out.append({
             "id": sid,
             "duration": dur,
@@ -2810,9 +2960,9 @@ def do_scenes(cfg, paths, force=False):
             g["scene"] = s.get("scene") or {}
 
     made = 0
-    # 场景风格锚：项目 project.json 的 scene_anchor 优先，其次全局配置，最后才用面馆默认锚
-    anchor = scene_anchor(cfg, paths)
+    # 场景风格锚：项目 project.json 的 scene_anchor 优先，其次全局配置，最后按室内/室外自动选
     for key, g in groups.items():
+        anchor = scene_anchor(cfg, paths, {"scene": g.get("scene") or {}})
         sc = g["scene"]
         setlist = sc.get("set") or scene_set_for(sc.get("place"), sc.get("id"))
         place = sc.get("place") or ""
@@ -2835,15 +2985,17 @@ def do_scenes(cfg, paths, force=False):
                 # 没写 set 时不要塞任何具体道具：模型会把不属于本片的碗/锅/菜单牌画进来
                 set_clause = ("Set dressing must be plain, believable and specific to this location as described; "
                               "do not invent props, food or signage that the description does not imply. ")
+            render = ANIMAL_SCENE_ANCHOR if is_animal_project(cfg, paths) else ""
             prompt = (
-                "Empty location plate, no people at all. %s "
+                "Empty location plate, no people at all. %s"
+                "%s"
                 "%s"
                 "Camera: %s. Time: %s, %s. Lighting: %s. Location: %s. "
                 "Cinematic realism, 35mm lens, natural depth of field, vertical composition. "
                 "ONE single continuous full-frame photograph of ONE room from ONE camera position - "
                 "no collage, no grid, no split panels, no borders, no multiple views stacked together. "
                 "No people, no hands, no readable text or lettering on signs (blank signboards), no watermark."
-                % (anchor, set_clause, desc, time_, weather, light, place)
+                % (anchor, render, set_clause, desc, time_, weather, light, place)
             )
             # 不拿别的机位板当参考：模型会直接抄那张的机位，导致所有机位长得一样。
             refs = []
@@ -2928,7 +3080,6 @@ def _cast_clause(shot, chars):
             "Their outfits are fixed for the whole film and match the character reference exactly."
             % (len(parts), " ".join(parts)))
 
-
 def _frame_for_shot(cfg, paths, shot, exe, chars=None, dry=False):
     sid = shot["id"]
     out = os.path.join(paths["frames"], sid + ".jpg")
@@ -2967,16 +3118,20 @@ def _frame_for_shot(cfg, paths, shot, exe, chars=None, dry=False):
     prompt = (shot.get("frame") or {}).get("prompt")
     if not prompt:
         die("%s 的 frame.mode=%s 但没有 frame.prompt" % (sid, fmode))
+    # 地域锁定锚放**最前面**：用户写的场景描述常常是 "An old city street corner" 这种
+    # 中性说法，模型会按"东亚老街"的默认先验给出日式町屋。
+    # 锚在开头才能压住这个先验（放结尾权重不够，实测照样出日式）。
+    anchor_text = scene_anchor(cfg, paths, shot)
+    prompt = anchor_text + " " + prompt
     # 空镜生成模式（gen）：没有人物，不需要锁脸、不需要人物白名单，
     # 但可以喂场景板当参考，用来生成「空镜 + 特定道具」的定制画面。
     is_empty_gen = (fmode == "gen")
     if not is_empty_gen:
         if "identity drift" not in prompt.lower():
             prompt += FACE_LOCK
-        if "east asian" not in prompt.lower():
-            prompt += EAST_ASIAN
-    # 场景风格锚 + 人物白名单 + 服装锁
-    prompt += " " + scene_anchor(cfg, paths)
+        if "east asian" not in prompt.lower() and "anthropomorphic animal" not in prompt.lower():
+            prompt += character_type_clause(cfg, paths)
+    # 人物白名单 + 服装锁
     if not is_empty_gen:
         prompt += _cast_clause(shot, chars or {})
         prompt += _position_clause(shot)
@@ -3445,7 +3600,9 @@ def cmd_fetch(args):
     cfg, paths = load_project(args.dir)
     p = os.path.join(paths["clips"], "_pending.json")
     if not os.path.exists(p):
-        die("没有待续查任务（clips/_pending.json 不存在）")
+        # 没有在途任务是正常状态（上一轮已经收完了），不是错误
+        info("没有待续查任务（clips/_pending.json 不存在）——都已收完")
+        return
     raw = load_json(p)
     if isinstance(raw, list):
         jobs, queue = raw, []
@@ -3455,7 +3612,11 @@ def cmd_fetch(args):
         if j.get("clip") and os.path.exists(j["clip"]):
             j["status"] = "completed"
     _run_scheduler(cfg, paths, jobs, queue)
-    os.remove(p)
+    # 清理 pending 失败不能崩：崩了会丢任务状态，后面无法续查
+    try:
+        os.remove(p)
+    except OSError:
+        pass
     info("全部完成，已清理 _pending.json")
 
 
@@ -4896,7 +5057,10 @@ def do_audit(cfg, paths):
             # VO（画外音/独白）是后期 TTS 贴上去的，片段里本来就没这条人声
             if rec["line"] and not rec["speech"] and not is_vo:
                 issues.append("%s 有台词但未检测到人声" % sid)
-            if rec["speech"] and d > 0 and rec["speech"][0][0] > 0.45 * d and not is_vo:
+            # ⚠ 「开口太晚」只在**这一镜确实有台词**时才检查。
+            # 无台词的镜头里，VAD 会把风声、远处车声、鸟叫检成人声 ——
+            # 拿它当台词时间去报「台词到 5.5s 才开口」是纯误报（实测踩过）。
+            if rec["line"] and rec["speech"] and d > 0 and rec["speech"][0][0] > 0.45 * d and not is_vo:
                 issues.append("%s 台词到 %.1fs 才开口（占 %.0f%%），前段空等，合成前建议收紧"
                               % (sid, rec["speech"][0][0], 100.0 * rec["speech"][0][0] / d))
             if rec["res"] and rec["res"] not in ("704x1280", "720x1280"):

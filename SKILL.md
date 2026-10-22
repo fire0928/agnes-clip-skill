@@ -6,7 +6,7 @@ description: 用 Agnes 云端算力全自动做竖屏短剧/长视频——一�
 description_zh: 一句话创意自动做成有对白、会说话的竖屏短剧。全流程 15 步：写剧本、分镜、角色定妆、场景板、逐镜首帧、批量出视频、配乐音效字幕、合成成片，人脸全程锁死不怕换脸。视频走云端算力，不占本地显卡。适合做催泪短剧、漫剧、系列连续剧，也支持同系列多集复用同一张脸。
 description_en: Turn a one-line idea into a vertical short drama with real dialogue. A 15-stage pipeline handles scripting, storyboarding, character sheets, scene boards, first frames, batch video generation, music, sound effects, subtitles and final cut — with character faces locked across every shot so nobody switches faces mid-story. Video runs on cloud GPUs, so no local hardware needed. Great for tearjerkers, anime shorts and serialized episodes that reuse the same face across episodes.
 agent_created: true
-version: 1.9.1
+version: 1.10.0
 ---
 
 # Agnes Clip · 一句话成片
@@ -379,6 +379,19 @@ python scripts/ac.py setup            # 交互里把「视频模型」改成 agn
 | **带参考图** | `faces`（默认等于 `cast`）里每个人的 `face_ref.jpg` + 本机位场景板，base64 放进 `extra_body.image`；单人 2 张、双人 3 张 | 日志会写「参考图 N 张：人脸 X + 场景 1」 |
 | **人数锁死** | 自动写 `Headcount in this frame is exactly N, and these are the only bodies visible: 1) … 2) …`，空位用陈述句交代「其它座位是空的」。**不要用 no other people / no duplicated person 这类否定句**，越写越容易画出来 | `--dry-run` 直接看 |
 | **人物位置** | 提示词没写左右时自动补 `Composition: A 在画左三分之一、B 在画右三分之一、不许过轴`；单人则略偏左、视线方向留空 | `--dry-run` 直接看 |
+
+| **地域锁定** | 提示词**最前面**自动插入地域锚：室外场景插 `Setting: contemporary mainland China, a modern Chinese city street...`（全是正向描述），室内插 `Authentic contemporary Chinese setting...`（含日式排除项）。**判断室内还是室外看 `scene.place` / `scene.slug` 里的关键词** | `--dry-run` 看第一句是不是锚 |
+
+> 🔴🔴 **地域锁定为什么这么写（实测踩过两次）**：
+> 1. **室外默认先验是日式**。写 `An old city street corner at dusk`，出来的是**日式町屋 + 和式灯笼**，
+>    完全不是中国现代城市。室内锚里的排除词在街景语境下不管用，得单独给室外一份。
+> 2. **锚必须放最前面**。放结尾权重不够，用户那句中性描述照样把模型带偏。
+> 3. **锚里不能有负面词**。第一版写了 `no wooden machiya townhouses`，结果**还是町屋**——
+>    "machiya" 这个词本身会激活町屋概念，越禁越来。只能纯正向描述。
+>
+> 改 `scene.place` 就能切换：写「面馆内」「客厅」走室内锚，写「老路口」「街角」走室外锚。
+> 想要更具体的锚，在 `project.json` 写 `"scene_anchor": "cn_old_street"`（可选
+> `cn_street` / `cn_old_street` / `cn_city_night` / `cn_noodle_shop` / `cn_apartment` / `cn_cafe`）。
 
 > 🔴 **过肩镜头必看**：前景那人背对镜头、不露脸，就一定要 `"faces": ["露脸的那位"]`。
 > 把他的正脸参考图一起喂进去，模型会在窗边/门口另画一个完整的人——同一镜里出现两个同一个人。

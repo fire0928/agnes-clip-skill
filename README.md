@@ -424,3 +424,7 @@ agnes-clip-平哥分享版/
 | 产品线 | AI 视频生成、达人建联、数字员工盒子（ilikeai.cc / aibox.ilikeai.cc） |
 
 业务合作、技术咨询、定制开发欢迎来信。
+
+### v1.8.1（2026-10-22）
+
+- **分发包现在带 `tools/` 了**：装完的人可以跑 `python tools/git_sync.py link` 一条命令接入自动更新通道。

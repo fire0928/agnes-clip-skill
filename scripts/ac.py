@@ -6473,6 +6473,36 @@ def cmd_music_ui(args):
         info("配乐台已关闭")
 
 
+# ----------------------------------------------------------------------------- 世界观工作台
+
+def cmd_worldview(args):
+    """世界观工作台：网页里查看/修改剧本、分镜、角色、道具、场景、世界观。
+
+    多集会在左侧列出，点一下就切过去。
+    """
+    import sys as _sys
+    _here = os.path.dirname(os.path.abspath(__file__))
+    if _here not in _sys.path:
+        _sys.path.insert(0, _here)
+    import wv_server
+
+    cfg, paths = load_project(args.dir)
+    root = paths["root"]
+    port = getattr(args, "port", 8777) or 8777
+    # 端口被占就顺延
+    for p in range(port, port + 20):
+        try:
+            import socket
+            s = socket.socket()
+            s.bind(("127.0.0.1", p))
+            s.close()
+            port = p
+            break
+        except OSError:
+            continue
+    wv_server.serve(root, port=port, open_browser=not getattr(args, "no_open", False))
+
+
 # ----------------------------------------------------------------------------- main
 
 def main():
@@ -6652,6 +6682,12 @@ def main():
     p.add_argument("dir")
     p.add_argument("--port", type=int, default=8788)
     p.set_defaults(func=cmd_music_ui)
+
+    p = sub.add_parser("worldview", help="打开世界观工作台（剧本/分镜/角色/道具/场景/世界观，多集切换）")
+    p.add_argument("dir")
+    p.add_argument("--port", type=int, default=8777)
+    p.add_argument("--no-open", action="store_true", help="不自动开浏览器")
+    p.set_defaults(func=cmd_worldview)
 
     p = sub.add_parser("setup", help="配置 Agnes 凭据（写入 ~/.workbuddy/agnes-clip.json）")
     p.add_argument("--agnes-endpoint", default=None)

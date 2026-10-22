@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>世界观工作台</title>
+<style>
+  :root{
+    --bg:#f7f5f2; --panel:#ffffff; --line:#e7e1d9; --line2:#f0ebe4;
+    --text:#221f1b; --text2:#5d564e; --muted:#948b81;
+    --accent:#a8623f; --accent-soft:#f4e9e2; --accent-line:#e0c4b2;
+    --ok:#4b7d6e; --ok-soft:#e8f1ee; --warn:#b8802f; --warn-soft:#fbf1e0;
+    --shadow:0 1px 2px rgba(34,31,27,.05), 0 8px 24px rgba(34,31,27,.05);
+    --radius:14px;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:14px/1.65 "Microsoft YaHei","PingFang SC","Hiragino Sans GB",system-ui,sans-serif;
+       -webkit-font-smoothing:antialiased}
+
+  /* ── 顶栏 ── */
+  header{position:sticky;top:0;z-index:30;background:rgba(247,245,242,.9);
+         backdrop-filter:blur(12px) saturate(1.4);border-bottom:1px solid var(--line);
+         padding:0 22px;height:58px;display:flex;align-items:center;gap:16px}
+  .brand{display:flex;align-items:baseline;gap:10px;min-width:0}
+  .brand h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.3px;white-space:nowrap}
+  .brand .sub{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .grow{flex:1}
+  .stat{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .chip{background:var(--panel);border:1px solid var(--line);border-radius:999px;
+        padding:3px 11px;font-size:11.5px;color:var(--text2);white-space:nowrap}
+  .chip b{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}
+  .chip.ok{background:var(--ok-soft);border-color:#cfe0da;color:#3d6a5c}
+  .chip.warn{background:var(--warn-soft);border-color:#ead9b8;color:#8a6220}
+
+  button,.btn{border:1px solid var(--line);background:#fff;border-radius:9px;padding:6px 13px;
+         font:inherit;font-size:12.5px;cursor:pointer;color:var(--text);white-space:nowrap;
+         transition:border-color .15s, background .15s, transform .06s}
+  button:hover,.btn:hover{border-color:#d3c8bc;background:#fdfcfb}
+  button:active{transform:translateY(1px)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:500}
+  button.primary:hover{background:#965634;border-color:#965634}
+  button.ghost{background:transparent;border-color:transparent;color:var(--text2)}
+  button.ghost:hover{background:#efeae4}
+  button:disabled{opacity:.45;cursor:default;transform:none}
+  .btnrow{display:flex;gap:8px;align-items:center}
+
+  /* ── 主体三栏 ── */
+  .shell{display:grid;grid-template-columns:236px 1fr;gap:0;height:calc(100vh - 58px)}
+  @media(max-width:820px){.shell{grid-template-columns:1fr;height:auto}}
+
+  /* 左栏：集 + 栏目 */
+  aside{background:#fbfaf8;border-right:1px solid var(--line);
+        overflow-y:auto;padding:16px 12px 40px}
+  @media(max-width:820px){aside{border-right:none;border-bottom:1px solid var(--line);max-height:none}}
+  .grp{margin-bottom:18px}
+  .grp h3{font-size:10.5px;margin:0 0 8px;padding:0 8px;color:var(--muted);
+          letter-spacing:1.4px;text-transform:uppercase;font-weight:600}
+  .nav a,.ep{display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:9px;
+            color:var(--text2);text-decoration:none;font-size:13px;cursor:pointer;
+            border:1px solid transparent}
+  .nav a:hover,.ep:hover{background:#f1ece6}
+  .nav a.on{background:var(--accent-soft);border-color:var(--accent-line);color:#8a4c2e;font-weight:600}
+  .nav a .ic{width:16px;text-align:center;opacity:.75;font-size:12px}
+  .nav a .cnt{margin-left:auto;font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .ep{width:100%;text-align:left;font:inherit;font-size:12.5px}
+  .ep.on{background:var(--accent-soft);border-color:var(--accent-line)}
+  .ep .t{font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ep .m{font-size:11px;color:var(--muted);margin-top:1px}
+  .ep .badge{margin-left:auto;background:var(--ok-soft);color:#3d6a5c;border-radius:999px;
+             padding:1px 7px;font-size:10px;flex-shrink:0}
+
+  /* 右栏 */
+  main{overflow-y:auto;padding:20px 24px 80px}
+  @media(max-width:820px){main{padding:16px 14px 60px}}
+  .page{animation:fade .22s ease}
+  @keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+  .phead{margin-bottom:16px}
+  .phead h2{margin:0 0 4px;font-size:19px;font-weight:650;letter-spacing:.2px}
+  .phead p{margin:0;color:var(--muted);font-size:12.5px}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+        box-shadow:var(--shadow);padding:16px 18px;margin-bottom:14px}
+  .card h3{margin:0 0 12px;font-size:12px;color:var(--muted);letter-spacing:1.2px;
+           text-transform:uppercase;font-weight:600;display:flex;align-items:center;gap:8px}
+  .card h3 .r{margin-left:auto;letter-spacing:0;text-transform:none;font-size:11.5px;color:var(--muted)}
+
+  textarea{width:100%;min-height:300px;border:1px solid var(--line);border-radius:10px;
+           padding:14px 16px;font:13.5px/1.85 "Microsoft YaHei",system-ui,sans-serif;
+           resize:vertical;background:#fdfcfb;color:var(--text);outline:none}
+  textarea:focus,input:focus{border-color:var(--accent-line);background:#fff;
+           box-shadow:0 0 0 3px rgba(168,98,63,.08)}
+  textarea.md{font-family:"SF Mono",Cascadia Code,Consolas,monospace;font-size:12.5px;line-height:1.75}
+
+  /* 剧集表 */
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;font-size:10.5px;color:var(--muted);letter-spacing:1.1px;
+     text-transform:uppercase;padding:0 10px 8px;font-weight:600;border-bottom:1px solid var(--line)}
+  td{padding:9px 10px;border-bottom:1px solid var(--line2);vertical-align:top}
+  tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:#fdfbf9}
+  .mono{font-variant-numeric:tabular-nums;font-size:12px;color:var(--text2)}
+  .sid{font-weight:650;font-variant-numeric:tabular-nums}
+  .pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:10.5px;
+        background:#f2eee9;color:var(--text2);white-space:nowrap}
+  .pill.done{background:var(--ok-soft);color:#3d6a5c}
+  .pill.todo{background:#f4f1ec;color:var(--muted)}
+  .pill.warn{background:var(--warn-soft);color:#8a6220}
+
+  /* 角色卡 */
+  .grid2{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
+  .char{border:1px solid var(--line);border-radius:12px;overflow:hidden;background:#fff}
+  .char .top{display:flex;gap:12px;padding:13px 14px;align-items:flex-start}
+  .thumb{width:64px;height:64px;border-radius:10px;object-fit:cover;flex-shrink:0;
+         border:1px solid var(--line);background:#f4f1ec}
+  .thumb.ph{display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:11px}
+  .char .info{min-width:0;flex:1}
+  .char .nm{font-weight:650;font-size:14px;display:flex;align-items:center;gap:7px}
+  .char .ds{color:var(--text2);font-size:12.5px;margin-top:3px;line-height:1.55}
+  .char .en{color:var(--muted);font-size:11.5px;margin-top:5px;line-height:1.5;
+            font-style:italic;word-break:break-word}
+  .char .foot{display:flex;gap:6px;flex-wrap:wrap;padding:0 14px 12px}
+
+  /* 分镜卡 */
+  .shot{border:1px solid var(--line);border-radius:12px;margin-bottom:10px;overflow:hidden;background:#fff}
+  .shot .hd{display:flex;gap:10px;align-items:center;padding:10px 14px;cursor:pointer;user-select:none}
+  .shot .hd:hover{background:#fdfbf9}
+  .shot .no{font-weight:700;font-variant-numeric:tabular-nums;min-width:30px}
+  .shot .sum{flex:1;min-width:0;color:var(--text2);font-size:12.5px;
+             white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .shot .bd{padding:2px 14px 14px;display:none;gap:18px}
+  .shot.open .bd{display:flex;flex-wrap:wrap}
+  .fld{flex:1;min-width:230px}
+  .fld label{display:block;font-size:10.5px;color:var(--muted);letter-spacing:.8px;
+             text-transform:uppercase;margin-bottom:4px;font-weight:600}
+  .fld .val{font-size:12.5px;line-height:1.6;color:var(--text2);white-space:pre-wrap;word-break:break-word}
+  .fld .val.prompt{font-size:11.5px;color:var(--muted);font-style:italic;
+                   font-family:"SF Mono",Consolas,monospace;line-height:1.6}
+  .fld.wide{flex:1 1 100%}
+
+  .empty{text-align:center;padding:38px 20px;color:var(--muted);font-size:13px}
+  .empty .big{font-size:30px;opacity:.28;margin-bottom:8px}
+
+  /* 场景 */
+  .scene{border:1px solid var(--line);border-radius:12px;margin-bottom:10px;background:#fff}
+  .scene .hd{padding:11px 14px;display:flex;gap:10px;align-items:center;
+             border-bottom:1px solid var(--line2)}
+  .scene .hd b{font-size:14px}
+  .scene .bd{padding:12px 14px;font-size:12.5px;color:var(--text2);line-height:1.7}
+  .scene .kv{display:flex;gap:6px;margin-bottom:4px}
+  .scene .kv b{color:var(--muted);font-weight:500;min-width:40px;flex-shrink:0;font-size:11.5px}
+  .scene ul{margin:6px 0 0;padding-left:20px}
+  .scene li{margin-bottom:2px}
+
+  /* 编辑态 */
+  .editing textarea{min-height:520px}
+  .row{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}
+  .tip{font-size:11.5px;color:var(--muted);line-height:1.7}
+
+  /* toast */
+  .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%) translateY(10px);
+         background:#221f1b;color:#fff;padding:10px 20px;border-radius:999px;font-size:12.5px;
+         opacity:0;transition:.25s;pointer-events:none;z-index:60;box-shadow:0 8px 28px rgba(0,0,0,.2)}
+  .toast.on{opacity:.95;transform:translateX(-50%) translateY(0)}
+  .toast.err{background:#9c3a2c}
+
+  .tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:14px}
+  .tabs button{border:none;background:transparent;border-radius:0;padding:8px 14px;
+               color:var(--muted);font-size:13px;border-bottom:2px solid transparent;
+               border-radius:0;margin-bottom:-1px}
+  .tabs button.on{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
+  .tabs button:hover{background:transparent;color:var(--text)}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <h1>世界观工作台</h1>
+    <span class="sub" id="epTitle">加载中…</span>
+  </div>
+  <div class="grow"></div>
+  <div class="stat" id="stat"></div>
+  <div class="btnrow">
+    <button onclick="location.reload()">刷新</button>
+    <button class="primary" id="btnSave" onclick="saveAll()" style="display:none">保存</button>
+  </div>
+</header>
+
+<div class="shell">
+  <aside>
+    <div class="grp">
+      <h3>剧集</h3>
+      <div id="epList"></div>
+    </div>
+    <div class="grp">
+      <h3>栏目</h3>
+      <nav class="nav" id="nav"></nav>
+    </div>
+    <div class="grp" id="grpSeries" style="display:none">
+      <h3>系列世界观</h3>
+      <nav class="nav"><a onclick="go('series')"><span class="ic">◎</span>系列设定</a></nav>
+    </div>
+  </aside>
+
+  <main id="main"><div class="empty"><div class="big">◍</div>正在读取项目…</div></main>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let DATA = null;          // 当前集的数据
+let EPISODES = [];
+let VIEW = 'world';        // 当前栏目
+let DIRTY = false;
+let SAVED_AT = '';
+
+const NAV = [
+  {k:'world',  ic:'◎', t:'世界观'},
+  {k:'story',  ic:'✎', t:'剧本'},
+  {k:'shots',  ic:'▤', t:'分镜'},
+  {k:'chars',  ic:'☺', t:'角色'},
+  {k:'props',  ic:'◈', t:'道具'},
+  {k:'scenes', ic:'▣', t:'场景'},
+];
+
+function esc(s){
+  return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function toast(msg, err){
+  const t=document.getElementById('toast');
+  t.textContent=msg; t.className='toast on'+(err?' err':'');
+  clearTimeout(t._t); t._t=setTimeout(()=>{t.className='toast';},2400);
+}
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  const d = await r.json();
+  if(!r.ok || d.ok===false) throw new Error(d.message||('HTTP '+r.status));
+  return d;
+}
+
+// ── 加载 ──
+async function boot(){
+  try{
+    DATA = await api('/api/episode');
+    EPISODES = DATA.episodes||[];
+    SAVED_AT = DATA.saved_at||'';
+    document.getElementById('epTitle').textContent = DATA.title || '';
+    renderAside(); renderStat(); render();
+  }catch(e){
+    document.getElementById('main').innerHTML =
+      '<div class="empty"><div class="big">⚠</div>读取失败：'+esc(e.message)+'</div>';
+  }
+}
+
+function renderAside(){
+  const el=document.getElementById('epList');
+  if(!EPISODES.length){ el.innerHTML='<div class="tip" style="padding:4px 9px">（没发现其它集）</div>'; return; }
+  el.innerHTML = EPISODES.map((e,i)=>
+    `<button class="ep ${e.is_current?'on':''}" data-i="${i}">
+       <div style="min-width:0;flex:1">
+         <div class="t">${esc(e.title)}</div>
+         <div class="m">${e.shot_count} 镜 · ${e.char_count} 角色</div>
+       </div>
+       ${e.is_current?'<span class="badge">当前</span>':''}
+     </button>`).join('');
+  el.querySelectorAll('.ep').forEach(b=>{
+    b.addEventListener('click',()=>{
+      const e=EPISODES[+b.dataset.i];
+      if(e) switchEp(e.root);
+    });
+  });
+  const sw=document.getElementById('grpSeries');
+  sw.style.display = DATA.series_worldview_path ? '' : 'none';
+}
+
+function renderStat(){
+  const s=DATA.shots.length, c=DATA.characters.length, p=DATA.props.length, sc=DATA.scenes.length;
+  const done=DATA.shots.filter(x=>x._has_clip).length;
+  const frames=DATA.shots.filter(x=>x._has_frame).length;
+  document.getElementById('stat').innerHTML =
+    `<span class="chip"><b>${s}</b> 镜</span>`+
+    `<span class="chip"><b>${done}</b>/${s} 已出片</span>`+
+    `<span class="chip"><b>${frames}</b>/${s} 首帧</span>`+
+    `<span class="chip"><b>${c}</b> 角色</span>`+
+    `<span class="chip"><b>${p}</b> 道具</span>`+
+    `<span class="chip"><b>${sc}</b> 场景</span>`+
+    (SAVED_AT?`<span class="chip">读取于 ${esc(SAVED_AT)}</span>`:'');
+}
+
+function renderNav(){
+  const counts={shots:DATA.shots.length,chars:DATA.characters.length,
+                props:DATA.props.length,scenes:DATA.scenes.length};
+  document.getElementById('nav').innerHTML = NAV.map(n=>
+    `<a class="${VIEW===n.k?'on':''}" onclick="go('${n.k}')">
+       <span class="ic">${n.ic}</span>${n.t}
+       ${counts[n.k]!=null?`<span class="cnt">${counts[n.k]}</span>`:''}
+     </a>`).join('');
+}
+
+function go(v){ VIEW=v; DIRTY=false; renderNav(); render(); }
+
+function render(){
+  renderNav();
+  const m=document.getElementById('main');
+  const fn={world:viewWorld, story:viewStory, shots:viewShots,
+            chars:viewChars, props:viewProps, scenes:viewScenes, series:viewSeries}[VIEW];
+  m.innerHTML='<div class="page">'+fn()+'</div>';
+  const sb=document.getElementById('btnSave');
+  sb.style.display = (VIEW==='world'||VIEW==='story')?'':'none';
+  sb.textContent = '保存';
+  bind();
+  m.scrollTop=0;
+}
+
+// ── 世界观 ──
+function viewWorld(){
+  const has = !!DATA.worldview_path;
+  return `<div class="phead">
+      <h2>世界观</h2>
+      <p>${has?'直接改下面的文本，改完点右上角「保存」，会写回 <code>'+esc(DATA.worldview_path)+'</code>'
+                 :'这个集还没有世界观文档。在下面写第一份，点「保存」会新建 <code>世界观.md</code>。'}</p>
+    </div>
+    <div class="card editing">
+      <h3>${has?'世界观正文':'新建世界观'} <span class="r">Markdown</span></h3>
+      <textarea id="edWorld" class="md" placeholder="# 世界观
+
+## 规则
+- 这是一个什么样的世界
+
+## 角色
+- 谁、在意什么
+
+## 场景
+- 有哪些地方
+
+## 禁忌
+- 绝对不能出现的东西">${esc(DATA.worldview_md)}</textarea>
+      <div class="row">
+        <span class="tip">建议分四块写：世界规则 / 角色 / 场景 / 禁忌。多集共用同一份的话，放到系列根目录的「世界观.md」里。</span>
+      </div>
+    </div>`;
+}
+
+// ── 剧本 ──
+function viewStory(){
+  return `<div class="phead">
+      <h2>剧本</h2>
+      <p>梗概、类型在下面，正文是 story.md。改完点右上角「保存」。</p>
+    </div>
+    <div class="card">
+      <h3>一句话梗概 <span class="r">logline</span></h3>
+      <textarea id="edLog" style="min-height:76px" placeholder="谁 + 想要什么 + 遇到什么阻碍 + 最后变成什么">${esc(DATA.logline)}</textarea>
+      <div class="row">
+        <span class="tip">叙事类型</span>
+        <input id="edGenre" value="${esc(DATA.genre)}" placeholder="如：情绪散文 / 一句话反转 / 三幕小故事"
+               style="border:1px solid var(--line);border-radius:9px;padding:6px 12px;font:inherit;font-size:12.5px;min-width:260px">
+      </div>
+    </div>
+    <div class="card editing">
+      <h3>剧本正文 <span class="r">story.md</span></h3>
+      <textarea id="edStory" class="md" placeholder="# 剧本正文&#10;&#10;每一场写清：地点、时间、人物、动作、对白。">${esc(DATA.story_md)}</textarea>
+    </div>`;
+}
+
+// ── 分镜 ──
+function viewShots(){
+  if(!DATA.shots.length)
+    return `<div class="phead"><h2>分镜</h2></div>
+            <div class="card"><div class="empty"><div class="big">▤</div>这个集还没有分镜。</div></div>`;
+  const rows = DATA.shots.map((s,i)=>`
+    <div class="shot" id="sh${i}">
+      <div class="hd" onclick="tog(${i})">
+        <span class="no">${esc(s.id)}</span>
+        <span class="sum">${esc((s.line||s.action||s.video_prompt||'').slice(0,80))}</span>
+        ${s._has_frame?'<span class="pill done">首帧</span>':'<span class="pill todo">无首帧</span>'}
+        ${s._has_clip?'<span class="pill done">成片</span>':'<span class="pill warn">待出片</span>'}
+        <span class="mono">${s.duration||0}s</span>
+        <span class="pill">${esc((s.scene&&(s.scene.place||s.scene.id))||'—')}</span>
+      </div>
+      <div class="bd">
+        <div class="fld wide"><label>台词</label><div class="val">${esc(s.line||'（无）')}</div></div>
+        <div class="fld"><label>角色</label><div class="val">${esc(s.char||'—')} ／ ${esc(s.speaker||'—')}</div></div>
+        <div class="fld"><label>时长 / 景别</label><div class="val">${s.duration||0}s ／ ${esc(s.shot_size||'—')}</div></div>
+        <div class="fld wide"><label>动作</label><div class="val">${esc(s.action||'（未写）')}</div></div>
+        <div class="fld wide"><label>微表情</label><div class="val">${esc(s.micro||'（未写）')}</div></div>
+        <div class="fld wide"><label>场景</label><div class="val">${sceneText(s.scene)}</div></div>
+        <div class="fld wide"><label>首帧提示词</label><div class="val prompt">${esc((s.frame&&s.frame.prompt)||'（未写）')}</div></div>
+        <div class="fld wide"><label>视频提示词</label><div class="val prompt">${esc(s.video_prompt||'（未写）')}</div></div>
+      </div>
+    </div>`).join('');
+  return `<div class="phead">
+      <h2>分镜</h2>
+      <p>共 ${DATA.shots.length} 镜。点标题展开看全部内容；改提示词请回 shots.json 或让 AI 改，避免手误。</p>
+    </div>
+    <div class="card">${rows}</div>`;
+}
+function sceneText(sc){
+  if(!sc) return '（未写）';
+  if(typeof sc==='string') return esc(sc);
+  const bits=[];
+  const place=sc.place||sc.id||sc.slug;
+  if(place) bits.push('地点 '+place);
+  if(sc.time) bits.push('时间 '+sc.time);
+  if(sc.weather) bits.push('天气 '+sc.weather);
+  if(sc.light) bits.push('光线 '+sc.light);
+  if(sc.set&&sc.set.length) bits.push('陈设 '+sc.set.join('、'));
+  return bits.length? esc(bits.join('　|　')) : '（未写）';
+}
+function tog(i){ const el=document.getElementById('sh'+i); if(el) el.classList.toggle('open'); }
+
+// ── 角色 ──
+function viewChars(){
+  if(!DATA.characters.length)
+    return `<div class="phead"><h2>角色</h2></div>
+            <div class="card"><div class="empty"><div class="big">☺</div>这个集还没有角色。</div></div>`;
+  const cards = DATA.characters.map(c=>{
+    const img = (c._images&&c._images.length)
+      ? `<img class="thumb" src="/api/asset?ep=${encodeURIComponent(DATA.root)}&kind=characters&name=${encodeURIComponent(c.name)}&file=${encodeURIComponent(c._images[0])}">`
+      : `<div class="thumb ph">无图</div>`;
+    const extra = (c._images&&c._images.length>1)
+      ? c._images.slice(1).map(f=>`<img class="thumb" style="width:38px;height:38px" src="/api/asset?ep=${encodeURIComponent(DATA.root)}&kind=characters&name=${encodeURIComponent(c.name)}&file=${encodeURIComponent(f)}">`).join('')
+      : '';
+    return `<div class="char">
+      <div class="top">${img}
+        <div class="info">
+          <div class="nm">${esc(c.name)}
+            ${c._shared?'<span class="pill done">共享库</span>':'<span class="pill">本集</span>'}
+            ${c.voice?'<span class="pill">🎙 '+esc(c.voice)+'</span>':''}
+          </div>
+          <div class="ds">${esc(c.desc||'（未写）')}</div>
+          ${c.desc_en?`<div class="en">${esc(c.desc_en)}</div>`:''}
+        </div>
+      </div>
+      ${extra?`<div class="foot" style="padding:0 14px 10px;gap:8px;display:flex">${extra}</div>`:''}
+      <div class="foot">
+        ${c.outfit_en?'<span class="pill">服装已锁</span>':'<span class="pill warn">服装未锁</span>'}
+        ${c._meta&&c._meta.created?'<span class="pill">建于 '+esc(c._meta.created)+'</span>':''}
+      </div>
+    </div>`;}).join('');
+  return `<div class="phead">
+      <h2>角色</h2>
+      <p>共 ${DATA.characters.length} 个。「共享库」= 多集复用同一张脸；「服装未锁」= 首帧可能穿错，要补 outfit_en。</p>
+    </div>
+    <div class="grid2">${cards}</div>`;
+}
+
+// ── 道具 ──
+function viewProps(){
+  if(!DATA.props.length)
+    return `<div class="phead"><h2>道具</h2></div>
+            <div class="card"><div class="empty"><div class="big">◈</div>这个集还没有道具。</div></div>`;
+  const cards = DATA.props.map(p=>{
+    const img = (p._images&&p._images.length)
+      ? `<img class="thumb" src="/api/asset?ep=${encodeURIComponent(DATA.root)}&kind=props&name=${encodeURIComponent(p.name)}&file=${encodeURIComponent(p._images[0])}">`
+      : `<div class="thumb ph">无图</div>`;
+    return `<div class="char"><div class="top">${img}
+      <div class="info"><div class="nm">${esc(p.name)}</div>
+      <div class="ds">${esc(p.desc||'（未写）')}</div>
+      ${p.desc_en?`<div class="en">${esc(p.desc_en)}</div>`:''}</div></div></div>`;}).join('');
+  return `<div class="phead">
+      <h2>道具</h2><p>共 ${DATA.props.length} 个。道具最好有参考图 —— 模型不认识「那把刀」，只认图。</p>
+    </div>
+    <div class="grid2">${cards}</div>`;
+}
+
+// ── 场景 ──
+function viewScenes(){
+  if(!DATA.scenes.length)
+    return `<div class="phead"><h2>场景</h2></div>
+            <div class="card"><div class="empty"><div class="big">▣</div>这个集还没有场景。</div></div>`;
+  const blocks = DATA.scenes.map(s=>{
+    const angles = Object.entries(s.angles||{}).map(([k,v])=>`<li><b>${esc(k)}</b>：${esc(v||'（未写英文机位）')}</li>`).join('');
+    return `<div class="scene">
+      <div class="hd"><b>${esc(s.place||s.id)}</b>
+        <span class="pill">${s.shot_ids.length} 镜</span>
+        ${s.time?`<span class="pill">${esc(s.time)}</span>`:''}
+        ${s.weather?`<span class="pill">${esc(s.weather)}</span>`:''}
+      </div>
+      <div class="bd">
+        ${s.light?`<div class="kv"><b>光线</b><span>${esc(s.light)}</span></div>`:''}
+        ${(s.set&&s.set.length)?`<div class="kv"><b>陈设</b><span>${s.set.map(esc).join('、')}</span></div>`:''}
+        ${angles?`<div style="margin-top:8px"><b style="font-size:11.5px;color:var(--muted)">机位表</b><ul>${angles}</ul></div>`:''}
+        <div class="kv" style="margin-top:8px"><b>镜头</b><span>${s.shot_ids.map(esc).join(' → ')}</span></div>
+      </div>
+    </div>`;}).join('');
+  return `<div class="phead">
+      <h2>场景</h2><p>共 ${DATA.scenes.length} 个场景（从分镜里自动归并）。机位表英文为空的话，首帧会自己发挥，容易越轴。</p>
+    </div>
+    ${blocks}`;
+}
+
+// ── 系列世界观 ──
+function viewSeries(){
+  return `<div class="phead">
+      <h2>系列世界观</h2>
+      <p>所有集共用的设定，存放在系列根目录：<code>${esc(DATA.series_worldview_path)}</code></p>
+    </div>
+    <div class="card editing">
+      <h3>系列设定 <span class="r">Markdown</span></h3>
+      <textarea id="edSeries" class="md">${esc(DATA.series_worldview_md)}</textarea>
+      <div class="row"><button class="primary" onclick="saveSeries()">保存系列世界观</button></div>
+    </div>`;
+}
+
+// ── 交互绑定 ──
+function bind(){
+  ['edWorld','edLog','edStory','edGenre','edSeries'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(el) el.addEventListener('input',()=>{ DIRTY=true; });
+  });
+}
+
+async function saveAll(){
+  const btn=document.getElementById('btnSave');
+  btn.disabled=true; btn.textContent='保存中…';
+  const body={};
+  if(VIEW==='world') body.worldview=document.getElementById('edWorld').value;
+  if(VIEW==='story'){
+    body.story_md=document.getElementById('edStory').value;
+    body.logline=document.getElementById('edLog').value;
+    body.genre=document.getElementById('edGenre').value;
+  }
+  try{
+    const d=await api('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},
+                                    body:JSON.stringify({root:DATA.root, payload:body})});
+    toast('已保存：'+(d.changed||[]).join('、'));
+    DIRTY=false;
+    await boot();
+  }catch(e){ toast('保存失败：'+e.message, true); }
+  btn.disabled=false; btn.textContent='保存';
+}
+
+async function saveSeries(){
+  try{
+    await api('/api/save-series',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({root:DATA.root, text:document.getElementById('edSeries').value})});
+    toast('系列世界观已保存');
+    await boot();
+  }catch(e){ toast('保存失败：'+e.message, true); }
+}
+
+async function switchEp(root){
+  if(DIRTY && !confirm('当前页有未保存的改动，切换会丢掉。继续？')) return;
+  try{
+    const d=await api('/api/episode?dir='+encodeURIComponent(root));
+    DATA=d; EPISODES=d.episodes||[]; SAVED_AT=d.saved_at||'';
+    VIEW='world'; DIRTY=false;
+    document.getElementById('epTitle').textContent = d.title||'';
+    renderAside(); renderStat(); render();
+    toast('已切到：'+(d.title||''));
+  }catch(e){ toast('切换失败：'+e.message, true); }
+}
+
+window.addEventListener('beforeunload',e=>{ if(DIRTY){e.preventDefault();e.returnValue='';} });
+boot();
+</script>
+</body>
+</html>

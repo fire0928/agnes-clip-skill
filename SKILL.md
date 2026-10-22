@@ -6,7 +6,7 @@ description: 用 Agnes 云端算力全自动做竖屏短剧/长视频——一�
 description_zh: 一句话创意自动做成有对白、会说话的竖屏短剧。全流程 15 步：写剧本、分镜、角色定妆、场景板、逐镜首帧、批量出视频、配乐音效字幕、合成成片，人脸全程锁死不怕换脸。视频走云端算力，不占本地显卡。适合做催泪短剧、漫剧、系列连续剧，也支持同系列多集复用同一张脸。
 description_en: Turn a one-line idea into a vertical short drama with real dialogue. A 15-stage pipeline handles scripting, storyboarding, character sheets, scene boards, first frames, batch video generation, music, sound effects, subtitles and final cut — with character faces locked across every shot so nobody switches faces mid-story. Video runs on cloud GPUs, so no local hardware needed. Great for tearjerkers, anime shorts and serialized episodes that reuse the same face across episodes.
 agent_created: true
-version: 1.8.2
+version: 1.9.0
 ---
 
 # Agnes Clip · 一句话成片
@@ -44,6 +44,7 @@ python ~/.workbuddy/skills/agnes-clip-平哥分享版/scripts/ac.py config-ui
 | `/片子状态` | 看项目进度到哪一步 |
 | `/做一条片子` | 从一句话创意一路做到成片 |
 | `/配乐台` | 试听配乐、逐镜调音量 |
+| **`/世界观`** | **打开世界观工作台：网页里看/改剧本、分镜、角色、道具、场景、世界观，多集可切** |
 | `/装快捷指令` | 把这些命令复制到 WorkBuddy 命令目录（复制后需重启 WorkBuddy） |
 
 **首次对话时主动告诉用户可以先跑 `/装快捷指令`**，之后输入 `/` 就能直接用。
@@ -455,6 +456,37 @@ python scripts/ac.py frame "<项目>" --only S03 --dry-run --force
     the same"。改完必须**重出首帧再重出视频**——只改提示词不重跑，旧片段里的错头发还在。
     已经成片的项目会出现"改一镜、全剧集连带"：本集改了要重剪别的剧集对它的 `recall`，再各自重合成。
 
+## 世界观工作台（网页）
+
+```bash
+python scripts/ac.py worldview "<项目目录>"
+```
+
+浏览器打开 `http://127.0.0.1:8777/`，把一个项目的所有设定摊开在一个页面里看和改。
+
+**左边**：剧集列表（同系列所有集，点一下切过去）+ 栏目导航
+**右边**：世界观 / 剧本 / 分镜 / 角色 / 道具 / 场景
+
+| 栏目 | 能看什么 | 能改什么 |
+|---|---|---|
+| 世界观 | `世界观.md` 全文 | ✅ 全文（存回 Markdown） |
+| 剧本 | 一句话梗概、叙事类型、`story.md` | ✅ 全部 |
+| 分镜 | 每镜台词/角色/动作/微表情/场景/两级提示词 | 只读（提示词手改易错，建议让 AI 改） |
+| 角色 | 定妆图、中英描述、音色、服装锁定状态、是否共享库 | 只读 |
+| 道具 | 参考图、描述 | 只读 |
+| 场景 | 光线、陈设、机位表、包含哪些镜头 | 只读 |
+
+**多集怎么组织**：以项目的父目录为「系列根」，里面每个含 `script/shots.json` 的子目录算一集，
+工作台左栏自动列出全部（当前集排最前）。系列共用的设定写进系列根目录的 `世界观.md`。
+
+**改了会怎样**：
+- 世界观/剧本改动 → 直接写回磁盘，**不影响已出的片子**
+- 分镜表改动 → 只是数据变了，**不会自动重出片**，要自己决定重跑哪几镜（`video --only Sxx --wait`）
+- 角色描述/服装锁定改了 → **必须重出首帧再重出视频**，否则旧片段里的错衣服还在
+
+**实现**：`scripts/wv_core.py`（数据层）+ `scripts/wv_server.py`（本地服务）+ `scripts/worldview_ui.html`（页面）。
+只监听 127.0.0.1，路径参数会被规整到项目根之内，读不到项目外的东西。
+
 ## 目录结构
 
 ```
@@ -522,6 +554,7 @@ python scripts/ac.py music "<dir>" --duration 90 --caption "雨夜，钢琴"
 python scripts/ac.py music "<dir>" --provider volc --duration 90 --caption "..."   # 火山引擎（无卡可跑，>60s 自动分段）
 python scripts/ac.py assemble "<dir>" [--subs] [--voice]
 python scripts/ac.py audit "<dir>"            # 出 AUDIT.md（逐镜核对 + 质检 + 成本）
+python scripts/ac.py worldview "<dir>"        # 世界观工作台（网页，多集可切）
 python scripts/ac.py status "<dir>"
 ```
 

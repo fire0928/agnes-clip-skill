@@ -3700,11 +3700,11 @@ def _tts_one(cfg, voice, txt, dst, rate_pct=None, pitch=None, spk=None):
     # ---- edge-tts：rate/pitch 必须用 = 连接（+/- 开头会被 argparse 当选项）
     cmd = [sys.executable, "-m", "edge_tts", "--voice", voice,
            "--text", txt, "--write-media", dst]
+    slow = 0
     if rate_pct is not None:
         # edge-tts 的语速解析要求 "+N%" / "-N%"，但 N 为负时微软端会返回
         # "No audio was received"（负语速在 SSML 里是非法值）。
         # 降速改用 pitch 补偿：语速夹到 0%，靠降调实现"念得更慢更沉"的效果。
-        slow = 0
         pct = int(rate_pct)
         if pct < 0:
             slow = -pct               # 降速幅度记下来，用 pitch 补
@@ -3712,6 +3712,13 @@ def _tts_one(cfg, voice, txt, dst, rate_pct=None, pitch=None, spk=None):
         r = "%+d%%" % pct
     else:
         r = spk.get("rate", vcfg.get("rate"))
+        # 配置里直接写了负语速（如 "-6%"）也要走降调补偿，不能直接丢给 edge-tts
+        if r and str(r).startswith("-"):
+            try:
+                slow = abs(int(str(r).replace("%", "").replace("-", "") or 0))
+                r = "+0%%"
+            except ValueError:
+                slow = 0
     if r:
         cmd += ["--rate=%s" % str(r)]
     pt = pitch if pitch is not None else spk.get("pitch", vcfg.get("pitch"))
@@ -3956,12 +3963,13 @@ def _split_sub(text, max_chars=14):
     return [text[:cut].strip(), text[cut:].strip()]
 
 
-def write_shot_subs(paths, entries, max_chars=14, size=38):
+def write_shot_subs(paths, entries, max_chars=14, size=38, margin_v=150):
     """按镜头表里的 shot["subs"] 生成逐句 ASS。
 
     subs 写的是本镜内的相对时间，转场/收紧改动时间轴后会自动跟着走：
         "subs": [{"t": 0.2, "d": 1.4, "text": "趁热喝，不加糖。"}]
     长句自动切成前后两条，时长按字数比例分配，保证每排不超过 max_chars。
+    margin_v：字幕距底部像素。裁掉画面底部后要调小，否则字幕会贴着画面下沿。
     """
     rows = []
     head = [
@@ -3978,7 +3986,7 @@ def write_shot_subs(paths, entries, max_chars=14, size=38):
         "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
         "MarginL, MarginR, MarginV, Encoding",
         "Style: Default,Microsoft YaHei,%d,&H00FFFFFF,&H000000FF,&H00141414,"
-        "&H78000000,0,0,0,0,100,100,0,0,1,3,1,2,40,40,150,1" % size,
+        "&H78000000,0,0,0,0,100,100,0,0,1,3,1,2,40,40,%d,1" % (size, margin_v),
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -4082,10 +4090,13 @@ def _parse_transition(spec):
     return kind, max(0.1, min(2.0, d))
 
 
-def _xfade_chain(exe, clips, durs, trans, kinds, dst, with_audio=False):
+def _xfade_chain(exe, clips, durs, trans, kinds, dst, with_audio=False, crop_bottom=0):
     """逐段转场拼接：trans[i]/kinds[i] 是第 i-1 段到第 i 段之间的转场。
 
     trans 全是 0.04 时等价于硬切；不同边界可以用不同转场与时长。
+
+    crop_bottom：裁掉底部多少像素。用来去掉视频模型自己烧进画面的字幕/水印
+    （提示词写了 no on-screen text 也不一定管用），顺带让竖屏比例更标准。
     返回合成后的总时长。
     """
     args = ["-y", "-loglevel", "error"]
@@ -4101,6 +4112,10 @@ def _xfade_chain(exe, clips, durs, trans, kinds, dst, with_audio=False):
                      % (prev, i, kinds[i], d, max(0.0, L - d), out))
         prev = out
         L = L + float(durs[i]) - d
+    # 底部裁切：xfade 链之后再裁，避免每段裁切导致尺寸不一致
+    if crop_bottom and crop_bottom > 0:
+        parts.append("%scrop=iw:ih-%d,setsar=1[vc]" % (prev, int(crop_bottom)))
+        prev = "[vc]"
     maps = ["-map", prev]
     if with_audio:
         ap = "[0:a]"
@@ -4112,10 +4127,18 @@ def _xfade_chain(exe, clips, durs, trans, kinds, dst, with_audio=False):
         maps += ["-map", ap, "-c:a", "aac", "-b:a", "160k"]
     else:
         maps += ["-an"]
-    args += ["-filter_complex", ";".join(parts)] + maps + [
+    # 滤镜链长（51 镜 = 50 个 xfade）时命令行会超 Windows 长度限制 → 写文件
+    fc_path = os.path.join(os.path.dirname(dst) or ".", "_xfade_filter.txt")
+    with open(fc_path, "w", encoding="utf-8") as f:
+        f.write(";".join(parts))
+    args += ["-filter_complex_script", fc_path] + maps + [
         "-c:v", "libx264", "-preset", "medium", "-crf", "19",
         "-pix_fmt", "yuv420p", "-movflags", "+faststart", dst]
-    ff_run(exe, args)
+    try:
+        ff_run(exe, args)
+    finally:
+        if os.path.exists(fc_path):
+            os.remove(fc_path)
     return L
 
 
@@ -4337,10 +4360,18 @@ def do_sfx(cfg, paths, into=None, out=None):
     parts.append("%samix=inputs=%d:duration=first:normalize=0,"
                  "alimiter=limit=0.95:level=disabled,aresample=44100[a]"
                  % ("".join(labels), len(labels)))
-    ff_run(exe, ["-y", "-loglevel", "error"] + inputs +
-           ["-filter_complex", ";".join(parts),
-            "-map", "0:v", "-map", "[a]", "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", dst])
+    # 滤镜链长（几十条音效）会超 Windows 命令行长度限制 → 写文件
+    fc_path = os.path.join(paths["out"], "_sfx_filter.txt")
+    with open(fc_path, "w", encoding="utf-8") as f:
+        f.write(";".join(parts))
+    try:
+        ff_run(exe, ["-y", "-loglevel", "error"] + inputs +
+               ["-filter_complex_script", fc_path,
+                "-map", "0:v", "-map", "[a]", "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", dst])
+    finally:
+        if os.path.exists(fc_path):
+            os.remove(fc_path)
     info("已叠加音效 -> %s" % dst)
     return dst
 
@@ -4368,7 +4399,8 @@ def _clip_mean_db(exe, path, cache=None):
     return lvl
 
 
-def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, tighten=True):
+def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, tighten=True,
+                crop_bottom=0):
     exe = have_ffmpeg(cfg)
     if not exe:
         die("找不到 ffmpeg（装 imageio-ffmpeg 或配置 ffmpeg 路径）")
@@ -4463,7 +4495,7 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
             work[i] = dst
             entries[i]["duration"] = ff_duration(dst, exe)
         _xfade_chain(exe, work, [e["duration"] for e in entries], trans, kinds, video_only,
-                     with_audio=all_audio)
+                     with_audio=all_audio, crop_bottom=crop_bottom)
         starts = [0.0]
         for i in range(1, len(entries)):
             starts.append(starts[i - 1] + entries[i - 1]["duration"] - trans[i])
@@ -4621,7 +4653,8 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
     subs_override = os.path.join(paths["out"], "_subs_override.ass")
     if use_subs and any(e["shot"].get("subs") for e in entries):
         # 镜头表里写了逐句字幕：按时间轴自动生成，长句自动切成两条单排
-        sub_path = write_shot_subs(paths, entries)
+        sub_path = write_shot_subs(paths, entries,
+                                   margin_v=max(60, 150 - int(crop_bottom or 0)))
         if sub_path:
             n = sum(1 for l in open(sub_path, encoding="utf-8") if l.startswith("Dialogue:"))
             info("字幕：按镜头表逐句生成 %d 条（时间轴已跟转场重排）" % n)
@@ -4668,7 +4701,13 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
     final = os.path.join(paths["out"], "final.mp4")
 
     def render(burn):
-        cmd = ["-y", "-loglevel", "error"] + inputs + ["-filter_complex", ";".join(parts),
+        # 滤镜图很长（51 镜 = 50+ 个配音/音效输入 + 36 段配乐），
+        # 直接放在命令行里会撞 Windows 的命令行长度上限（WinError 206）。
+        # 写成文件用 -filter_complex_script 传入，长度无限制。
+        fc_path = os.path.join(paths["out"], "_filter.txt")
+        with open(fc_path, "w", encoding="utf-8") as f:
+            f.write(";".join(parts))
+        cmd = ["-y", "-loglevel", "error"] + inputs + ["-filter_complex_script", fc_path,
                                                        "-map", "[vout]" if burn else "0:v",
                                                        "-map", audio_map]
         if burn:
@@ -4676,7 +4715,11 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
         else:
             cmd += ["-c:v", "copy"]
         cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", "final.mp4"]
-        ff_run(exe, cmd, cwd=paths["out"])
+        try:
+            ff_run(exe, cmd, cwd=paths["out"])
+        finally:
+            if os.path.exists(fc_path):
+                os.remove(fc_path)
 
     if sub_path:
         try:
@@ -4689,7 +4732,7 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
             parts[:] = [p for p in parts if "[vout]" not in p]
             if not os.path.exists(video_only):
                 _xfade_chain(exe, work, [e["duration"] for e in entries], trans, kinds,
-                             video_only, with_audio=all_audio)
+                             video_only, with_audio=all_audio, crop_bottom=crop_bottom)
             render(False)
     else:
         render(False)
@@ -4709,7 +4752,8 @@ def cmd_assemble(args):
     cfg, paths = load_project(args.dir)
     do_assemble(cfg, paths, use_subs=args.subs, use_voice=args.voice,
                 transition=getattr(args, "transition", None),
-                tighten=not getattr(args, "no_tighten", False))
+                tighten=not getattr(args, "no_tighten", False),
+                crop_bottom=int(getattr(args, "crop_bottom", 0) or 0))
 
 
 def cmd_seam(args):
@@ -6555,6 +6599,8 @@ def main():
                    help="转场：none / dissolve:0.7 / fadewhite:0.4（穿越、闪回用白闪）")
     p.add_argument("--voice", action="store_true",
                    help="生成并混入 TTS 配音（默认关闭；模型自己会出声时别开，会双重人声）")
+    p.add_argument("--crop-bottom", type=int, default=0,
+                   help="裁掉底部多少像素（去掉视频模型自己烧进画面的字幕/水印）")
     p.set_defaults(func=cmd_assemble)
 
     p = sub.add_parser("sfx", help="按镜头表 sfx 字段生成音效，或把音效叠到已有成片上")

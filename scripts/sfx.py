@@ -193,6 +193,63 @@ def _thud():
     return _fade(_norm(out), 0.0, 0.12)
 
 
+def _knock():
+    """敲门：三记指节敲木门。低频木质 + 短促中频敲击声。"""
+    dur = 1.1
+    out = _zeros(dur)
+    for k, at in enumerate((0.0, 0.32, 0.64)):
+        env = _exp_env(int(0.22 * SR), 0.035)
+        # 木门的闷响
+        _add(out, _mul(_sine(120, 0.22), env), at, 0.85)
+        _add(out, _mul(_sine(240, 0.12), env), at, 0.30)
+        # 指节骨头的脆响
+        _add(out, _mul(_lp(_noise(0.05, 17 + k), 2600),
+                       _exp_env(int(0.05 * SR), 0.008)), at, 0.45)
+    return _fade(_norm(out), 0.0, 0.15)
+
+
+def _footstep():
+    """脚步：橡胶鞋底踩在硬地上，一步。"""
+    dur = 0.30
+    out = _zeros(dur)
+    _add(out, _mul(_lp(_noise(0.10, 23), 1500), _exp_env(int(0.10 * SR), 0.020)), 0, 0.8)
+    _add(out, _mul(_sine(95, dur), _exp_env(int(dur * SR), 0.045, 0.004)), 0, 0.55)
+    _add(out, _mul(_lp(_noise(0.04, 29), 3800), _exp_env(int(0.04 * SR), 0.006)), 0, 0.30)
+    return _fade(_norm(out), 0.0, 0.08)
+
+
+def _tvstatic():
+    """老电视的电流雪花：窄带噪声 + 轻微嗡鸣 + 断续爆音。"""
+    dur = 1.4
+    base = _hp(_lp(_noise(dur, 43), 6000), 1200)
+    out = [0.0] * len(base)
+    for i in range(len(out)):
+        t = i / SR
+        m = 0.75 + 0.25 * math.sin(2 * math.pi * 7.3 * t)
+        out[i] = base[i] * m
+    # 变压器嗡鸣
+    _add(out, _mul(_sine(50, dur), _exp_env(int(dur * SR), 0.5, 0.05)), 0, 0.22)
+    _add(out, _mul(_sine(100, dur), _exp_env(int(dur * SR), 0.5, 0.05)), 0, 0.12)
+    # 断断续续的爆音
+    for at, g in ((0.15, 0.5), (0.62, 0.35), (1.02, 0.45)):
+        _add(out, _mul(_lp(_noise(0.05, 47), 3200),
+                       _exp_env(int(0.05 * SR), 0.010)), at, g)
+    return _fade(_norm(out), 0.05, 0.25)
+
+
+def _cheer():
+    """人群欢呼：宽带人声噪声 + 起伏。远景欢呼，不刺耳。"""
+    dur = 2.2
+    base = _hp(_lp(_noise(dur, 53), 3200), 500)
+    out = [0.0] * len(base)
+    for i in range(len(out)):
+        t = i / SR
+        m = 0.55 + 0.35 * math.sin(2 * math.pi * 1.7 * t) \
+            + 0.18 * math.sin(2 * math.pi * 4.3 * t + 1.1)
+        out[i] = base[i] * m
+    return _fade(_norm(out), 0.35, 0.5)
+
+
 def _rain(dur=8.0):
     """窗外的雨：两层带通噪声 + 缓慢起伏。不喧哗，只做底。"""
     dur = max(1.0, float(dur))
@@ -262,6 +319,10 @@ BANK = {
     "rain": _rain,
     "tinnitus": _tinnitus,
     "drone": _drone,
+    "knock": _knock,
+    "footstep": _footstep,
+    "tvstatic": _tvstatic,
+    "cheer": _cheer,
 }
 
 # 需要按时长现场生成的（其余是固定短音）

@@ -50,6 +50,30 @@ def safe_join(root, *parts):
 
 
 def make_handler(default_root):
+    default_root = os.path.abspath(default_root)
+
+    def allowed_root(candidate):
+        """只允许写「当前项目」或「同系列其它集」。
+
+        系列根 = 当前项目的父目录（同系列多集都放在那儿）。
+        白名单之外一律拒绝 —— 否则接口能被拿来写项目外的任意路径。
+        """
+        try:
+            c = os.path.abspath(candidate)
+        except Exception:
+            return None
+        if c == default_root:
+            return c
+        series_root = os.path.dirname(default_root)
+        try:
+            if os.path.commonpath([c, series_root]) == series_root and c != series_root:
+                # 必须是个真项目（有自己的 shots.json）
+                if os.path.exists(os.path.join(c, "script", "shots.json")):
+                    return c
+        except ValueError:
+            pass
+        return None
+
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
@@ -82,8 +106,10 @@ def make_handler(default_root):
                 self.end_headers()
                 return
             if u.path == "/api/episode":
-                root = (q.get("dir") or [default_root])[0]
-                root = os.path.abspath(root)
+                root = allowed_root((q.get("dir") or [default_root])[0])
+                if not root:
+                    self._json({"ok": False, "message": "只能打开当前项目或同系列的其它集"}, 403)
+                    return
                 if not os.path.isdir(root):
                     self._json({"ok": False, "message": "目录不存在"}, 404)
                     return
@@ -105,8 +131,17 @@ def make_handler(default_root):
             if kind not in ("characters", "props", "scenes"):
                 self._json({"ok": False, "message": "bad kind"}, 400)
                 return
-            p = safe_join(root, "assets", kind, name, fn)
-            if not p or not os.path.isfile(p):
+            # 两种布局：子目录式 assets/<kind>/<name>/<file> 与平铺式 assets/<kind>/<file>
+            cands = [
+                safe_join(root, "assets", kind, name, fn),
+                safe_join(root, "assets", kind, fn),
+            ]
+            p = None
+            for c in cands:
+                if c and os.path.isfile(c):
+                    p = c
+                    break
+            if not p:
                 self._json({"ok": False, "message": "file not found"}, 404)
                 return
             ext = os.path.splitext(p)[1].lower()
@@ -130,7 +165,10 @@ def make_handler(default_root):
                 return
 
             if u.path == "/api/save":
-                root = os.path.abspath(body.get("root") or default_root)
+                root = allowed_root(body.get("root") or default_root)
+                if not root:
+                    self._json({"ok": False, "message": "只能写当前项目或同系列的其它集"}, 403)
+                    return
                 try:
                     r = wv_core.save_episode(root, body.get("payload") or {})
                     self._json(r)
@@ -138,7 +176,10 @@ def make_handler(default_root):
                     self._json({"ok": False, "message": str(e)[:400]}, 500)
                 return
             if u.path == "/api/save-series":
-                root = os.path.abspath(body.get("root") or default_root)
+                root = allowed_root(body.get("root") or default_root)
+                if not root:
+                    self._json({"ok": False, "message": "只能写当前项目或同系列的其它集"}, 403)
+                    return
                 try:
                     r = wv_core.save_series_worldview(root, body.get("text") or "")
                     self._json(r)

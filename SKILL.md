@@ -6,7 +6,7 @@ description: 用 Agnes 云端算力全自动做竖屏短剧/长视频——一�
 description_zh: 一句话创意自动做成有对白、会说话的竖屏短剧。全流程 15 步：写剧本、分镜、角色定妆、场景板、逐镜首帧、批量出视频、配乐音效字幕、合成成片，人脸全程锁死不怕换脸。视频走云端算力，不占本地显卡。适合做催泪短剧、漫剧、系列连续剧，也支持同系列多集复用同一张脸。
 description_en: Turn a one-line idea into a vertical short drama with real dialogue. A 15-stage pipeline handles scripting, storyboarding, character sheets, scene boards, first frames, batch video generation, music, sound effects, subtitles and final cut — with character faces locked across every shot so nobody switches faces mid-story. Video runs on cloud GPUs, so no local hardware needed. Great for tearjerkers, anime shorts and serialized episodes that reuse the same face across episodes.
 agent_created: true
-version: 1.9.0
+version: 1.9.1
 ---
 
 # Agnes Clip · 一句话成片
@@ -472,17 +472,23 @@ python scripts/ac.py worldview "<项目目录>"
 | 世界观 | `世界观.md` 全文 | ✅ 全文（存回 Markdown） |
 | 剧本 | 一句话梗概、叙事类型、`story.md` | ✅ 全部 |
 | 分镜 | 每镜台词/角色/动作/微表情/场景/两级提示词 | 只读（提示词手改易错，建议让 AI 改） |
-| 角色 | 定妆图、中英描述、音色、服装锁定状态、是否共享库 | 只读 |
-| 道具 | 参考图、描述 | 只读 |
+| 角色 | 定妆图、中英描述、音色、服装锁定状态、是否共享库 | ✅ 描述/英文描述/音色/服装锁定都能改 |
+| 道具 | 参考图、描述 | ✅ 中英描述能改 |
 | 场景 | 光线、陈设、机位表、包含哪些镜头 | 只读 |
 
 **多集怎么组织**：以项目的父目录为「系列根」，里面每个含 `script/shots.json` 的子目录算一集，
 工作台左栏自动列出全部（当前集排最前）。系列共用的设定写进系列根目录的 `世界观.md`。
 
 **改了会怎样**：
-- 世界观/剧本改动 → 直接写回磁盘，**不影响已出的片子**
-- 分镜表改动 → 只是数据变了，**不会自动重出片**，要自己决定重跑哪几镜（`video --only Sxx --wait`）
+- 世界观/剧本/角色/道具描述 → 直接写回磁盘，**不影响已出的片子**
+- 分镜表 → 只是数据变了，**不会自动重出片**，要自己决定重跑哪几镜（`video --only Sxx --wait`）
 - 角色描述/服装锁定改了 → **必须重出首帧再重出视频**，否则旧片段里的错衣服还在
+- 改角色「中文描述」不影响已有画面，但改「英文描述」/「服装锁定」会影响下一次出图
+
+**三层数据保护**（防止手滑把内容弄丢）：
+1. 角色/道具保存时**按名字合并** —— 页面上漏掉某个角色，不会把它从磁盘上删掉
+2. `shots.json` 解析失败时**拒绝写入** —— 不会用空内容覆盖坏文件
+3. 页面打开后文件被别处改过 → **拒绝写入并提示刷新** —— 不会拿旧数据盖掉新改动
 
 **实现**：`scripts/wv_core.py`（数据层）+ `scripts/wv_server.py`（本地服务）+ `scripts/worldview_ui.html`（页面）。
 只监听 127.0.0.1，路径参数会被规整到项目根之内，读不到项目外的东西。

@@ -308,6 +308,28 @@ def cmd_push(args):
 # ═══════════════ pull ═══════════════
 
 def cmd_pull(args):
+    if getattr(args, "quiet", False):
+        # 定时任务模式：只在有更新时输出，没更新就安静退出
+        if not fetch_remote()[0]:
+            return
+        a, b = ahead_behind()
+        if b == 0:
+            return
+        dirty = bool(git("status", "--porcelain", must=False)[1].strip())
+        if dirty:
+            git("stash", "push", "-u", "-m", "git_sync 自动暂存", must=False)
+        if a > 0:
+            code, out = git("rebase", "origin/" + CONF.get("branch", "main"), must=False)
+            if code != 0:
+                git("rebase", "--abort", must=False)
+                print("[git_sync] 有更新但 rebase 冲突，已中止，需要人工处理")
+                return
+        else:
+            git("reset", "--hard", "origin/" + CONF.get("branch", "main"), must=False)
+        _, rev = git("rev-parse", "--short", "HEAD", must=False)
+        print("[git_sync] 已更新到 %s（版本 %s）" % (rev.strip(), cur_version()))
+        return
+
     print("=" * 56)
     print("  更新  ·  %s" % (CONF.get("package_name") or os.path.basename(ROOT)))
     print("=" * 56)
@@ -376,6 +398,72 @@ def cmd_pull(args):
     print("提示：代码变了，如果本 skill 有常驻服务，需要重启它才会加载新代码。")
 
 
+# ═══════════════ link（把 zip 解压的目录接入自动更新通道）═══════════════
+
+def cmd_link(args):
+    """把「解压 zip 装好的 skill」接入自动更新通道。
+
+    场景：别人发你一个 zip，你解压到 ~/.workbuddy/skills/xxx/。
+    这时这个目录不是 git 仓库，没法 pull。跑这个命令会：
+      1. git init + 绑定远端
+      2. 从远端拉一份，把本地对齐到最新版（你手改的内容会先 stash 保护）
+      3. 以后跑 `git_sync.py pull` 就能同步
+
+    前提：能访问 GitHub（本机走 SSH 443 端口）。
+    """
+    print("=" * 56)
+    print("  接入自动更新通道  ·  %s" % (CONF.get("package_name") or os.path.basename(ROOT)))
+    print("=" * 56)
+
+    if not CONF.get("repo"):
+        fail("没配仓库地址。请在 %s 里填 \"repo\"" % os.path.basename(CONF_PATH))
+
+    is_repo = git("rev-parse", "--git-dir", must=False)[0] == 0
+    if not is_repo:
+        print("\n[1/3] 初始化本地 git 仓库")
+        git("init", "-q")
+        git("config", "user.name", "fire0928")
+        git("config", "user.email", "fire0928@gmail.com")
+        git("remote", "add", "origin", CONF["repo"], must=False)
+        ok("已初始化并绑定远端")
+    else:
+        print("\n[1/3] 已经是 git 仓库")
+        git("remote", "set-url", "origin", CONF["repo"], must=False)
+        ok("远端已指向 " + CONF["repo"])
+
+    print("\n[2/3] 拉取远端最新版")
+    fetched, out = fetch_remote()
+    if not fetched:
+        fail("拉取远端失败（网络不通，或这台机器访问不了 GitHub）：\n" + out.strip()[:400])
+    ok("已获取远端")
+
+    # 本地有改动先保护
+    dirty = bool(git("status", "--porcelain", must=False)[1].strip())
+    if dirty:
+        print("      本地有改动，先暂存保护")
+        git("stash", "push", "-u", "-m", "git_sync link 自动暂存", must=False)
+        ok("已暂存（冲突时 git stash pop 找回）")
+
+    branch = CONF.get("branch", "main")
+    code, out = git("reset", "--hard", "origin/" + branch, must=False)
+    if code != 0:
+        fail("对齐远端失败:\n" + out.strip()[:400])
+    ok("已对齐到远端最新版")
+
+    print("\n[3/3] 收尾")
+    _, rev = git("rev-parse", "--short", "HEAD", must=False)
+    print("\n" + "=" * 56)
+    print("  接入完成")
+    print("  当前提交 %s ｜ 版本 %s" % (rev.strip(), cur_version()))
+    print()
+    print("  以后更新：")
+    print("    python %s pull" % os.path.join("tools", "git_sync.py"))
+    print()
+    print("  想让它每天自动更新（Windows 任务计划 / Linux cron）：")
+    print("    python %s pull --quiet" % os.path.join("tools", "git_sync.py"))
+    print("=" * 56)
+
+
 # ═══════════════ check / status ═══════════════
 
 def cmd_check(args):
@@ -423,7 +511,11 @@ def main():
 
     p = sub.add_parser("pull", help="从 GitHub 拉最新更新")
     p.add_argument("--force", action="store_true", help="丢弃本地未提交改动")
+    p.add_argument("--quiet", action="store_true", help="定时任务模式：没更新就安静退出")
     p.set_defaults(func=cmd_pull)
+
+    p = sub.add_parser("link", help="把解压装的目录接入自动更新通道（首次只需跑一次）")
+    p.set_defaults(func=cmd_link)
 
     p = sub.add_parser("check", help="检查远端有没有新版本")
     p.set_defaults(func=cmd_check)

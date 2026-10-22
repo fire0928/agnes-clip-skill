@@ -16,10 +16,12 @@ DIST = os.path.join(ROOT, "dist")
 PKG_NAME = "agnes-clip"
 
 # 不进包的东西
-SKIP_DIRS = {"__pycache__", ".git", ".idea", ".vscode", "dist", "tools"}
+# 注意：tools/ 不再整个排除 —— git_sync.py 必须带着，
+# 装完的人才能跑 "git_sync.py link" 接入自动更新通道。
+SKIP_DIRS = {"__pycache__", ".git", ".idea", ".vscode", "dist"}
 SKIP_FILES = {".DS_Store", ".pyc", ".pyo", ".log"}
 # 只给平哥自己看的操作手册，对外不发
-SKIP_NAMES = {"发布指南.md"}
+SKIP_NAMES = {"发布指南.md", "建仓说明.md"}
 # 本机凭据，绝不能进包
 SECRET_FILES = {"agnes-clip.json", "ai-video-pipeline.json", ".env", "id_rsa"}
 SECRET_PAT = re.compile(

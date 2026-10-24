@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agnes Clip · 流程控制台</title>
+<style>
+:root{
+  --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a;
+  --tx:#e6e9ef; --tx2:#9aa3b2; --tx3:#6b7383;
+  --ac:#4f8cff; --ok:#34c98a; --warn:#f5a623; --err:#f2555a; --run:#4f8cff;
+  --r:10px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.wrap{max-width:1500px;margin:0 auto;padding:18px}
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:16px}
+h1{font-size:19px;font-weight:600;letter-spacing:.3px}
+h1 small{color:var(--tx3);font-weight:400;font-size:12px;margin-left:8px}
+.spacer{flex:1}
+button{background:var(--panel2);color:var(--tx);border:1px solid var(--line);border-radius:8px;
+  padding:7px 13px;font-size:13px;cursor:pointer;font-family:inherit;transition:.15s}
+button:hover{border-color:var(--ac);background:#252a35}
+button.pri{background:var(--ac);border-color:var(--ac);color:#fff}
+button.pri:hover{filter:brightness(1.1)}
+button:disabled{opacity:.4;cursor:not-allowed}
+input,select,textarea{background:#12151b;color:var(--tx);border:1px solid var(--line);
+  border-radius:8px;padding:7px 10px;font:13px/1.5 inherit;font-family:inherit}
+textarea{width:100%;min-height:80px;resize:vertical}
+.row{display:flex;gap:9px;align-items:center;flex-wrap:wrap}
+
+.grid{display:grid;grid-template-columns:270px 1fr;gap:16px;align-items:start}
+@media(max-width:960px){.grid{grid-template-columns:1fr}}
+
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+.panel>h2{font-size:13px;font-weight:600;color:var(--tx2);padding:11px 14px;
+  border-bottom:1px solid var(--line);background:var(--panel2);
+  display:flex;align-items:center;gap:8px}
+.panel>h2 .tag{font-size:11px;color:var(--tx3);font-weight:400;margin-left:auto}
+.panel .bd{padding:14px}
+
+/* 阶段列表 */
+.stage{display:flex;gap:10px;align-items:flex-start;padding:9px 14px;cursor:pointer;
+  border-left:2px solid transparent;transition:.12s}
+.stage:hover{background:#1c2029}
+.stage.on{background:#1b2433;border-left-color:var(--ac)}
+.stage .ic{width:20px;height:20px;border-radius:50%;flex:none;margin-top:2px;
+  display:grid;place-items:center;font-size:11px;font-weight:700}
+.stage .ic.pending{background:#2a2f3a;color:var(--tx3)}
+.stage .ic.done{background:var(--ok);color:#0d1f16}
+.stage .ic.running{background:var(--run);color:#fff;animation:pulse 1.1s infinite}
+.stage .ic.failed{background:var(--err);color:#fff}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.stage .tx{min-width:0;flex:1}
+.stage .tt{font-size:13px;font-weight:500}
+.stage .ts{font-size:11px;color:var(--tx3);margin-top:1px;line-height:1.4}
+.stage .tm{font-size:10px;color:var(--tx3);font-family:ui-monospace,monospace}
+
+/* 标签页 */
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);background:var(--panel2);
+  overflow-x:auto;padding:0 6px}
+.tab{padding:9px 14px;font-size:13px;color:var(--tx2);cursor:pointer;white-space:nowrap;
+  border-bottom:2px solid transparent;transition:.12s}
+.tab:hover{color:var(--tx)}
+.tab.on{color:var(--tx);border-bottom-color:var(--ac)}
+.tabd{padding:14px}
+.hide{display:none!important}
+
+/* 图片 */
+.imgs{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:11px}
+.img{background:#12151b;border:1px solid var(--line);border-radius:9px;overflow:hidden;transition:.15s}
+.img:hover{border-color:var(--ac)}
+.img .ph{aspect-ratio:3/4;background:#0c0e12;display:grid;place-items:center;overflow:hidden}
+.img .ph img{width:100%;height:100%;object-fit:cover;display:block}
+.img .ph .no{color:var(--tx3);font-size:11px;text-align:center;padding:10px;line-height:1.5}
+.img .nm{font-size:11px;padding:6px 8px;color:var(--tx2);border-top:1px solid var(--line);
+  word-break:break-all}
+.img .nm b{color:var(--tx);display:block;font-weight:500;margin-bottom:2px}
+
+/* 情绪曲线 */
+.cv{display:flex;flex-direction:column;gap:2px;font-family:ui-monospace,monospace;font-size:11px}
+.cvr{display:grid;grid-template-columns:46px 42px 130px 1fr;gap:9px;align-items:center;padding:2px 0}
+.cvr:hover{background:#1c2029}
+.cvr .id{color:var(--tx2)}
+.cvr .v{text-align:right;font-weight:600}
+.cvr .bar{color:var(--tx3);white-space:pre}
+.cvr .pv{color:var(--tx3)}
+.cvr.lo .bar,.cvr.lo .v{color:var(--err)}
+.cvr.hi .bar,.cvr.hi .v{color:var(--ok)}
+
+/* 表格 */
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--tx3);font-weight:500;font-size:12px;background:var(--panel2);position:sticky;top:0}
+tbody tr:hover{background:#1c2029}
+.mono{font-family:ui-monospace,monospace;font-size:12px}
+.pill{display:inline-block;padding:1px 7px;border-radius:20px;font-size:11px;
+  background:#252a35;color:var(--tx2)}
+.pill.ok{background:rgba(52,201,138,.16);color:var(--ok)}
+.pill.err{background:rgba(242,85,90,.16);color:var(--err)}
+.pill.warn{background:rgba(245,166,35,.16);color:var(--warn)}
+.pill.human{background:rgba(79,140,255,.16);color:var(--ac)}
+
+pre{background:#0c0e12;border:1px solid var(--line);border-radius:8px;padding:11px;
+  overflow:auto;font-size:12px;line-height:1.65;max-height:460px;white-space:pre-wrap;word-break:break-word}
+.md{background:#12151b;border:1px solid var(--line);border-radius:8px;padding:13px;
+  font-size:13px;line-height:1.75;max-height:620px;overflow:auto}
+.md h1{font-size:16px;margin:14px 0 8px}
+.md h2{font-size:14px;margin:14px 0 7px;color:var(--ac)}
+.md h3{font-size:13px;margin:11px 0 6px}
+.md p{margin:6px 0}
+.md ul,.md ol{margin:6px 0 6px 20px}
+.md li{margin:3px 0}
+.md code{background:#0c0e12;padding:1px 5px;border-radius:4px;font-size:12px}
+.md pre{background:#0c0e12;margin:8px 0;max-height:none}
+.md blockquote{border-left:3px solid var(--ac);padding-left:11px;color:var(--tx2);margin:8px 0}
+.md table{font-size:12px;margin:8px 0}
+.md th{position:static}
+.md strong{color:#fff}
+.md hr{border:0;border-top:1px solid var(--line);margin:12px 0}
+
+.log{background:#0c0e12;border:1px solid var(--line);border-radius:8px;padding:11px;
+  font-family:ui-monospace,monospace;font-size:11.5px;line-height:1.65;max-height:340px;
+  overflow:auto;white-space:pre-wrap}
+.log .ok{color:var(--ok)}.log .err{color:var(--err)}.log .warn{color:var(--warn)}
+.log .info{color:var(--ac)}.log .dim{color:var(--tx3)}
+
+.empty{color:var(--tx3);text-align:center;padding:26px;font-size:13px}
+.note{font-size:12px;color:var(--tx3);line-height:1.65}
+.kv{display:grid;grid-template-columns:96px 1fr;gap:5px 11px;font-size:13px}
+.kv .k{color:var(--tx3)}
+.brief{width:100%;min-height:400px;font-family:ui-monospace,monospace;font-size:12.5px;line-height:1.75}
+.toast{position:fixed;bottom:18px;right:18px;background:var(--panel2);border:1px solid var(--ac);
+  border-radius:9px;padding:11px 15px;font-size:13px;max-width:420px;display:none;z-index:99;
+  box-shadow:0 6px 26px rgba(0,0,0,.5)}
+.toast.on{display:block}
+.spin{display:inline-block;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>Agnes Clip · 流程控制台 <small id="proj"></small></h1>
+  <div class="spacer"></div>
+  <div class="row">
+    <select id="epsel"></select>
+    <button onclick="reload()">刷新</button>
+    <button class="pri" id="runbtn" onclick="runStage()">运行当前阶段</button>
+  </div>
+</header>
+
+<div class="grid">
+  <!-- 左：阶段 -->
+  <div class="panel">
+    <h2>流程阶段 <span class="tag" id="stagetag"></span></h2>
+    <div id="stages"></div>
+    <div class="bd" style="border-top:1px solid var(--line)">
+      <div class="note" id="curdesc"></div>
+    </div>
+  </div>
+
+  <!-- 右：详情 -->
+  <div>
+    <div class="panel">
+      <div class="tabs" id="tabs"></div>
+      <div id="tabd" class="tabd"></div>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <h2>执行日志 <span class="tag" id="logtag"></span></h2>
+      <div class="bd"><div class="log" id="log">（还没有日志）</div></div>
+    </div>
+  </div>
+</div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script>
+let DATA=null, CUR="brief", TAB="overview", POLL=null;
+
+const esc=s=>String(s==null?"":s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+
+function toast(m){const t=document.getElementById("toast");t.textContent=m;t.classList.add("on");
+  clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove("on"),3600);}
+
+async function api(path,opt){
+  const r=await fetch(path,opt||{});
+  const ct=r.headers.get("content-type")||"";
+  if(ct.includes("json")) return await r.json();
+  return await r.text();
+}
+
+/* ---------- 加载 ---------- */
+async function reload(){
+  const eps=await api("/api/projects");
+  const sel=document.getElementById("epsel");
+  if(!eps.length){document.getElementById("tabd").innerHTML='<div class="empty">还没有项目。先跑 <code>ac.py flow &lt;项目&gt; --stage init</code></div>';return;}
+  if(!sel.options.length){
+    eps.forEach(e=>{const o=document.createElement("option");o.value=e;o.textContent=e;sel.appendChild(o);});
+  }
+  const cur=localStorage.getItem("ac_ep")||eps[0];
+  if(eps.includes(cur)) sel.value=cur;
+  localStorage.setItem("ac_ep",sel.value);
+  document.getElementById("proj").textContent=sel.value;
+  await loadProject();
+}
+
+async function loadProject(){
+  const ep=document.getElementById("epsel").value;
+  DATA=await api("/api/state?ep="+encodeURIComponent(ep));
+  if(!DATA||!DATA.stages){document.getElementById("tabd").innerHTML='<div class="empty">读取失败</div>';return;}
+  renderStages();renderTabs();renderTab();
+}
+
+function renderStages(){
+  const box=document.getElementById("stages");
+  box.innerHTML=DATA.stages.map(s=>{
+    const ic={done:"✓",running:"…",pending:"·",failed:"✗"}[s.status]||"·";
+    return `<div class="stage ${s.key===CUR?"on":""}" data-k="${s.key}">
+      <div class="ic ${s.status}">${ic}</div>
+      <div class="tx"><div class="tt">${esc(s.label)}</div>
+      <div class="ts">${esc(s.desc||"")}</div>
+      ${s.at?`<div class="tm">${esc(s.at)}</div>`:""}</div></div>`;
+  }).join("");
+  box.querySelectorAll(".stage").forEach(el=>el.onclick=()=>{
+    CUR=el.dataset.k;renderStages();renderTab();
+    document.getElementById("curdesc").textContent=stageDesc(CUR);
+  });
+  const cur=DATA.stages.find(s=>s.key===CUR)||DATA.stages[0];
+  document.getElementById("stagetag").textContent=`${DATA.done}/${DATA.stages.length} 完成`;
+  document.getElementById("curdesc").innerHTML=
+    `<b>${esc(cur.label)}</b><br>${esc(stageDesc(CUR))}<br><br>
+     <span class="note">这一阶段的产物：${esc((cur.artifacts||[]).join(" · ")||"—")}</span>`;
+}
+
+function stageDesc(k){
+  const s=DATA.stages.find(x=>x.key===k);return s?s.desc:"";
+}
+
+const TABS=[
+  ["overview","总览"],["brief","需求分析"],["analysis","情绪/逻辑分析"],
+  ["shots","分镜表"],["cast","角色图"],["props","道具/场景"],["frames","首帧图"],
+  ["videos","视频片段"],["files","文件"]
+];
+function renderTabs(){
+  document.getElementById("tabs").innerHTML=TABS.map(([k,n])=>
+    `<div class="tab ${k===TAB?"on":""}" data-k="${k}">${n}</div>`).join("");
+  document.getElementById("tabs").querySelectorAll(".tab").forEach(el=>el.onclick=()=>{
+    TAB=el.dataset.k;renderTabs();renderTab();
+  });
+}
+
+function renderTab(){
+  const d=document.getElementById("tabd");
+  if(TAB==="overview") d.innerHTML=tabOverview();
+  else if(TAB==="brief") d.innerHTML=tabBrief();
+  else if(TAB==="analysis") d.innerHTML=tabAnalysis();
+  else if(TAB==="shots") d.innerHTML=tabShots();
+  else if(TAB==="cast") d.innerHTML=tabImgs(DATA.cast,"角色");
+  else if(TAB==="props") d.innerHTML=tabImgs(DATA.props,"道具/场景");
+  else if(TAB==="frames") d.innerHTML=tabImgs(DATA.frames,"首帧");
+  else if(TAB==="videos") d.innerHTML=tabVideos();
+  else if(TAB==="files") d.innerHTML=tabFiles();
+  if(TAB==="brief"){const ta=document.getElementById("briefta");if(ta)ta.oninput=saveBrief;}
+}
+
+function tabOverview(){
+  const a=DATA.analysis||{};
+  const st=DATA.stages||[];
+  const next=st.find(s=>s.status!=="done");
+  let h=`<div class="row" style="margin-bottom:12px">
+    <span class="pill ${next?"warn":"ok"}">${next?("下一步："+esc(next.label)):"全部完成 🎉"}</span>
+    <span class="pill">${DATA.n_shots||0} 镜</span>
+    <span class="pill">${DATA.total_seconds||0} 秒</span>
+    <span class="pill">${(DATA.cast||[]).length} 角色</span>
+    <span class="pill">${(DATA.frames||[]).length} 首帧</span>
+    <span class="pill">${(DATA.videos||[]).length} 片段</span></div>`;
+  if(a.logline) h+=`<div class="md" style="margin-bottom:12px"><h2>一句话故事</h2><blockquote>${esc(a.logline)}</blockquote></div>`;
+  h+=`<div class="row" style="margin-bottom:12px">
+    <button onclick="runStage()">▶ 运行「${esc((st.find(s=>s.key===CUR)||{}).label||"")}」</button>
+    <button onclick="runAll()">▶▶ 一路跑到检查</button>
+    <button onclick="rerunFrom()">↻ 从当前阶段重跑</button>
+    </div>`;
+  if(a.curve&&a.curve.length){
+    h+=`<h2 style="font-size:13px;color:var(--tx2);margin:14px 0 8px">情绪曲线</h2>`;
+    h+=`<div class="cv">`+a.curve.map(c=>{
+      const cls=c.id===(a.low||{}).id?"lo":(c.id===(a.high||{}).id?"hi":"");
+      return `<div class="cvr ${cls}"><span class="id">${esc(c.id)}</span>
+      <span class="v">${c.intensity>=0?"+":""}${c.intensity}</span>
+      <span class="bar">${esc(c.bar||"")}</span>
+      <span class="pv">${esc(c.purpose||"")} ${esc(c.audience||"")}</span></div>`;
+    }).join("")+`</div>`;
+  }
+  return h;
+}
+
+function tabBrief(){
+  if(!DATA.brief){return `<div class="empty">还没生成需求分析工单。<br>
+    跑 <code>ac.py flow ${esc(DATA.ep)} --stage brief</code></div>`;}
+  return `<div class="note" style="margin-bottom:9px">
+    这份工单是<b>给你改的</b>。改完点「保存」，再跑
+    <code>--from story</code> 就能按新需求重写剧本。</div>
+    <div class="row" style="margin-bottom:9px"><button class="pri" onclick="saveBrief()">保存工单</button>
+    <button onclick="regenBrief()">重新生成模板</button></div>
+    <textarea class="brief" id="briefta">${esc(DATA.brief)}</textarea>`;
+}
+
+async function saveBrief(){
+  const ta=document.getElementById("briefta");
+  const r=await api("/api/brief?ep="+encodeURIComponent(DATA.ep),{
+    method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({text:ta.value})});
+  toast(r.ok?"工单已保存":"保存失败："+(r.error||""));
+  await loadProject();
+}
+async function regenBrief(){
+  const r=await api("/api/brief/regen?ep="+encodeURIComponent(DATA.ep),{method:"POST"});
+  toast(r.ok?"已重新生成模板":"失败："+(r.error||""));
+  await loadProject();
+}
+
+function tabAnalysis(){
+  const a=DATA.analysis||{};
+  if(!a.curve){return `<div class="empty">还没有分析数据。<br>
+    跑 <code>ac.py flow ${esc(DATA.ep)} --stage shots</code> 之后会自动生成。</div>`;}
+  let h=`<div class="md">`;
+  if(a.logline){h+=`<h2>一句话故事</h2><blockquote>${esc(a.logline)}</blockquote>`;}
+  const f=a.four||{};
+  h+=`<h2>logline 四要素</h2><table>
+    <tr><th style="width:110px">要素</th><th>内容</th></tr>
+    <tr><td>谁</td><td>${esc(f.who||"—")}</td></tr>
+    <tr><td>想要什么</td><td>${esc(f.want||"—")}</td></tr>
+    <tr><td>阻碍</td><td>${esc(f.obstacle||"—")}</td></tr>
+    <tr><td>最后变成什么</td><td>${esc(f.change||"—")}</td></tr></table>`;
+  h+=`<h2>情绪曲线</h2>`;
+  h+=`<table><tr><th>镜</th><th style="width:70px">强度</th><th style="width:220px">曲线</th><th>作用</th><th>观众心里</th></tr>`;
+  a.curve.forEach(c=>{
+    const cls=c.id===(a.low||{}).id?'style="color:var(--err)"':(c.id===(a.high||{}).id?'style="color:var(--ok)"':"");
+    h+=`<tr><td class="mono">${esc(c.id)}</td><td ${cls}>${c.intensity>=0?"+":""}${c.intensity}</td>
+    <td class="mono" ${cls}>${esc(c.bar||"")}</td><td>${esc(c.purpose||"")}</td><td>${esc(c.audience||"")}</td></tr>`;
+  });
+  h+=`</table>`;
+  h+=`<p>最低点 <b>${esc((a.low||{}).id)}</b>（${(a.low||{}).v}）——
+     最高点 <b>${esc((a.high||{}).id)}</b>（${(a.high||{}).v}）</p>`;
+  if(a.flat_runs&&a.flat_runs.length)
+    h+=`<p><span class="pill err">平直段</span> ${a.flat_runs.map(r=>esc(r[0])+"~"+esc(r[1])).join("、")} 连续三镜同值</p>`;
+  if(a.motif) h+=`<h2>母题</h2><p>${esc(a.motif)}</p>`;
+  if((a.qa||[]).length){
+    h+=`<h2>问答闭环</h2><table><tr><th>问</th><th>答</th><th style="width:70px">状态</th></tr>`;
+    a.qa.forEach(q=>{h+=`<tr><td class="mono">${esc(q.q_id)} ${esc(q.q||"")}</td>
+      <td class="mono">${esc(q.a_id)} ${esc(q.a||"—")}</td>
+      <td>${q.closed?'<span class="pill ok">闭合</span>':'<span class="pill err">悬空</span>'}</td></tr>`;});
+    h+=`</table>`;
+  }
+  const e=a.ending||{};
+  h+=`<h2>结尾高潮</h2><p>末镜 <b>${esc(e.id)}</b>，强度 ${e.intensity} ${e.is_peak?"<span class='pill ok'>落在峰值</span>":"<span class='pill warn'>不在峰值</span>"}
+     ｜ 收尾模式 <code>${esc(e.mode||"未标注")}</code></p>
+     <p class="note">${esc(e.action||"")}</p>`;
+  const pc=a.pace||{};
+  h+=`<h2>短剧节奏指标</h2><table>
+    <tr><th>指标</th><th style="width:160px">结果</th><th>判定</th></tr>
+    <tr><td>首钩（${esc(pc.hook_id||"—")}）</td><td>${pc.has_hook?"有":"无"}</td>
+    <td>${pc.has_hook?'<span class="pill ok">前 3 秒抓人</span>':'<span class="pill warn">开场没钩子</span>'}</td></tr>
+    <tr><td>爆点数</td><td>${pc.beats_total||0}（词 ${pc.beats||0} + 跳变 ${pc.jumps||0}）</td>
+    <td>${(pc.beats_total||0)>=3?'<span class="pill ok">达标</span>':'<span class="pill warn">建议 ≥3</span>'}</td></tr>
+    <tr><td>尾钩（${esc(pc.tail_id||"—")}）</td><td>${pc.has_tail?"有":"无"}</td>
+    <td>${pc.has_tail?'<span class="pill ok">留了悬念</span>':'<span class="pill warn">自然收尾</span>'}</td></tr>
+    <tr><td>台词超长</td><td>${(pc.over_lines||[]).length} 句 &gt;14 字</td>
+    <td>${(pc.over_lines||[]).length?('<span class="pill warn">'+pc.over_lines.map(x=>esc(x.id)+"("+x.n+"字)").join("、")+'</span>'):'<span class="pill ok">达标</span>'}</td></tr>
+    </table>`;
+  h+=`</div>`;
+  return h;
+}
+
+function tabShots(){
+  const s=DATA.shot_rows||[];
+  if(!s.length) return `<div class="empty">还没有分镜表。<br>跑 <code>ac.py flow ${esc(DATA.ep)} --stage shots</code></div>`;
+  return `<table><tr><th>镜</th><th style="width:56px">秒</th><th style="width:56px">强度</th>
+    <th>动作</th><th>台词</th><th style="width:190px">因为…所以…</th></tr>`+
+    s.map(r=>`<tr><td class="mono">${esc(r.id)}</td><td class="mono">${r.duration||""}</td>
+    <td>${r.intensity>=0?"+":""}${r.intensity}</td>
+    <td>${esc(r.action||"")}</td><td>${esc(r.line||"—")}</td>
+    <td class="note">${esc(r.because||"")}</td></tr>`).join("")+`</table>`;
+}
+
+function tabImgs(list,label){
+  if(!list||!list.length) return `<div class="empty">还没有${label}。</div>`;
+  return `<div class="imgs">`+list.map(i=>`
+    <div class="img"><div class="ph">${i.url?`<img loading="lazy" src="${esc(i.url)}">`:`<div class="no">${esc(i.note||"未生成")}</div>`}</div>
+    <div class="nm"><b>${esc(i.name)}</b>${esc(i.note||"")}</div></div>`).join("")+`</div>`;
+}
+
+function tabVideos(){
+  const v=DATA.videos||[];
+  if(!v.length) return `<div class="empty">还没有视频片段。</div>`;
+  return `<table><tr><th>镜</th><th style="width:90px">时长</th><th style="width:100px">文件</th><th>预览</th></tr>`+
+    v.map(x=>`<tr><td class="mono">${esc(x.id)}</td><td class="mono">${x.dur||""}</td>
+    <td>${x.url?`<a href="${esc(x.url)}" target="_blank" style="color:var(--ac)">打开</a>`:"—"}</td>
+    <td>${x.url?`<video src="${esc(x.url)}" controls style="max-height:150px;border-radius:6px"></video>`:"—"}</td></tr>`).join("")+`</table>`;
+}
+
+function tabFiles(){
+  const f=DATA.files||[];
+  if(!f.length) return `<div class="empty">没有文件</div>`;
+  return `<table><tr><th>文件</th><th style="width:100px">大小</th></tr>`+
+    f.map(x=>`<tr><td class="mono">${esc(x.name)}</td><td class="mono">${esc(x.size||"")}</td></tr>`).join("")+`</table>`;
+}
+
+/* ---------- 运行 ---------- */
+async function runStage(){
+  const btn=document.getElementById("runbtn");
+  btn.disabled=true;btn.innerHTML='<span class="spin">◌</span> 运行中';
+  const log=document.getElementById("log");
+  log.textContent="";
+  const r=await api("/api/run?ep="+encodeURIComponent(DATA.ep)+"&stage="+encodeURIComponent(CUR),{method:"POST"});
+  btn.disabled=false;btn.textContent="运行当前阶段";
+  if(r.ok){toast("「"+r.stage_label+"」完成");}
+  else{toast("失败："+(r.error||"").slice(0,200));}
+  await loadProject();
+}
+async function runAll(){
+  const btn=document.getElementById("runbtn");
+  btn.disabled=true;btn.innerHTML='<span class="spin">◌</span> 一路运行中';
+  const r=await api("/api/runall?ep="+encodeURIComponent(DATA.ep),{method:"POST"});
+  btn.disabled=false;btn.textContent="运行当前阶段";
+  toast(r.ok?"跑完了："+(r.done||[]).join(" → "):"中断："+(r.error||"").slice(0,200));
+  await loadProject();
+}
+async function rerunFrom(){
+  const r=await api("/api/reset?ep="+encodeURIComponent(DATA.ep)+"&stage="+encodeURIComponent(CUR),{method:"POST"});
+  toast(r.ok?"已重置「"+CUR+"」及之后的阶段":"失败");
+  await loadProject();
+}
+
+/* 日志轮询 */
+async function pollLog(){
+  try{
+    const r=await api("/api/log?ep="+encodeURIComponent(DATA.ep));
+    if(r&&r.text){document.getElementById("log").textContent=r.text;
+      const l=document.getElementById("log");l.scrollTop=l.scrollHeight;
+      document.getElementById("logtag").textContent=r.running?"运行中…":"";}
+  }catch(e){}
+}
+document.getElementById("epsel").onchange=async e=>{
+  localStorage.setItem("ac_ep",e.target.value);
+  document.getElementById("proj").textContent=e.target.value;
+  await loadProject();
+};
+reload();
+POLL=setInterval(pollLog,1500);
+</script>
+</body>
+</html>

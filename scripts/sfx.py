@@ -308,6 +308,115 @@ def _drone(dur=5.0):
     return _fade(_norm(_soft(out)), min(1.6, dur * 0.4), min(2.0, dur * 0.45))
 
 
+# ---------------------------------------------------------------- 厨房 / 炒菜音效
+# 美食号片子的地基：切菜、颠勺、油爆、火焰、盘子这几个声音一出来，观众立刻知道
+# 「这段是做饭」，不用看画面也知道进度到哪一步。
+def _chop():
+    """菜刀剁在木案板上：一下。木头钝响 + 一点金属刃声。"""
+    dur = 0.26
+    out = _zeros(dur)
+    # 木案板的低频闷响
+    _add(out, _mul(_sine(150, dur), _exp_env(int(dur * SR), 0.028, 0.0015)), 0, 0.85)
+    _add(out, _mul(_sine(320, 0.09), _exp_env(int(0.09 * SR), 0.016)), 0, 0.32)
+    # 刀刃蹭过木头的脆响
+    _add(out, _mul(_hp(_lp(_noise(0.07, 71), 7000), 2200),
+                   _exp_env(int(0.07 * SR), 0.010)), 0, 0.60)
+    return _fade(_norm(out), 0.0, 0.07)
+
+
+def _sizzle():
+    """油爆：豆角下锅那一声「滋啦」。高频细密爆裂声，带气泡感。"""
+    dur = 1.5
+    n = int(dur * SR)
+    out = [0.0] * n
+    # 细密的高频颗粒 = 油泡。颗粒感要起伏，油泡不是均匀的。
+    grain = _hp(_lp(_noise(dur, 83), 9000), 3000)
+    rumble = _lp(_noise(dur, 97), 380)
+    for i in range(n):
+        t = i / SR
+        mod = 0.55 + 0.45 * math.sin(2 * math.pi * 7.3 * t + 0.6)
+        out[i] = grain[i] * (0.55 * mod + 0.25 * math.exp(-4.0 * t)) \
+            + rumble[i] * 0.22 * math.exp(-2.6 * t)
+    return _fade(_norm(_soft(out)), 0.006, 0.35)
+
+
+def _woktoss():
+    """颠勺：锅里的料被抛起又落回。短促的气流声 + 一记金属回响。"""
+    dur = 0.42
+    out = _zeros(dur)
+    # 抛起：气流上冲
+    n = int(dur * SR)
+    air = _hp(_lp(_noise(dur, 101), 6000), 700)
+    env = []
+    for i in range(n):
+        t = i / n
+        env.append(math.sin(math.pi * t) ** 1.4)
+    _add(out, _mul(air, env), 0, 0.70)
+    # 落回：锅壁的金属回响
+    _add(out, _mul(_sine(760, 0.20), _exp_env(int(0.20 * SR), 0.035, 0.002)), 0.10, 0.34)
+    _add(out, _mul(_sine(1140, 0.13), _exp_env(int(0.13 * SR), 0.022)), 0.10, 0.20)
+    # 料落进锅的一点散碎撞击
+    _add(out, _mul(_hp(_lp(_noise(0.09, 103), 8000), 2600),
+                   _exp_env(int(0.09 * SR), 0.014)), 0.11, 0.50)
+    return _fade(_norm(out), 0.0, 0.12)
+
+
+def _clang():
+    """厚背刀敲案板清声：金属高响 + 一点木底。招牌「叮」的一声。"""
+    dur = 1.5
+    out = _zeros(dur)
+    # 金属泛音组（这几层才是「钢」而不是「铁皮」）
+    for f, g in ((1180, 1.0), (2360, 0.55), (3540, 0.28), (4720, 0.13)):
+        _add(out, _sine(f, dur), 0, g * math.exp(-3.4 * dur))
+    # 起音的敲击瞬间
+    _add(out, _mul(_hp(_lp(_noise(0.03, 107), 11000), 3200),
+                   _exp_env(int(0.03 * SR), 0.005)), 0, 0.75)
+    # 木案板托着的那点闷响
+    _add(out, _mul(_sine(196, 0.16), _exp_env(int(0.16 * SR), 0.028)), 0, 0.30)
+    return _fade(_norm(_soft(out)), 0.001, 0.55)
+
+
+def _flame():
+    """灶火轰起来：低频呼呼的燃气/火焰声，持续垫底。"""
+    dur = 3.0
+    n = int(dur * SR)
+    out = [0.0] * n
+    base = _lp(_noise(dur, 109), 700)
+    hiss = _hp(base, 3200)
+    for i in range(n):
+        t = i / SR
+        # 火焰的呼吸感：忽大忽小
+        mod = 0.62 + 0.24 * math.sin(2 * math.pi * 2.9 * t + 0.4) \
+            + 0.14 * math.sin(2 * math.pi * 7.1 * t)
+        out[i] = base[i] * mod + hiss[i] * 0.16 * mod
+    return _fade(_norm(_soft(out)), 0.35, 0.8)
+
+
+def _plate():
+    """瓷盘放到桌上：一声清脆的「叮」，带一点余韵。"""
+    dur = 1.0
+    out = _zeros(dur)
+    for f, g in ((980, 1.0), (1480, 0.45), (2320, 0.22)):
+        _add(out, _sine(f, dur), 0, g * math.exp(-5.0 * dur))
+    _add(out, _mul(_hp(_lp(_noise(0.02, 113), 9000), 3000),
+                   _exp_env(int(0.02 * SR), 0.004)), 0, 0.55)
+    return _fade(_norm(_soft(out)), 0.001, 0.30)
+
+
+def _paper():
+    """撕纸：两下短促的纸纤维撕裂声 + 一点落地的沙沙。"""
+    dur = 0.55
+    out = _zeros(dur)
+    for k, at in enumerate((0.0, 0.20)):
+        _add(out, _mul(_hp(_lp(_noise(0.12, 131 + k * 7), 9000), 2200),
+                       _exp_env(int(0.12 * SR), 0.020, 0.003)), at, 0.85)
+        _add(out, _mul(_sine(260, 0.08), _exp_env(int(0.08 * SR), 0.014)), at, 0.20)
+    # 纸片落地
+    _add(out, _mul(_hp(_lp(_noise(0.18, 137), 6000), 1500),
+                   _exp_env(int(0.18 * SR), 0.040)), 0.36, 0.42)
+    return _fade(_norm(out), 0.0, 0.16)
+
+
 BANK = {
     "glass": _glass,
     "notify": _notify,
@@ -323,6 +432,14 @@ BANK = {
     "footstep": _footstep,
     "tvstatic": _tvstatic,
     "cheer": _cheer,
+    # ---- 厨房 / 炒菜（美食号必备）----
+    "chop": _chop,        # 刀剁案板
+    "sizzle": _sizzle,    # 油爆：豆角下锅
+    "woktoss": _woktoss,  # 颠勺
+    "clang": _clang,      # 厚背刀敲案板清声
+    "flame": _flame,      # 灶火
+    "plate": _plate,      # 瓷盘上桌
+    "paper": _paper,      # 撕纸（撕菜票、撕菜单）
 }
 
 # 需要按时长现场生成的（其余是固定短音）

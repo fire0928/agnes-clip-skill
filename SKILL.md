@@ -6,7 +6,7 @@ description: 用 Agnes 云端算力全自动做竖屏短剧/长视频——一�
 description_zh: 一句话创意自动做成有对白、会说话的竖屏短剧。全流程 15 步：写剧本、分镜、角色定妆、场景板、逐镜首帧、批量出视频、配乐音效字幕、合成成片，人脸全程锁死不怕换脸。视频走云端算力，不占本地显卡。适合做催泪短剧、漫剧、系列连续剧，也支持同系列多集复用同一张脸。
 description_en: Turn a one-line idea into a vertical short drama with real dialogue. A 15-stage pipeline handles scripting, storyboarding, character sheets, scene boards, first frames, batch video generation, music, sound effects, subtitles and final cut — with character faces locked across every shot so nobody switches faces mid-story. Video runs on cloud GPUs, so no local hardware needed. Great for tearjerkers, anime shorts and serialized episodes that reuse the same face across episodes.
 agent_created: true
-version: 1.10.0
+version: 1.23.0
 ---
 
 # Agnes Clip · 一句话成片
@@ -112,6 +112,96 @@ python scripts/ac.py pick-image <项目目录> --channel agnes      # 或 gpt-im
 逐步的命令、字段、踩坑与验证方法写在 **`references/full_pipeline.md`**，那是主作业手册；本文件给规则与硬约束。
 
 **人工介入只有五处**：剧本定稿、场景板验收、首帧验收、质检、精修（配乐/音效/转场/字幕）。其余都可以批量跑。
+
+---
+
+## 🔥 流程化：10 个显式阶段 + 流程控制台（v1.20.0）
+
+### 为什么有这套
+
+以前是一条 `auto` 命令跑到底——**中间什么都看不见，改需求只能从头再来**，
+而且情绪曲线/母题/因果链这些分析散在 `shots.json` 字段里，没有一份**给人看**的报告。
+
+现在拆成 10 个阶段，每阶段可单独跑、可单独重跑，**需求随时能改**。
+
+### 十个阶段
+
+| # | 阶段 | 命令 | 产物 | 你要做什么 |
+|---|---|---|---|---|
+| ① | 建项目 | `flow <dir> --stage init` | `project.json` | — |
+| ② | **需求分析** | `--stage brief` | `script/brief.md` | **看工单、改工单**（六行工单 + logline四要素 + 情绪曲线表 + 母题 + 出场表） |
+| ③ | 编剧 | `--stage story` | `script/story_prompt.md` | 当前会话模型按作业单写故事 |
+| ④ | 拆分镜 | `--stage shots` | `script/shots.json` + `report/analysis.md` | **看分析报告**（情绪曲线/因果链/问答闭环/节奏指标） |
+| ⑤ | **逻辑自检** | `--stage check` | `report/check.md` | 有「必须改」就改，不许往下跑 |
+| ⑥ | 角色定妆 | `--stage cast` | `assets/characters/` | **看真实角色图** |
+| ⑦ | 道具与场景 | `--stage props` | `assets/props/`、`assets/scenes/` | 看真实道具图 |
+| ⑧ | 首帧 | `--stage frame` | `frames/` | **看真实首帧图** |
+| ⑨ | 视频 | `--stage video` | `clips/` | — |
+| ⑩ | 合成成片 | `--stage assemble` | `out/` | — |
+
+### 三种跑法
+
+```bash
+# 1) 一路跑到逻辑自检（默认 --to check，视频和成片单独跑）
+python scripts/ac.py flow ep05
+
+# 2) 只跑一个阶段
+python scripts/ac.py flow ep05 --stage brief
+
+# 3) 需求改了，从某一阶段接着跑
+python scripts/ac.py flow ep05 --from story
+```
+
+### 流程控制台（推荐）
+
+```bash
+python scripts/ac.py studio "<系列目录>"     # 例如 .../maoge-series
+```
+
+本地网页，**一个页面看全**：
+
+| 标签页 | 内容 |
+|---|---|
+| 总览 | 阶段进度条 + 情绪曲线图 + 一键跑 |
+| **需求分析** | 工单可**直接编辑保存**；保存后 story 及之后的阶段自动标记为待重跑 |
+| **情绪/逻辑分析** | logline四要素 / 情绪曲线 / 母题 / 因果链 / 问答闭环 / **短剧节奏指标** |
+| 分镜表 | 每镜的动作、台词、强度、「因为…所以…」 |
+| **角色图** | **真实角色定妆图**（正脸 + 设定卡 + 三视图） |
+| 道具/场景 | 真实道具参考图 + 场景板 |
+| **首帧图** | **真实首帧图**，一镜一张 |
+| 视频片段 | 可直接播放的片段 |
+| 执行日志 | 每一步在干什么、跑了多久 |
+
+### 需求随时能改
+
+改需求有两条路：
+- **网页**：控制台「需求分析」页改工单 → 保存（后续阶段自动作废）
+- **命令行**：直接编辑 `script/brief.md`，然后 `flow <dir> --from story`
+
+### 流程产物落盘位置
+
+```
+<项目>/
+├── script/
+│   ├── brief.md          ← 需求工单（你改这个）
+│   ├── story_prompt.md   ← 编剧作业单
+│   ├── story.md          ← 故事
+│   ├── shots.json        ← 分镜表
+│   └── _flow.json        ← 阶段状态
+├── report/
+│   ├── analysis.md       ← 剧本分析报告（情绪曲线等）
+│   └── check.md          ← 逻辑自检报告
+└── assets/ frames/ clips/ out/
+```
+
+### 配套文档
+
+| 文件 | 讲什么 |
+|---|---|
+| `references/screenwriting_playbook.md` | **编剧固定流程**（六行工单 → 三张表 → 逐镜四空 → 结构自查） |
+| `references/short_drama_craft.md` | **短剧节奏工艺**（五节点秒级结构 / 1-3-10-16 / 首钩尾钩 / 台词铁律 / 去 AI 味） |
+| `references/logic_check.md` | 逻辑自检清单（含结构级硬伤） |
+
 
 ## 角色设定卡（`char_card.jpg`）
 
@@ -322,6 +412,94 @@ python scripts/ac.py setup            # 交互里把「视频模型」改成 agn
 | 6 | 才允许 `frame` / `video` | 前五步没确认，不许动生成 |
 
 **四条硬规则**：禁止连续两镜都是「站着看」；每镜必须有一个动作；用户说「绝对不能出现」的一个都不许出现；写完做「删一镜测试」——删掉一镜故事不残缺，那它就是废镜。
+
+### 逻辑必须闭合（用户明确要求：剧本阶段就判断，出片后还要复查）
+
+**观众凭什么知道下一镜会发生？** 每镜都要能回答这个问题：
+
+- 上一镜必须提供动机/触发/线索，本镜的动作必须**回应**上一镜，台词必须**回答**上一镜的疑问。
+- 凡是引入**新元素**（电视播报、第三方角色、关键道具）的镜，后面**必须至少有一镜明确反应它**，否则这个元素是白给的。
+  - 实测事故：加了「电视播报」却只画模糊画面，靠猫嫂反应带信息 → 猫嫂那句「他，去帮人做饭了？」观众接不上，剧情跳。
+- 凡是「转折/高潮」的镜，前两镜内必须已经出现让观众能想到这个转折的线索。
+- 台词里出现的每个信息，观众要么之前见过，要么这一镜就是刻意的「揭晓」且有铺垫。
+
+#### 问答必须闭环（问了就必须有人答）
+
+**A 角色问了句什么，下一镜必须有人接。** 如果提问的人下一镜直接退场、只剩另一个角色在讲别的事，
+这句问就白问了——观众会一直等着听答案。
+
+- 实测事故：S04 羊大爷问「小伙子，你跟谁住一块啊？」，猫哥一句没答就切到下一镜（下一镜是灶间，只有猫哥一人），
+  对话悬空，整段像剪断了。
+- 修法：加一镜猫哥回头作答（「就我一个，媳妇儿在家守店呢。」），顺带还能埋伏笔。
+- `ac.py check` 会自动查：问句的说话人不在下一镜同框名单里、且下一镜说话人不是电视/广播/电话那头 → 报「问句悬空没人接」。
+
+写完跑 `ac.py check <dir>` 自动查：因果链字段（`because`/`audience`）、情绪曲线、转折铺垫、结尾高潮、台词长度、**问答闭环**。
+**工具只能查机械项，"逻辑断在半路"仍然必须人读一遍**（把字幕连起来念，念不顺就是断了；特别留意上一句问、下一句没人答）。
+详见 `references/logic_check.md`。
+
+### 美食号套路（题材是做饭/出菜时才用）
+
+用户要「做成美食号的形式」时走这套。**和剧情片的根本差别**：炒菜段 30-45 秒**一句台词都没有**，
+全靠动作和声音；观众看完要「想吃东西」，不只是「觉得剧情好」。
+
+- 22 镜骨架 + 情绪曲线：`S01-S03` 3 秒钩子 → `S04-S05` 交代低潮 →
+  `S06-S11` **炒菜段（30-45 秒，零台词）** → 反派上门（谷底 -4）→ 忍着 → 端盘让菜说话 →
+  街坊回流 → `S22` 结尾高潮 +5
+- 六个招牌动作（每样单独一镜 5-9 秒，机位要换）：备菜 / 切菜 / **扔刀** / 热锅下料 / **大颠勺** / **收汁装盘**
+- 铁律：**反派不许动手**，被一盘菜打服（耳朵耷拉 + 肩膀垮 + 把盘子推回去）；主角不吵架，端盘让对方尝
+- 结尾只两种收法：① 征服顾客 ② 被老婆当众夸（末镜台词「我老公这手艺，够吃一辈子」）
+- 已内置 7 个厨房音效：`chop` 剁、`clang` 刀敲板、`sizzle` 油爆、`woktoss` 颠勺、`flame` 灶火、`plate` 瓷盘、`paper` 撕纸
+
+`ac.py check` 会自动查：炒菜段是否够 30 秒、招牌动作是否齐三种、**温度梯度是否穿帮**。详见 `references/food_show.md`。
+
+### 炒菜段的温度梯度（穿帮最容易出的地方）
+
+用户明确要求：「温度梯度一定要把握好，不要出现穿帮镜头。」
+**火候是一条单向可追踪的曲线**——观众对温度敏感，上一镜说「油冒烟」、下一镜说「油炸开」，物理上不成立，立刻出戏。
+
+标准梯度（任何菜都按这个走）：
+
+```
+空锅烧热 → 五成油温（冒小泡、不冒烟）
+下干料   → 转小火慢焙（火大会焦，动作慢）
+下肥肉   → 转大火逼油脂
+下青菜   → 保持大火断生
+加水焖   → 转最小火，蒸汽只从盖缝持续渗出
+开盖     → 蒸汽是「薄薄一层被揭起」，不是爆发
+```
+
+三条硬规矩：**①「冒烟」和「炸开」不能同镜出现**（冒烟的油遇干料是焙不是炸）；
+**② 每镜必须写明「现在是什么火」**（`turns the burner knob DOWN to a low flame`）；
+**③ 蒸汽量要匹配火候**（写了「最小火」，下一镜就不能 `dense burst of white steam`）。
+
+完整表格、提示词对照（❌穿帮 vs ✅正确 7 组）、音效音量对照见 `references/heat_ladder.md`。
+
+### 结尾必须有动作高潮，不能平淡收场
+
+**最后一镜不能是「故事讲完了所以停」。** 必须落在一个**具体的肢体动作**上（拥抱/挨打/揪耳朵/扛东西/挥手回头/泼水/鞠躬…），
+而且这个动作要回应全片的矛盾。判定一句话：
+
+> 把最后一镜的台词删掉，画面本身还能不能让人明白「这里有情绪」？如果只是「两个人站着」，就是平淡结尾。
+
+模式库在 `references/ending_modes.md`（10 个模式：hug / slap / ear_pinch / carry_log / sweep / spit_take / wave_back / light_up / bow_apology / phone_pickup）。
+镜头表里给末镜标 `"ending_mode": "hug"`，`ac.py check` 会检查末镜有没有模式、`intensity` 够不够高、有没有肢体动作。
+
+### 双人同框：脸会被"平均"，手会变成人手（实测高发）
+
+**单人镜永远正确，双人镜才崩** —— 出现下面两种情况，第一时间怀疑这一条：
+
+| 症状 | 修法 |
+|---|---|
+| 某个角色的脸跟单人镜不一样（配色被另一个角色冲淡、出现斑块/条纹） | ① shots.json 顶层要有 `characters` 字段（`desc_en` + `outfit_en`），skill 靠它锁脸锁服装；② 双人镜的提示词里要**显式绑定「参考图1 是谁、参考图2 是谁」**并禁止"blend the two faces"；③ **姿态要让脸够大**——背对镜头、弯腰低头都会让脸崩，改成「转回身面向镜头这一侧」「上身微微前倾但脸完全抬着」 |
+| 动物角色的手变成了人类的手 | 提示词里必须显式写手：`furry paws, rounded pink paw pads, small blunt claws`；只写 `hands` 模型就填人手。**动作 ≠ 提示词**，中文动作里写了「捧脸」，英文提示词里也得写清手长什么样 |
+
+详见 `references/two_shot_faces.md`。
+
+### 出片后必须复查（不能只交片）
+
+成片不等于过关。至少看一遍：逻辑链在成片里是否成立（抽帧+念字幕）、对话镜两人是否相对而立（不能都看镜头）、
+**上一句有人问、下一句有没有人答**、人物数量与台词实物是否对得上、结尾动作有没有演完、成片时长是否等于计划（少了大概率是 xfade 静默截断）。
+逐项清单见 `references/logic_check.md`。
 
 ### 机位系统（解决"一会儿左一会儿右"）
 
@@ -572,6 +750,7 @@ python scripts/ac.py voice "<dir>" [--force]  # 按台词生成配音（按角�
 python scripts/ac.py music "<dir>" --duration 90 --caption "雨夜，钢琴"
 python scripts/ac.py music "<dir>" --provider volc --duration 90 --caption "..."   # 火山引擎（无卡可跑，>60s 自动分段）
 python scripts/ac.py assemble "<dir>" [--subs] [--voice]
+python scripts/ac.py check "<dir>"             # 剧本逻辑自检（因果链/情绪曲线/转折铺垫/结尾高潮）
 python scripts/ac.py audit "<dir>"            # 出 AUDIT.md（逐镜核对 + 质检 + 成本）
 python scripts/ac.py worldview "<dir>"        # 世界观工作台（网页，多集可切）
 python scripts/ac.py status "<dir>"
@@ -1044,6 +1223,15 @@ python <skill-creator>/scripts/quick_validate.py <skill目录>   # 必须输出 
 | `references/camera_language.md` | 12 种运镜英文写法、6 套组合公式、航拍与特写的安全边界 |
 | `references/micro_expression.md` | 眼神 / 笑意 / 呼吸微表情库，5 套情绪模板 |
 | `references/face_lock.md` | 锁脸方法论与漂移实测数据、尾帧桥接 |
+| `references/ending_modes.md` | 结尾动作高潮模式库（10 个：拥抱/挨打/揪耳朵/扛木头/扫地/泼水/挥手回头/点灯/鞠躬/接电话） |
+| `references/logic_check.md` | 剧本逻辑自检清单 + 出片后复查清单（因果链/问答闭环/转折铺垫/朝向/字幕时机） |
+| `references/food_show.md` | **美食号套路**：22 镜骨架、炒菜段六个招牌动作、7 个厨房音效、两种结尾收法 |
+| `references/heat_ladder.md` | **炒菜温度梯度**：7 阶段火候表、5 条硬规矩、提示词对照表、音效音量对照 |
+| `references/two_shot_faces.md` | **双人同框**：脸被"平均"、手变成人手 —— 三层修法 + 姿态保脸写法 + 验收清单 |
+| `references/group_scene.md` | **群戏镜**（3-6 人同框）：group_scene 声明、站位写法、头号敌人别同框 |
+| `references/scenic_beauty.md` | **唯美山水词库**：安全词 vs 危险词、三个场景锚点模板、光线词、三层纵深 |
+| `references/conflict_extortion.md` | **讹人冲突的化解套路**：五步化解、找茬的人怎么写、台词模板、镜头安排 |
+| `references/human_and_props.md` | **人类角色混居 + 道具参考图**：人脸被画成兽脸的修法、地方菜必须喂真实参考图（鲊广椒实例）|
 | `references/troubleshooting.md` | 崩坏现象 → 原因 → 修法（人脸/画面/动作/流程四类） |
 | `references/prompt_template.md` | 首帧图与视频提示词模板（含对白口型写法） |
 

@@ -161,6 +161,23 @@ Agnes 单段最多 12 秒，长视频 = 多段拼接：
   适用：同场景、同机位、紧接的正反打/接话。管线会自动等上一镜出片再提交，不会并发抢跑。
   不适用：跨场景、换机位、时间跳跃。
 - `no_plate: true`：极近景时不吃场景板参考（板是中景，模型会照抄它的构图）。代价是背景陈设要自己写进 prompt。
+- `no_faces: true`：**极近景不露脸**（只拍爪子/前臂/食材）。这一镜的人物脸不入画。
+  🔴 不加这个标记，特写会被顶成站立人物镜（实测 ep05 S06）：
+  提示词里明明写了「Tight close-up…only his forearms and paws visible」，
+  但 skill 自动追加的「Headcount exactly 2, these are the only bodies visible」
+  +「The two characters face each other…their eyes meet on each other's face」
+  跟它直接打架——模型最后照着**后写的那句**画，成了两人站着对话的中景，
+  特写彻底没了。
+  加上 `no_faces: true` 之后，skill 会：
+  - **不喂人脸参考图**（没有脸要锁，喂了反而把模型往人物照上带）
+  - **不追加人数白名单和两人站位句**
+  - 换成极近景白名单：「画面里只有爪子、前臂、挖出来的植株、泥土和草，
+    没有脸、没有头、没有身体，人在手腕和手肘处被裁切」
+  - 道具参考图的编号自动从 1 开始（没人脸图占位）
+  > 注意：`no_faces` 和 `no_plate` 是两件事。`no_plate` 管**背景**参考（场景板），
+  > `no_faces` 管**人物**参考（人脸图）。极近景通常两个都要开。
+  > 判定标准很简单：**这一镜能不能看见脸**——能看见就别开，会破坏锁脸。
+
 
 ### 配乐音量：`bgm`（0–1，可选）
 ```json
@@ -174,16 +191,24 @@ Agnes 单段最多 12 秒，长视频 = 多段拼接：
 
 ### 音效：`sfx`（数组，可选）
 ```json
-{"id": "S09", "sfx": [{"at": 0.55, "kind": "notify", "gain": -17}]}
-{"id": "S01", "sfx": [{"at": 0.30, "kind": "rain", "dur": 42.0, "gain": -28}]}
+{"id": "S09", "sfx": [{"at": 0.55, "kind": "notify", "gain_db": -17}]}
+{"id": "S01", "sfx": [{"at": 0.30, "kind": "rain", "dur": 42.0, "gain_db": -28}]}
 ```
 - `at`：**本镜内**的秒数（不是全片时间轴）。镜头重出/收紧后不用改。
-- `kind`：`glass` / `notify` / `notify2` / `tick` / `tap` / `whoosh` / `thud` / `rain` / `tinnitus` / `drone`（见 `scripts/sfx.py`，现场合成）。
-- `gain`：dB，相对素材本身的 −3dBFS 峰值。短音效 −14 ~ −22，连续的 rain/tinnitus/drone 用 −26 ~ −38。
+- `kind`：`glass` / `notify` / `notify2` / `tick` / `tap` / `whoosh` / `thud` / `rain` / `tinnitus` / `drone` /
+  `chop` / `clang` / `sizzle` / `woktoss` / `flame` / `plate` / `paper` / `footstep` / `cheer`（见 `scripts/sfx.py`，现场合成）。
+- `gain_db`：dB，相对素材本身的 −3dBFS 峰值。短音效 −14 ~ −22，连续的 rain/tinnitus/drone 用 −26 ~ −38。
+  🔴 **字段名写错不报错，只是音效力度全废**（skill v1.19.0 前只认 `gain`，
+  镜头表写 `gain_db` 会被静默读成默认 −12dB，所有音效力度归零、炒菜声和火焰声都不够响，
+  而成片照常出，肉眼很难发现）。
+  现在 **`gain_db` 和 `gain` 两个名字都认，`gain_db` 优先**——写哪个都行，但**全片要统一**。
 - `dur`：只有 rain / tinnitus / drone 需要写时长（秒）；不写默认 4s。
 - 简写 `"sfx": ["tick", "whoosh"]` 等价于都落在镜头开头、−12dB（不推荐，容易盖住台词）。
 - 落点优先挑**镜头切点前后**或**对方开口前 0.6–1s**，别卡演员微动作——模型片段的动作时刻不可控。
 - 叠加：`ac.py sfx <dir> --into out/final-bgm.mp4 --out out/final.mp4`（视频流复制、只重混音频）。同一版不要叠两次。
+- 🔴 **野外做菜的音效要更响**：火焰 `flame` −8dB 起、油爆 `sizzle` −7dB 起、
+  颠勺 `woktoss` −10dB、切菜 `chop` −13dB（见 `food_show.md` 野外做菜段）。
+  锅气是美食号的灵魂，音效压太轻就只剩画面在动。
 
 
 ### 环视镜头

@@ -36,6 +36,7 @@ ffmpeg 未装时自动尝试 imageio-ffmpeg 提供的静态二进制。
 """
 import argparse
 import base64
+import io
 import json
 import math
 import hashlib
@@ -188,8 +189,9 @@ DEFAULT_IMAGE = {
     "key": "",
     "model": "gpt-image-2.5",
     # banana 通道（Gemini 原生协议，服装/道具/手部细节最听话）
+    # 端点留空：使用者自己在配置页填自己的中转地址（各家网关不同）。
     "banana": {
-        "endpoint": "https://apibase.cc",
+        "endpoint": "",
         "key": "",
         "model": "nano-banana-pro",
         "image_size": "2K",
@@ -264,9 +266,12 @@ EAST_ASIAN = (" All characters are East Asian Chinese with East Asian facial fea
 # 🔴 拟人动物项目（猫哥这种 3D 动漫短剧）不能加上面那句——
 # 「东亚人面部特征、黑色头发、人类肤色」会把猫拉回人样，长出人类五官。
 # 项目 project.json 写 "character_type": "anthropomorphic_animal" 时改用这一句。
-ANTHROPOMORPHIC = (" All characters are anthropomorphic animals with animal faces, fur, muzzles, "
-                    "paws and tails, never human skin, never human hair, never human facial features, "
-                    "never human hands, and they stand and walk upright on two legs like people.")
+ANTHROPOMORPHIC = (" Most characters are anthropomorphic animals with animal faces, fur, muzzles, "
+                    "paws and tails, standing and walking upright on two legs like people. "
+                    "A character explicitly described as a human being is a real human with human skin, "
+                    "human face and human hands, living among the animal neighbours — "
+                    "keep the two kinds of character visually distinct and never turn a human "
+                    "into an animal or an animal into a human.")
 
 # 拟人动物项目的整体渲染风格锚：动物城（Zootopia）级 3D 动画。
 ANIMAL_RENDER_ANCHOR = (
@@ -484,6 +489,15 @@ def all_char_names(paths):
     return sorted(names)
 
 
+def _cast_char_dirs(paths):
+    """角色资产可能存放的目录（共享角色库 + 本集）。"""
+    out = []
+    for d in (paths.get("cast"), paths.get("chars")):
+        if d and os.path.isdir(d) and d not in out:
+            out.append(d)
+    return out
+
+
 def require_agnes_creds(cfg):
     a = cfg.get("agnes") or {}
     if not a.get("endpoint"):
@@ -596,7 +610,10 @@ def normalize_loudness(path, exe, target=-16.0, ceiling=-1.5):
     # 增益照给，峰交给 limiter 兜（对话片偶尔限掉一点峰，听不出来）。
     if gain > 6.0:
         gain = 6.0
-    if gain < 0.5:
+    # 🔴 负增益（成片偏响）也要处理：原声模式下模型人声给到 1.0，
+    #    混完常常 -10 LUFS 上下，比 -16 响一大截，手机外放刺耳。
+    #    以前这里直接 return，成片就带着过响的响度交付了。
+    if -0.5 < gain < 0.5:
         info("响度 %.1f LUFS（峰值 %s dBTP），不再调整" % (cur, tp))
         return
     tmp = path + ".norm.mp4"
@@ -1763,6 +1780,85 @@ STORY_SYSTEM = """你是资深竖屏短剧编剧兼分镜师。你的任务不�
     全片要有至少一个最低点和一个最高点，禁止连续三镜同一 intensity。
 0.4 禁止连续两镜都是"站着看/望着远处"。每镜必须有一个具体动作（推门、抬手、跨过、抓起、放下）。
 0.5 写完做删一镜测试：删掉一镜故事不残缺，那镜就是废镜，重写。
+0.6 **逻辑链必须闭合**（用户明确要求，剧本阶段就要判断逻辑全不全）：
+    每一镜都要能回答「观众凭什么知道下一镜会发生」。
+    · 上一镜必须提供动机/触发/线索，本镜的动作必须是**回应**上一镜，台词必须**回答**上一镜的疑问。
+    · 凡是引入新元素（新角色、第三方播报、关键道具）的镜，后面**必须至少有一镜明确反应它**，否则这个元素是白给的。
+    · 凡是「转折/高潮」的镜，前两镜内必须已经出现让观众能想到这个转折的线索。
+    · 台词里出现的每个信息，观众要么之前见过，要么这一镜就是刻意的「揭晓」且有铺垫。
+0.7 **结尾必须是动作高潮，不能平淡收场**：
+    最后一镜必须落在一个**具体的肢体动作**上（拥抱/挨打/揪耳朵/扛东西/挥手回头/泼水/鞠躬…），
+    不能是「两人站着说完最后一句」。最后一镜的 `intensity` 要接近全片最高。
+    选一个模式并写进 `ending_mode` 字段（可选：hug / slap / ear_pinch / carry_log / sweep /
+    spit_take / wave_back / light_up / bow_apology / phone_pickup）。
+0.8 **问答必须闭环：谁问了，下一镜必须有人答**：
+    · 只要某一镜的台词是**问句**（以「？/?」结尾，或句尾带「吗/呢」，或结尾三字内有「谁/哪儿/哪里/为何/多少」），
+      那么提问的人**必须出现在下一镜的同框人物里**，而且下一镜的台词要真在应答他。
+    · 最常见的破绽是：A 问了一句，下一镜 A 直接退场，只剩 B 在讲别的事——这句问就白问了，
+      观众会一直等着听答案，整段像剪断了。
+      （实测事故：羊大爷问「小伙子，你跟谁住一块啊？」，猫哥一句没答就切到下一镜，对话悬空。）
+    · 修法：补一镜回答，并且尽量让回答**顺带埋伏笔**（例：猫哥答「就我一个，媳妇儿在家守店呢。」，
+      这句正好解释了后面猫嫂为什么守着空锅发火）。
+    · 唯一例外：电视播报 / 广播 / 电话那头在回应（说话人是 anchor / vo 之类），不算悬空。
+
+0.85 **问句和答句必须是同一个问题**（ep05 实测，用户反馈「情节不顺畅」）：
+    · 「猫嫂问『这折耳根一斤卖几个钱？』→ 猫哥答『您尝尝值不值这个价』」——
+      问的是**价格**，答的是**好不好吃**，被问的老汉全程没答那句问，观众会一直等着听答案。
+    · 写完把每一对「问句 → 下一镜台词」并排读一遍：
+      **答句必须正面覆盖问句的话题**。问价格就要答价格（哪怕只答一个数字），
+      问好不好吃就答好不好吃。实在要转话题，得让台词里**先答一句再转**。
+    · 常见的合法修法：把问句和答句合并成同一句里先答后转，
+      例：「三毛一斤，您尝尝，值不值这个价。」——「三毛一斤」答了价格，后面才转话题。
+0.86 **冲突方不能天降**（ep05 实测，用户反馈「情节不顺畅」）：
+    · 反派/找茬的人**第一次出现**时，前面必须已经交代过他的存在或他的来由。
+      否则观众第一个问题是「他刚才在哪、怎么现在才发现」。
+    · 合法铺垫（任选其一，**越具体越好**）：
+      ① 画面线索：坡边的**旧界碑**、围栏、标牌、石柱、木牌 —— 让主角经过时**没当回事**，
+         观众看到了、记住了，后面他从这个方向出现就顺理成章；
+      ② 台词线索：路过的人提过「这块地有人管」「那户姓X的脾气不好」；
+      ③ 主角自己说漏：「这是谁家的地来着？」——没人接，于是埋下祸根。
+    · 写成画面时，线索要**真的画出来**（写进 frame.prompt），
+      光在 because 字段里写不算——观众看不见。
+0.87 **人跑了就别再莫名回来**（ep05 实测，用户反馈「情节不顺畅」）：
+    · 如果某一镜写了「一窝蜂跑掉/落荒而逃」，下一镜又「聚回来吃饭」，
+      中间**必须交代折返**，否则观众懵「跑了怎么又回来了」。
+    · 三种合法写法：
+      ① 干脆**删掉离场镜**（最省事）；
+      ② 把离场改成**喜剧性的小插曲**，下一镜明确写「被请回来/追回来/拉回来」；
+      ③ 离场本身就是剧情的一部分（比如去搬东西、去救人），下一镜交代去向。
+    · 写完检查：离场镜之后的两镜内，有没有出现「回来」的动作或台词？
+      没有就是硬伤。
+0.88 **每一镜都要能被删掉测试**（ep05 实测，用户反馈「情节不顺畅」）：
+    · 随机删掉任意一镜，如果故事照样成立 → 这镜是废镜，重写或合并。
+    · 特别检查**过场镜**（「一行人赶到河边」「大家开始收拾」这类）——
+      它们最容易被写成风景介绍，删了故事反而更顺。
+    · 群戏里每一个出场角色都要有**存在理由**：
+      谁是来帮忙的？谁只是凑热闹的？谁有名词/有动作？
+      纯凑人数的角色要么给他一句台词，要么让他别出现。
+
+0.9 **美食号专用规则（题材是做饭/出菜时才用，非美食题材跳过）**：
+    详见 references/food_show.md。核心五条：
+    · **3 秒钩子**：第 1 镜就要出现「麻烦/挑战」，不许铺垫日常。
+    · **炒菜段零台词**：炒菜的镜头（切菜/颠勺/装盘）**不写台词**，
+      把台词省下来给前后冲突。那30 多秒就是让观众「看饿了」的地方，塞进对话观众会分心。
+      把台词留空写成 ""。
+    · **手活要拆成单独镜头**：备菜 / 切菜 / 扔刀 / 热锅下料 / 翻锅 / 收汁装盘，
+      每样单独一镜（5-9 秒），机位要换（切菜用案板特写、颠勺用灶台中景、装盘用传菜口特写）。
+    · **不许吵架**：反派挑衅后，主角的回应是**把菜端上让对方尝**，不是回嘴。
+      手艺人靠手艺赢，一动手就 low 了。反派认输的信号写「耳朵耷拉+ 肩膀垮了 + 把盘子推回去」。
+    · **结尾只有两种收法**：① 征服顾客（端盘→对方动筷→对方低头认输）；
+      ② 被老婆/搭档当众夸（把围裙披上、手掌按胸口、说「我老公这手艺，够吃一辈子」）。
+      不要「两人并肩看夕阳」这种淡收场。末镜 intensity = +5，台词 ≤ 12 字。
+    · 🔴 **因果链两条铁律**（用户两次指出过，写反例时对照检查）：
+      ① **反派必须先踩手艺，主角接战才有理由。**
+         只压价不踩手艺 → 主角那句「我跟你干」是凭空来的，观众会问「做给谁看？」
+         ✓ 狼兄：「一块五，爱卖不卖。你那豆角子，配叫镇店菜？」
+           猫哥：「就配。这半筐豆角，我照样炒一盘。」
+      ② **反派上门必须有来由，不能天降。**
+         「他没尝过就来说菜一般」是硬伤。
+         ✓ 主角在菜市场当众承诺过 → 狼兄是来**验收承诺**的，进门先闻到香味
+      · 顺手把**道具的来路交代清楚**（例：把「菜被截了」改成「就剩这半筐」），
+        一举解决接战的赌注 + 前面客人为什么走，比事后解释省力得多。
 
 一、戏怎么写
 0. 先定基调：用户要温暖/治愈/积极，结尾必须落在重逢、和解、希望或日常的暖上；不要用死亡、绝症、苦情收尾。冲突可以有，但要给出出口。
@@ -1851,6 +1947,11 @@ STORY_SYSTEM = """你是资深竖屏短剧编剧兼分镜师。你的任务不�
       "camera": "dolly in slowly / follow / arc / static ...",
       "action": "中文：这一镜唯一的主要动作",
       "micro": "中文：微表情过程",
+      "intensity": -5,
+      "purpose": "推进",
+      "because": "因为上一镜____，所以这一镜____",
+      "audience": "观众此刻该想什么",
+      "ending_mode": "",
       "speaker": "girl",
       "line": "角色真正说出口的中文台词（≤18字）",
       "frame": {"mode": "swap", "prompt": "English first-frame prompt: location, outfit, lighting, composition, camera distance. Do NOT describe facial features. End with: Keep the face, identity and hairstyle exactly as in the reference image."},
@@ -1864,7 +1965,10 @@ STORY_SYSTEM = """你是资深竖屏短剧编剧兼分镜师。你的任务不�
 - duration 可以留 0，管线会按台词字数、beat 数、景别自动计算（4–12 秒）。
 - 景别和运镜要有变化，不要十条一个样；对话镜头必须是腰以上。
 - 8 镜的片子至少 4 镜有台词；6 镜至少 3 镜；不要把所有台词堆在最后。
-- 第一镜建立场景并开口，最后一镜用台词收尾。"""
+- 第一镜建立场景并开口，最后一镜用台词收尾。
+- 每个镜头必须填 `intensity`（-5~+5）、`purpose`（推进/停顿/转折/高潮）、`because`、`audience`；
+  最后一镜必须填 `ending_mode`（结尾动作高潮的模式名）。
+- 结尾镜不能只是站着说话，必须有明确肢体动作。"""
 
 
 def generate_story(cfg, idea, n_shots, seconds, title=None):
@@ -2135,10 +2239,24 @@ def normalize_story(data, n_shots, seconds, title=None):
             else:
                 lang = "Mandarin Chinese with precise lip-sync"
                 extra = "mouth shapes each syllable clearly, jaw and lips move naturally"
+            # 🔴 口型朝向：多人对话镜必须让角色**看着对方**，不能一律朝镜头。
+            #    实测 ep03 踩过：原来这里硬写 "keep the face turned toward the camera"，
+            #    结果所有对话镜的人物都把脸转向观众——S02 猫哥站在大爷旁边抬着爪要帮忙，
+            #    脸却看着镜头；S07 两人对话时都低头看盘子不互相看。
+            #    现在按同框人数分两种说法：
+            #      · 两人及以上 → 转向对话对象、眼神落在对方脸上，头微侧四分之三朝镜头（嘴看得见）
+            #      · 独角戏  → 朝向镜头（本来就没有对方可看）
+            scene_cast = [c for c in (s.get("cast") or [ch]) if c]
+            if len(scene_cast) >= 2:
+                facing = ("the face is turned toward the other character in the scene, "
+                          "eyes locked on the listener's face, the head angled three-quarters toward "
+                          "the lens so the mouth stays visible")
+            else:
+                facing = ("the face is turned toward the camera so the mouth stays visible, "
+                          "the eyes looking past the lens")
             lips = (' The character speaks in %s: "%s" — '
-                    '%s; '
-                    'keep the face turned toward the listener or camera so the mouth stays visible.'
-                    % (lang, line, extra))
+                    '%s; %s.'
+                    % (lang, line, extra, facing))
             low = vp.lower()
             if "precise lip-sync" not in low and "lip sync" not in low:
                 vp = vp.rstrip() + timed + lips
@@ -2162,6 +2280,12 @@ def normalize_story(data, n_shots, seconds, title=None):
             "char": ch,
             "shot_size": shot_size,
             "camera": camera,
+            # ---- 逻辑字段（剧本阶段自检用，见 references/logic_check.md）----
+            "intensity": s.get("intensity"),
+            "purpose": (s.get("purpose") or "").strip(),
+            "because": (s.get("because") or "").strip(),
+            "audience": (s.get("audience") or "").strip(),
+            "ending_mode": (s.get("ending_mode") or "").strip(),
             "action": action,
             "micro": micro,
             "speaker": speaker,
@@ -2333,9 +2457,48 @@ def do_story(cfg, paths, idea, n_shots, seconds, title=None):
     # 推理用 WorkBuddy 默认时，不调外部 API：把提示词落盘，交给当前会话模型写 shots.json
     if text_provider(cfg) == "workbuddy":
         total = int(n_shots * float(seconds))
+        # 🔴 编剧流程固定化（ep05 用户反馈「每次都不一样」）：
+        #    以前只丢一段提示词就让人写分镜，等于**跳过骨架直接写分镜**，
+        #    质量全看当场发挥。现在落盘的是一份**完整的编剧作业单**：
+        #    先填工单 → 定三张表 → 逐镜填四空 → 结构硬伤自查 → 才写 shots.json。
         prompt = (STORY_SYSTEM + "\n\n---\n\n创意：%s\n镜头数：%d\n每镜时长：约 %s 秒（总时长约 %d 秒）\n%s\n"
                   % (idea, n_shots, seconds, total,
                      ("片名：%s" % title) if title else "片名你自己起。"))
+        prompt += (
+            "\n---\n\n"
+            "## 你必须按这个顺序作业（不许跳步）\n\n"
+            "### 作业单 Step 1：先写这六行（写完存到 script/story_brief.md）\n\n"
+            "```\n"
+            "我想让观众感觉到：\n"
+            "主角想要：\n"
+            "他的阻碍：\n"
+            "最后他变成了：\n"
+            "必须出现的画面：（最多 3 个）\n"
+            "绝对不能出现的：\n"
+            "```\n\n"
+            "### 作业单 Step 2：三张表（写完存到 script/story_brief.md）\n\n"
+            "1. **情绪曲线表**：每镜一个 -5~+5 的值，先排完再写镜头。\n"
+            "   要有最低点（60%-75% 处）和最高点（最后 1-2 镜），禁止连续三镜同值。\n"
+            "2. **母题**：一个具体物件/动作贯穿全片，首镜出现、末镜回应。\n"
+            "3. **出场表**：每个角色的功能定位、首次出场镜、必有名词/动作。\n"
+            "   填不出「必有名词/动作」的角色就别让他出场。\n\n"
+            "### 作业单 Step 3：逐镜填这四个空（填不出「因为上一镜…」= 废镜，删掉）\n\n"
+            "1. 这一镜的作用（推进/停顿/转折）\n"
+            "2. 因为上一镜 ______，所以这一镜 ______\n"
+            "3. 他在这里做什么（必须是一个动作，不能是「站着看」）\n"
+            "4. 观众看完应该想 ______\n\n"
+            "### 作业单 Step 4：结构硬伤自查（写完逐条对照，错了就改）\n\n"
+            "- **问句和答句是同一个问题吗？**（问价格不能答好不好吃）\n"
+            "- **冲突方天降了吗？**（前面要有界碑/标牌/台词线索，画面线索要写进 frame.prompt）\n"
+            "- **人跑了又莫名回来了吗？**（离场后两镜内要交代「请回来」）\n"
+            "- **每一镜删掉测试**：删了故事照样成立的就是废镜\n\n"
+            "### 作业单 Step 5：才写 shots.json\n\n"
+            "写完把 shots.json 写到 script/shots.json，然后**必须**跑：\n\n"
+            "```\n"
+            "python <skill>/scripts/ac.py check <项目目录>\n"
+            "```\n\n"
+            "有「必须改」就回去改，**不许带着问题往下跑视频**。\n\n"
+            "完整方法论见 references/screenwriting_playbook.md。\n")
         p = os.path.join(paths["root"], "script", "story_prompt.md")
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
@@ -2356,6 +2519,102 @@ def cmd_story(args):
 
 # ----------------------------------------------------------------------------- characters
 
+def _is_animal_character(desc):
+    """这个角色是不是拟人动物（猫/羊/狗…）。
+
+    🔴 坑（实测 ep03 羊大爷）：角色卡和三视图的提示词里原本**硬写**
+       "East Asian Chinese person"，羊大爷的设定卡于是有 4/9 格画成了人脸，
+       只有正面全身是羊。定妆图本身是对的，卡却错了 —— 同一镜里两种物种。
+       所以凡是 desc 里出现拟人动物特征，都必须把"人"的措辞换成"动物"。
+    """
+    d = (desc or "").lower()
+    for w in ("anthropomorphic", "anthropomorphic animal", "cat ", "kitten", "dog ", "puppy",
+              "sheep", "ram", "fox", "rabbit", "bear", "panda", "lion", "tiger", "wolf",
+              "otter", "raccoon", "squirrel", "mouse", "goat", "deer", "horse", "pig ",
+              "cow ", "chicken", "duck", "monkey", "elephant", "hippo", "turtle", "frog",
+              "whale", "dolphin", "penguin", "owl", "eagle", "parrot", "snake", "lizard",
+              # 🔴 漏词修复（实测 ep05）：词表里没有具体犬种，
+              #    「an elderly female poodle dog」被判成人类 →
+              #    于是加了真人定性句（human face / no fur / human hands），
+              #    把贵宾犬画成了人脸。
+              #    凡是「犬种名 + dog」都要算动物。
+              "poodle", "spaniel", "terrier", "retriever", "husky", "corgi",
+              "dachshund", "chihuahua", "pug", "mastiff", "collie", "shepherd",
+              "samoyed", "dalmatian", "bulldog", "doberman", "boxer", "beagle",
+              "corgi", "akita", "shiba", "malamute", "rottweiler", "greyhound",
+              # 其它容易漏的具体物种
+              "chinchilla", "hamster", "ferret", "hedgehog", "parrot", "macaw",
+              "cockatoo", "toucan", "flamingo", "pelican", "heron", "stork",
+              "hedgehog", "capybara", "lemur", "sloth", "meerkat", "mongoose",
+              "antelope", "gazelle", "bison", "buffalo", "llama", "alpaca",
+              "camel", "donkey", "mule", "koala", "wombat", "kangaroo",
+              "raccoon", "badger", "weasel", "otter", "seal", "walrus"):
+        if w in d:
+            return True
+    return False
+
+
+def _is_human_character(desc):
+    """这个角色是不是**人类**（不是拟人动物）。
+
+    🔴 坑（实测 ep04 卖菜阿姨）：世界观锚里写着
+       "every inhabitant is an anthropomorphic animal"，模型会把画面里**所有人**
+       都画成兽脸——包括明确写了 "an elderly Tujia woman" 的角色。
+       修法：desc 里明确说「是人类」时，提示词要显式声明
+       "a real human being, human skin, no fur, human face, not an animal muzzle"，
+       把「人类」和「动物」这两组词从概念上分开。
+    """
+    d = (desc or "").lower()
+    # 先排除动物（描述里出现动物词就不是人类）
+    if _is_animal_character(desc):
+        return False
+    # 🔴 强人类标记优先（实测 ep05）：
+    #    「a real human being」是**明确声明**，比任何泛称都可靠。
+    #    有它就一定是人，哪怕描述里混进了别的词。
+    for w in ("a real human", "real human being", "human being",
+              "human skin", "human face", "human hands"):
+        if w in d:
+            return True
+    # 🔴 泛称要防一手：狗也可能是「an elderly female poodle」，
+    #    拟人动物的描述里也常有「female cat」「young man」这类词。
+    #    所以泛称只在**没有出现明显动物特征词**时才认。
+    if any(w in d for w in ("fur", "muzzle", "paws", "whiskers", "tail",
+                            "ears", "coat", "pelt", "fluffy", "curly coat")):
+        # 出现动物体征，但也要看有没有明确的人类声明（上面已处理），没有就判动物
+        return False
+    for w in ("elderly woman", "elderly man", "middle-aged woman",
+              "middle-aged man", "young woman", "young man",
+              "old woman", "old man", "woman", "man",
+              "grandmother", "grandfather", "aunt", "uncle",
+              "farmer", "peasant", "worker", "shopkeeper", "driver"):
+        if w in d:
+            return True
+    return False
+
+
+def _species_clause(desc, who="East Asian Chinese person"):
+    """按物种返回提示词片段：动物角色不能出现"人脸/黑发/东亚人"这些词。"""
+    if _is_animal_character(desc):
+        return ("an anthropomorphic animal character with a full furry animal head, "
+                "a furry muzzle and snout, animal ears and a tail, "
+                "standing upright on two legs and wearing everyday clothes. "
+                "The face is the animal's own face — no human skin, no human face, "
+                "no human nose, no human lips, no human eyebrows. "
+                "Fur covers the head, muzzle, arms, legs and paws. "
+                "The same animal species with the identical fur colouring, markings, "
+                "horns or ears in every panel.")
+    if _is_human_character(desc):
+        # 🔴 人类角色：必须显式说「是人」，否则世界观锚的 anthropomorphic animal 会把她变成兽脸
+        return ("a real human being — a human person with a human face, human skin with no fur "
+                "anywhere on the body, human eyes, human nose and human lips, "
+                "human hands with human fingers and human skin, natural human skin texture and "
+                "pores, real human wrinkles and age lines, human hair. "
+                "This character is a human being, NOT an animal and NOT an anthropomorphic "
+                "animal character: no fur, no muzzle, no animal ears, no tail, no paws. "
+                "This is a real person living among anthropomorphic animal neighbours.")
+    return who + ". East Asian facial features, black hair, dark eyes, natural East Asian skin tones."
+
+
 def make_turnaround(cfg, paths, name):
     """生成角色三视图（正面 / 侧面 / 背面），用于形象确认与扩展。"""
     exe = have_ffmpeg(cfg)
@@ -2363,11 +2622,14 @@ def make_turnaround(cfg, paths, name):
     src = os.path.join(cdir, "face_ref.jpg")
     if not os.path.exists(src):
         die("找不到 %s 的 face_ref.jpg" % name)
-    prompt = ("Character turnaround sheet of an East Asian Chinese person: the same person shown in "
+    meta = load_json(os.path.join(cdir, "meta.json"), {})
+    species = _species_clause(meta.get("desc") or "")
+    prompt = ("Character turnaround sheet of %s: the same character shown in "
               "three full-body views side by side — front view, side view, back view. "
-              "East Asian facial features, black hair. Identical face, hairstyle, body proportions and outfit "
+              "%s "
+              "Identical face, fur or hairstyle, body proportions and outfit "
               "across all three views. Pure white background, even flat lighting, full body in frame, "
-              "orthographic, like a game character design sheet. No text, no watermark.")
+              "orthographic, like a game character design sheet. No text, no watermark." % (species, species))
     info("%s 生成三视图 ..." % name)
     raw, _ = agnes_image_generate(cfg, prompt, ref_paths=[src], project_paths=paths)
     save_image_bytes(raw, os.path.join(cdir, "turnaround.jpg"), exe)
@@ -2451,10 +2713,14 @@ def cut_views(cfg, paths, name, quiet=False):
     if len(cells) < 3:
         warn("%s 设定卡只识别到 %d 格，跳过分角度参考图" % (name, len(cells)))
         return {}
-    # 第 0 格是大头，中间是三视图，末格是细节列
-    mid = cells[1:-1]
-    if len(mid) == 4:          # turnaround 版式多一个四分之三侧，取后三个
-        mid = mid[-3:]
+    # 取"中间那几格"当三视图：第 0 格是大头，末格是细节列。
+    #实测有 4 格版（大头|正|侧|背，没有细节列）——这时末格本身就是背面，
+    # 再切片就会把背面切掉、只剩 3 格而整体跳过（羊大爷的角色卡就是这个版式）。
+    mid = cells[1:]
+    if len(mid) >= 4:
+        mid = mid[-4:] if len(cells) >= 5 else mid[-3:]
+    if len(mid) < 3:
+        mid = cells[-3:]
     if len(mid) < 3:
         return {}
     vdir = os.path.join(cdir, "views")
@@ -2496,6 +2762,12 @@ def view_for_angle(paths, name, angle):
     elif a in ("side", "profile", "three_quarter", "3q"):
         pick = "side"
     elif a in ("front", "eye", "close", "closeup", "portrait"):
+        # 🔴 优先用 face_ref.jpg（彩色锁脸锚点），不要用 views/front.jpg。
+        # 实测：views/front.jpg 是低饱和三视图，配色会被模型学走——
+        # 海豹重点色的猫出成虎斑、绿眼睛（ep02 S01/S02/S05 事故）。
+        # face_ref.jpg 才是带标准配色的大头锁脸图，脸型/眼睛颜色最准。
+        if os.path.exists(fref):
+            return fref
         pick = "front"
     else:
         return fref if os.path.exists(fref) else None
@@ -2560,7 +2832,12 @@ def make_char_card(cfg, paths, name, face_ref, desc="", outfit="", style="sheets
     否则两张图是两张脸，卡上的人会对不上锚点。传了 channel 就强制走它。
     """
     base = CHAR_CARD_STYLES.get(style) or CHAR_CARD_STYLES["sheets"]
-    who = "East Asian Chinese person"
+    # 🔴 动物角色不能写 "East Asian Chinese person"（见 _species_clause 的说明）
+    if _is_animal_character(desc):
+        base = base.replace("same hairstyle", "same fur pattern and horn shape")
+        who = _species_clause(desc)
+    else:
+        who = "East Asian Chinese person"
     bits = [base, who]
     if desc.strip():
         bits.append("Character details: " + desc.strip() + ".")
@@ -2618,13 +2895,22 @@ def do_char_gen(cfg, paths, name, desc, with_turnaround=False, outfit="",
 
     # 定妆图的服装必须和全片 outfit_en 一致，否则首帧会照着参考图穿错衣服。
     wear = ("Wearing exactly this outfit: %s. " % outfit.strip()) if (outfit or "").strip() else ""
-    prompt = ("Character reference portrait of an East Asian Chinese person: %s. "
-              "%s"
-              "East Asian facial features, black hair, dark eyes, natural East Asian skin tones. "
-              "Front-facing half-body, neutral standing pose, clean neutral studio background, "
-              "soft even lighting, photorealistic cinematic look, natural skin texture, "
-              "sharp facial features. Single person only, plain backdrop, "
-              "no text, no watermark." % (desc, wear))
+    species = _species_clause(desc)
+    if _is_animal_character(desc):
+        prompt = ("Character reference portrait of %s: %s. "
+                  "%s"
+                  "Front-facing half-body, neutral standing pose, clean neutral studio background, "
+                  "soft even lighting, photorealistic cinematic look, detailed fur texture, "
+                  "sharp animal features. Single character only, plain backdrop, "
+                  "no text, no watermark." % (species, desc, wear))
+    else:
+        prompt = ("Character reference portrait of an East Asian Chinese person: %s. "
+                  "%s"
+                  "East Asian facial features, black hair, dark eyes, natural East Asian skin tones. "
+                  "Front-facing half-body, neutral standing pose, clean neutral studio background, "
+                  "soft even lighting, photorealistic cinematic look, natural skin texture, "
+                  "sharp facial features. Single person only, plain backdrop, "
+                  "no text, no watermark." % (desc, wear))
     info("生成角色形象 %s（通道 %s）..." % (name, ch))
     raw, _ = agnes_image_generate(cfg, prompt, project_paths=paths, force_channel=ch)
     save_image_bytes(raw, os.path.join(cdir, "source.jpg"), exe)
@@ -3023,6 +3309,80 @@ FACE_LOCK = (" Keep the face, identity, hairstyle and body proportions exactly a
              "same person, no morphing, no identity drift.")
 
 
+def _paws_clause(shot, chars):
+    """按角色分别声明「手是爪子还是人手」。
+
+    🔴 坑（实测 ep05 S18）：原来这句是**无条件**追加的
+       「Every character's hands are furry animal paws」，
+       但画面里可能有真人（老乡夫妇）。它和真人声明
+       「human hands with human fingers」正面打架，
+       模型两边各取一半 → 把真人画成了兽脸。
+       修法：人和动物分开声明；全是动物才用原来那句。
+    """
+    cast = shot.get("cast") or ([shot.get("char")] if shot.get("char") else [])
+    humans, animals = [], []
+    for name in cast:
+        if not name:
+            continue
+        c = (chars or {}).get(name) or {}
+        dsc = (c.get("desc_en") or c.get("desc") or "").strip()
+        if dsc and _is_human_character(dsc):
+            humans.append(name)
+        else:
+            animals.append(name)
+    if humans and animals:
+        return (" The %s %s show visible hands: they are furry animal paws with the same fur "
+                "colour as the rest of that character, never human fingers or human skin. "
+                "The %s %s show visible hands: they are human hands with human fingers and "
+                "human skin, never paws, never fur. The two kinds of hands must not be mixed "
+                "up and must not be blended together."
+                % (" and ".join(animals), " and ".join(animals),
+                   " and ".join(humans), " and ".join(humans)))
+    if humans:
+        return (" Every character's visible hands are human hands with human fingers and "
+                "human skin, never paws, never fur, never animal fingers.")
+    if animals:
+        return (" Every character's visible hands are furry animal paws with the same fur "
+                "colour as the rest of that character, never human fingers or human skin.")
+    return ""
+
+
+def _paws_only_clause(shot, chars):
+    """极近景（不露脸）的白名单句：只允许爪子/前臂/道具入画。
+
+    🔴 坑（实测 ep05 S06）：这一镜的设计是「特写挖土，只露两只爪子」，
+       但 skill 自动追加的「Headcount exactly 2, these are the only bodies visible」
+       + 「两人相对而立、视线交汇」把构图顶成了站立双人镜。
+       修法：shot.no_faces = true 时，走这一套极近景白名单——
+       不喂人脸参考图（没有脸要锁）、不追加站位句、只声明爪子不许变成人手。
+    """
+    cast = [c for c in (shot.get("cast") or []) if c]
+    humans, animals = [], []
+    for name in cast:
+        c = (chars or {}).get(name) or {}
+        dsc = (c.get("desc_en") or c.get("desc") or "").strip()
+        if dsc and _is_human_character(dsc):
+            humans.append(name)
+        else:
+            animals.append(name)
+    if humans and animals:
+        hand_rule = ("The %s contribute furry animal paws with the same fur colour as the rest of "
+                     "that character; the %s contribute human hands with human fingers and human "
+                     "skin. The two kinds of hands must not be mixed up."
+                     % (" and ".join(animals), " and ".join(humans)))
+    elif humans:
+        hand_rule = ("Every visible hand is a human hand with human fingers and human skin, "
+                     "never paws, never fur.")
+    else:
+        hand_rule = ("Every visible hand is a furry animal paw with the same fur colour as the "
+                     "rest of that character, never human fingers or human skin.")
+    return (" Extreme close-up on the ground: the frame contains ONLY furry paws, forearms, "
+            "freshly dug plants, dark soil and grass. No faces, no heads, no full bodies, "
+            "no torsos and no background people are visible in this frame — the camera is "
+            "close to the ground and the subjects are cropped at the wrist and the elbow. "
+            + hand_rule)
+
+
 def _position_clause(shot):
     """人物站位兜底：提示词没写左右，就按 cast 顺序补一句。
 
@@ -3036,16 +3396,29 @@ def _position_clause(shot):
     """
     prompt = (shot.get("frame") or {}).get("prompt") or ""
     low = prompt.lower()
-    if any(k in low for k in ("left third", "right third", "on the left", "on the right",
-                              "left side of frame", "right side of frame",
-                              "in the left", "in the right", "left third of", "right third of")):
-        return ""
+    has_staging = any(k in low for k in ("left third", "right third", "on the left", "on the right",
+                                         "left side of frame", "right side of frame",
+                                         "in the left", "in the right", "left third of", "right third of"))
     cast = shot.get("cast") or [shot.get("char")]
     cast = [c for c in cast if c]
     if len(cast) >= 2:
+        # 🔴 对话镜必须写清「两人相对、视线交汇」（实测 ep03 踩过）。
+        #    只写左右站位的话，模型会把两个人都摆成侧对镜头、面朝观众，
+        #    于是「猫哥要帮大爷」这种戏看着像两个人在各自看风景。
+        #    所以：站位写过就只补「相对而立」这段，没写过才连站位一起补。
+        facing = (" The two characters face each other in a natural three-quarter profile: "
+                  "the nearer shoulder of each character points toward the other, "
+                  "their eyes meet on each other's face, and neither one looks at the camera. "
+                  "They are clearly engaged in a conversation, not standing side by side.")
+        if has_staging:
+            return (" Composition: the two characters are staged on opposite sides of the frame "
+                    "at the same distance from the lens, camera on one side of the axis only — "
+                    "do not cross the line or mirror the staging." + facing)
         return (" Composition: %s is placed on the LEFT third of the frame, %s on the RIGHT third, "
                 "both at the same distance from the lens, camera on one side of the axis only — "
-                "do not cross the line or mirror the staging." % (cast[0], cast[1]))
+                "do not cross the line or mirror the staging." % (cast[0], cast[1]) + facing)
+    if has_staging:
+        return ""
     if cast:
         return (" Composition: %s is placed slightly LEFT of centre, angled into the frame with empty space "
                 "in the direction of their gaze; camera at eye level." % cast[0])
@@ -3075,10 +3448,62 @@ def _cast_clause(shot, chars):
             parts.append("%d) %s (%s), wearing exactly: %s" % (i, name, who, outfit))
         else:
             parts.append("%d) %s (%s)" % (i, name, who))
+    # shot.extras：没有参考图的临时角色（客人、路人）。
+    # 🔴 坑（实测 ep02 S06）：只写 prompt 说“四个角色”，但白名单句里只列了两只猫
+    #    并声明“these are the only bodies visible”，模型就把客人全删了 —— 提示词自相矛盾，
+    #    白名单那句赢了。所以额外角色必须也进白名单，人数也要算进 headcount。
+    extras = shot.get("extras") or []
+    extra_parts = []
+    extra_count = 0
+    for i, ex in enumerate(extras, 1):
+        if isinstance(ex, dict):
+            desc = (ex.get("desc") or "").strip()
+            n = int(ex.get("count") or 1)
+        else:
+            desc = str(ex).strip()
+            n = 1
+        if not desc:
+            continue
+        extra_count += n
+        extra_parts.append("%d) %s" % (len(parts) + i, desc))
+    allbodies = parts + extra_parts
     return (" Headcount in this frame is exactly %d, and these are the only bodies visible: %s. "
-            "Every other seat, the aisle behind them, the doorway and the window are empty space. "
+            "Every other seat, the aisle behind them and the rest of the room is empty space. "
             "Their outfits are fixed for the whole film and match the character reference exactly."
-            % (len(parts), " ".join(parts)))
+            % (len(parts) + extra_count, " ".join(allbodies)))
+
+def _human_cast_clause(shot, chars):
+    """真人角色的**定性句**：明确「这些是人，不是兽」。
+
+    🔴 坑（实测 ep05 S18）：世界观锚里有一句通用描述
+       "a cartoon animal with a full furry animal head, a furry muzzle and snout…"
+       —— 它描述的是这个世界里的**动物居民**，但当一镜里全是真人时（老乡夫妇），
+       模型会把这句通用描述套到画面主体身上，把两位老乡画成狐狸脸/狗脸的兽脸。
+       修法：真人角色逐个点名定性，把「人」和「兽」在提示词里彻底分开。
+    """
+    cast = shot.get("cast") or ([shot.get("char")] if shot.get("char") else [])
+    humans = []
+    for name in cast:
+        c = (chars or {}).get(name) or {}
+        d = (c.get("desc_en") or c.get("desc") or "").strip()
+        if d and _is_human_character(d):
+            humans.append((name, d))
+    if not humans:
+        return ""
+    parts = []
+    for name, d in humans:
+        parts.append("%s (%s)" % (name, d))
+    return (" Cast separation for this frame: %s. Each of them is a REAL HUMAN PERSON: "
+            "a human face with human eyes, human nose and human lips, human skin with no fur "
+            "anywhere on the head or body, human hair or a human headscarf, human ears, "
+            "NO animal muzzle, NO snout, NO whiskers, NO fur, NO tail, NO animal ears, "
+            "NO paws. Their visible hands are human hands with human fingers and human skin. "
+            "Do not draw them as anthropomorphic animals and do not give them any animal "
+            "feature whatsoever. The generic animal description that describes the animal "
+            "inhabitants of this world applies only to the animal characters in this frame, "
+            "never to these human people."
+            % "; ".join(parts))
+
 
 def _frame_for_shot(cfg, paths, shot, exe, chars=None, dry=False):
     sid = shot["id"]
@@ -3129,33 +3554,114 @@ def _frame_for_shot(cfg, paths, shot, exe, chars=None, dry=False):
     if not is_empty_gen:
         if "identity drift" not in prompt.lower():
             prompt += FACE_LOCK
+        # 🔴 旧守卫：提示词里已经写了 anthropomorphic animal / east asian 就别再叠加，
+        #    否则「All characters are East Asian Chinese…」会把猫拉回人样长人类五官。
         if "east asian" not in prompt.lower() and "anthropomorphic animal" not in prompt.lower():
             prompt += character_type_clause(cfg, paths)
-    # 人物白名单 + 服装锁
-    if not is_empty_gen:
-        prompt += _cast_clause(shot, chars or {})
-        prompt += _position_clause(shot)
-    # 室内镜头不要飘到街上（模型很容易把“面馆”画成灯笼街）
-    if (shot.get("scene") or {}).get("interior", True):
-        # 注意：这里不能写死 "the shop"——公寓、卧室这种内景会被推成店铺。
-        where = ((shot.get("scene") or {}).get("place") or "").strip() or "this interior"
-        prompt += (" This frame is INSIDE (%s): no street, no sidewalk, no outdoor view as the main "
-                   "background, no hanging lanterns, no shop sign, no passers-by." % where)
-
-    # shot.faces：只把“画面里真露脸”的角色参考图喂进去。过肩镜头前景那人背对镜头，
-    # 喂了他的脸就会被复制成第二个人（实测事故），所以允许按镜收窄。
+        # 🔴 真人保险（ep05 S18 事故修复）：这一镜里有真人时，必须加 ANTHROPOMORPHIC 句，
+        #    它里面那句 "A character explicitly described as a human being is a real human…"
+        #    是「真人邻居不被兽化」的唯一保险。
+        #    注意：不能用 is_animal_project() 判断——不少项目（如 ep05）没在 project.json
+        #    里写 character_type，但它确实是拟人动物项目；这里改用「这一镜有没有真人」
+        #    来决定，且只在**确实缺这句**时才补，避免重复。
+        if (not is_empty_gen and chars and _human_cast_clause(shot, chars)
+                and "keep the two kinds of character visually distinct" not in prompt.lower()):
+            prompt += ANTHROPOMORPHIC
+    # 参考图收集（**必须在人物白名单之前**——白名单那段的绑定声明要用到 ref_bind）
+    # 🔴 shot.no_faces=true（极近景，不露脸）：不喂人脸参考图。
+    #    没有脸要锁，喂了反而会把模型往「半身/全身人物照」上带，
+    #    把「只露爪子的特写」顶成站立人物镜（实测 ep05 S06）。
+    no_faces = bool(shot.get("no_faces"))
     face_cast = shot.get("faces") or shot.get("cast") or [cname]
     ang = (shot.get("angle") or "").strip()
     refs = []
-    if not is_empty_gen:
+    ref_bind = []          # [(角色名, 参考图路径)]，用于在提示词里绑定「哪张脸是谁」
+    if not is_empty_gen and not no_faces:
         for n in face_cast:
             # 按机位取对应角度的参考图：侧面机位喂侧脸、背面机位喂背影，
             # 没裁出来或机位不明确就回落到 face_ref.jpg（最稳）。
             p = view_for_angle(paths, n, ang)
             if p and os.path.exists(p):
                 refs.append(p)
+                ref_bind.append((n, p))
         if not refs:
             refs = [face_ref]
+            ref_bind.append((cname, face_ref))
+
+    # 人物白名单 + 服装锁
+    if not is_empty_gen and no_faces:
+        # 极近景分支：只声明爪子/前臂入画，不追加人数白名单和两人站位。
+        prompt += _paws_only_clause(shot, chars or {})
+    elif not is_empty_gen:
+        prompt += _cast_clause(shot, chars or {})
+        prompt += _position_clause(shot)
+        # 🔴 真人定性句（ep05 S18 事故修复）：画面里有真人时必须逐个点名，
+        #    否则世界观锚里的通用动物描述会把真人画成兽脸。
+        prompt += _human_cast_clause(shot, chars or {})
+        # 🔴 双人同框时，模型会把两张脸"平均"——猫哥的海豹重点色深褐面罩
+        #    被浅色脸的阿姨冲淡，出成白脸带褐斑（ep04 S05/S06 真实事故）。
+        #    原因：喂了两张 face_ref，但提示词没说"哪张图对应画面里哪个人"。
+        #    修法：显式绑定 + 重复每个角色的辨识特征 + 强调互不相同的配色。
+        if len(ref_bind) >= 2:
+            names = [n for n, _ in ref_bind]
+            prompt += (" Reference photo %d is the face of %s; reference photo %d is the face of %s. "
+                       "Do not blend the two faces together and do not average their colouring — "
+                       "each character keeps its own exact face, its own fur colouring and its own "
+                       "eye colour, with no shared markings between them."
+                       % (1, names[0], 2, names[1]))
+            for i, (n, _) in enumerate(ref_bind, 1):
+                c = (chars or {}).get(n) or {}
+                desc = (c.get("desc_en") or "").strip()
+                if desc:
+                    prompt += (" %s: %s" % (n, desc))
+            # 动物角色的手必须是爪子，不能退回人类手（ep04 S23 真实事故）
+            # 🔴 坑（实测 ep05 S18）：这句原本**无条件**追加，但画面里可能有真人
+            #    （老乡夫妇）。「Every character's hands are paws」会和真人声明
+            #    「human hands with human fingers」直接打架，模型两边各取一半，
+            #    结果把祥婶和老乡画成了兽脸（真人邻居被兽化）。
+            #    修法：按角色分开声明——动物说爪子，真人说人手；全是动物才用原句。
+            prompt += _paws_clause(shot, chars or {})
+    # 室内镜头不要飘到街上（模型很容易把“面馆”画成灯笼街）
+    if (shot.get("scene") or {}).get("interior", True):
+        # 注意：这里不能写死 "the shop"——公寓、卧室这种内景会被推成店铺。
+        # 🔴 这里必须用**纯正向**描述：写 "no hanging lanterns" 这类否定句，
+        #    等于把「灯笼」这个概念喂给模型，反而会招来日式圆灯笼（实测反复出现）。
+        # 🔴 陈设一律取该场景自己的 `scene.set`，**不要在这里硬写**。
+        #    之前硬写了「刷金属吊灯 + 白墙纸条」，套到菜市场/后厨上就成了串味
+        #    （ep04 菜市场首帧里冒出来米面馆的吊灯和手写纸条）。
+        sc = shot.get("scene") or {}
+        where = (sc.get("place") or "").strip() or "this interior"
+        detail = ""
+        st = sc.get("set") or []
+        if st:
+            detail = (" Visible in this interior, from the location's own furnishings: "
+                      + "; ".join(str(x).rstrip(".") for x in st[:8]) + ".")
+        prompt += (" This frame is set entirely inside %s. Everything visible in frame belongs to this "
+                   "same location — no other room, no street outside, no different venue.%s"
+                   % (where, detail))
+
+    # shot.faces / 参考图收集：已在上面（人物白名单之前）完成，
+    # 因为白名单里的「哪张脸是谁」绑定声明要用到 ref_bind。
+
+    # 🔴 道具参考图（shot.props）：菜品/食材类镜头必须喂。
+    #   文字描述再准，模型也画不准中国地方菜（鲊广椒这种金黄颗粒裹红辣椒的东西，
+    #   纯靠文字会画成一堆鲜辣椒或深红褐色膏体）。一张真实参考图顶十句描述。
+    prop_refs = []
+    for pn in (shot.get("props") or []):
+        pp = os.path.join(paths["props"], str(pn) + ".jpg")
+        if os.path.exists(pp):
+            prop_refs.append((str(pn), pp))
+    if prop_refs:
+        for pn, pp in prop_refs:
+            refs.append(pp)
+        # 🔴 编号要接着人脸图往后数，不能从 1 开始——
+        #    人脸绑定声明已经用了「Reference photo 1 / 2」，重复编号会让模型混乱。
+        base = len(ref_bind)
+        prop_desc = " ".join(
+            "Reference photo %d is a close-up of %s itself — the actual food, correctly coloured "
+            "and correctly textured. Reproduce its exact colour and texture in this frame."
+            % (base + i + 1, pn) for i, (pn, _) in enumerate(prop_refs))
+        prompt += " " + prop_desc
 
     # shot.no_plate=true：极近景时不给场景板。板是中景，模型会照抄它的构图，压不住景别。
     plate = None if shot.get("no_plate") else plate_for(paths, shot)
@@ -3290,9 +3796,12 @@ def _submit_one(cfg, task, force_tier=None, force_max_attempts=None):
 def do_videos(cfg, paths, only=None, force=False, wait=False, allow_partial=False):
     require_video_agnes_creds(cfg)
     a = cfg["agnes"]
-    shots = load_json(paths["shots"])["shots"]
+    story = load_json(paths["shots"])
+    shots = story["shots"]
     if not shots:
         die("script/shots.json 里没有镜头")
+    # 真人锁定要用：判断这一镜里哪些角色是「人」，视频提示词据此声明。
+    chars = {c.get("name"): c for c in (story.get("characters") or [])}
     only_set = set(only.split(",")) if only else None
 
     tasks = []
@@ -3315,6 +3824,19 @@ def do_videos(cfg, paths, only=None, force=False, wait=False, allow_partial=Fals
         prompt = (shot.get("video_prompt") or "").strip()
         if not prompt:
             die("%s 缺 video_prompt" % sid)
+        # 🔴 视频提示词也要锁真人（ep05 S18 事故）：
+        #    首帧画对了不代表视频里不会被兽化——视频模型是另一条独立生成链，
+        #    它只看到首帧图 + 文字，文字不写「这是人」，它就按世界观里的动物套。
+        #    所以镜头里有真人时，视频提示词必须再声明一次。
+        if chars and _human_cast_clause(shot, chars):
+            prompt += " " + _human_cast_clause(shot, chars)
+        # 🔴 极近景不露脸（ep05 S06）：视频模型容易在运动中把人「带进画」——
+        #    首帧只有爪子，运镜一推就可能拉出半张脸。
+        #    视频提示词也要钉死「全程不露脸」。
+        if shot.get("no_faces"):
+            prompt += (" The camera stays in an extreme close-up on the paws, the soil and the plants "
+                       "for the whole shot. No face, no head and no body ever enters the frame; "
+                       "the subjects stay cropped at the wrist and the elbow throughout.")
         link = (shot.get("link") or "").strip().lower()
         prev_clip = None
         if link in ("prev", "tail", "prev-tail", "prev_tail") and idx > 0:
@@ -4266,13 +4788,22 @@ def _xfade_chain(exe, clips, durs, trans, kinds, dst, with_audio=False, crop_bot
     parts = []
     prev = "[0:v]"
     L = float(durs[0])
+    # 🔴 xfade 的 offset 必须留出至少一帧的余量（实测 ep03 踩过）。
+    #    现象：offset + duration 正好等于前一段时长时，xfade 会**静默截断整条链**——
+    #    10 段拼出来只有 7.33 秒（只剩第 3 段），ffmpeg 退出码还是 0，不报错。
+    #    根因：容器时长是「帧数 / 帧率」的近似值，offset 用四舍五入的时长算出来
+    #    会比真实末帧时间戳晚一点点，xfade 找不到重叠区就退化成「只取后一段」。
+    #    修法：offset 减一帧（1/24 秒）留安全边，并按 offset 后的真实长度累加 L，
+    #    避免误差一路累积到后面几段。
+    FRAME = 1.0 / 24.0
     for i in range(1, len(clips)):
         d = float(trans[i])
         out = "[v%d]" % i
-        parts.append("%s[%d:v]xfade=transition=%s:duration=%.3f:offset=%.3f%s"
-                     % (prev, i, kinds[i], d, max(0.0, L - d), out))
+        off = max(0.0, L - d - FRAME)
+        parts.append("%s[%d:v]xfade=transition=%s:duration=%.3f:offset=%.4f%s"
+                     % (prev, i, kinds[i], d, off, out))
         prev = out
-        L = L + float(durs[i]) - d
+        L = off + float(durs[i])
     # 底部裁切：xfade 链之后再裁，避免每段裁切导致尺寸不一致
     if crop_bottom and crop_bottom > 0:
         parts.append("%scrop=iw:ih-%d,setsar=1[vc]" % (prev, int(crop_bottom)))
@@ -4460,13 +4991,23 @@ def collect_sfx(paths, entries, exe=None):
                 except Exception as ex:
                     warn("%s 音效 %s 合成失败：%s" % (e["shot"]["id"], kind, ex))
                     continue
+            # 🔴 字段名兼容（实测 ep04/ep05 全部音效都被压成默认 -12dB）：
+            #    镜头表里写的是 `gain_db`，而这里只读 `gain`，
+            #    读不到就静默落到默认值 -12——**所有音效力度全废**，
+            #    而且不报错，很难发现（成片照常出，只是炒菜声、火焰声都不够响）。
+            #    现在两种名字都认，`gain_db` 优先。
+            g = c.get("gain_db")
+            if g is None:
+                g = c.get("gain")
+            if g is None:
+                g = -12
             cues.append({
                 "path": dst,
                 "kind": kind,
                 "shot": e["shot"]["id"],
                 "start": max(0.0, e["start"] + float(c.get("at", 0.0))),
-                "gain": db_to_gain(c.get("gain", -12)),
-                "gain_db": float(c.get("gain", -12)),
+                "gain": db_to_gain(g),
+                "gain_db": float(g),
             })
     return cues
 
@@ -4561,7 +5102,7 @@ def _clip_mean_db(exe, path, cache=None):
 
 
 def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, tighten=True,
-                crop_bottom=0):
+                crop_bottom=0, native_voice=False, out_name=None):
     exe = have_ffmpeg(cfg)
     if not exe:
         die("找不到 ffmpeg（装 imageio-ffmpeg 或配置 ffmpeg 路径）")
@@ -4655,14 +5196,20 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
                          "-movflags", "+faststart", dst])
             work[i] = dst
             entries[i]["duration"] = ff_duration(dst, exe)
-        _xfade_chain(exe, work, [e["duration"] for e in entries], trans, kinds, video_only,
-                     with_audio=all_audio, crop_bottom=crop_bottom)
+        real_len = _xfade_chain(exe, work, [e["duration"] for e in entries], trans, kinds, video_only,
+                                with_audio=all_audio, crop_bottom=crop_bottom)
+        # 每段的起点 = 它在 xfade 链里的实际起点。
+        # 🔴 必须跟 _xfade_chain 里的 offset 算法一致（offset = L - d - 一帧），
+        #    否则字幕/音效的时间轴会和画面对不上（差几帧到零点几秒）。
         starts = [0.0]
+        L = float(entries[0]["duration"])
         for i in range(1, len(entries)):
-            starts.append(starts[i - 1] + entries[i - 1]["duration"] - trans[i])
+            off = max(0.0, L - trans[i] - 1.0 / 24.0)
+            starts.append(off)
+            L = off + float(entries[i]["duration"])
         for e, s in zip(entries, starts):
             e["start"] = s
-        total = sum(e["duration"] for e in entries) - sum(trans[1:])
+        total = real_len if real_len else (sum(e["duration"] for e in entries) - sum(trans[1:]))
         info("转场后总时长 %.2f 秒（原 %.2f）" % (total, sum(e["duration"] for e in entries)))
         if not all_audio:
             has_audio = [False] * len(entries)
@@ -4744,10 +5291,16 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
         tts_full = bool(vo_map) and all(
             os.path.exists(os.path.join(paths["audio"], "vo", e["shot"]["id"] + ".mp3"))
             for e in line_shots)
-        amb_vol = 0.22 if tts_full else (0.82 if bgm_idx is not None else 1.0)
-        # 双人对白集：模型会在「她开口说话」的镜头里自己念英文（训练偏英语），
-        # 压到 0.22 还是听得见。凡是有台词、而且已经配好 TTS 的镜头，把原声整段静音，
-        # 只留其余镜头的环境底噪。project.json audio.mute_native_on_dialogue=false 可关。
+        # 🔴 原声模式（--native-voice）：不用 TTS，模型自己念的台词就是正片声音。
+        #     这时原声是**主角**，音量给足（1.0），配乐要给它让路。
+        if native_voice:
+            amb_vol = 1.0
+        else:
+            amb_vol = 0.22 if tts_full else (0.82 if bgm_idx is not None else 1.0)
+        # 双人对白集：模型在「角色开口说话」的镜头里会**自己念中文台词**（ep01/ep02/ep03 实测确认）。
+        # TTS 模式下会把这些镜的原声压到 0.10，避免跟 TTS 撞声；
+        # 原声模式（--native-voice）下不压，一镜都不静音。
+        # project.json audio.mute_native_on_dialogue=false 可关。
         amb_chain = "[0:a]volume=%.2f" % amb_vol
         mute_on_dlg = True
         try:
@@ -4755,7 +5308,8 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
         except Exception:
             pass
         muted = []
-        if tts_full and mute_on_dlg:
+        # 🔴 原声模式：模型自己念的台词就是正片声音，一镜都不能静音。
+        if tts_full and mute_on_dlg and not native_voice:
             for e in entries:
                 sid = e["shot"]["id"]
                 if not (e["shot"].get("line") or "").strip():
@@ -4772,7 +5326,7 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
                 amb_chain += ",volume=0.10:enable='between(t,%.3f,%.3f)'" % (a0, b0)
                 muted.append("%s(%.0fdB)" % (sid, lvl))
         if muted:
-            info("压低原声 %d 镜（模型自念英文）：%s" % (len(muted), "、".join(muted)))
+            info("压低原声 %d 镜（有台词，已配 TTS）：%s" % (len(muted), "、".join(muted)))
         parts.append(amb_chain + "[amb]")
         labels.append("[amb]")
     if bgm_idx is not None:
@@ -4785,7 +5339,13 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
             parts.extend(chain)
         else:
             parts.append("[%d:a]atrim=0:%.3f,apad,volume=0.85[mus]" % (bgm_idx, total))
-        labels.append("[mus]")
+        # 🔴 原声模式：配乐是背景，要给模型的人声让路 —— 整体压到 45%。
+        #     TTS 模式下配乐是主角（人声是 TTS，混音平衡已调好），不压。
+        if native_voice:
+            parts.append("[mus]volume=0.45[musv]")
+            labels.append("[musv]")
+        else:
+            labels.append("[mus]")
     vol = float((cfg.get("voices") or {}).get("volume", 1.6))
     for i, (vi, start) in enumerate(vo_inputs):
         ms = int(round((start + 0.3) * 1000))
@@ -4812,7 +5372,42 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
 
     sub_path = None
     subs_override = os.path.join(paths["out"], "_subs_override.ass")
-    if use_subs and any(e["shot"].get("subs") for e in entries):
+    if use_subs and native_voice:
+        # 🔴 原声模式：字幕必须对齐**模型原声**的人声位置，跟 TTS 时间轴没关系。
+        #     镜头表里的 subs.t 是按 TTS 排的，直接用会整体错位。
+        #     做法：VAD 逐镜测原声人声区间 → 字幕贴上去；
+        #     模型没出声的镜（比如只有笑声）就退回镜头表里的 subs.t。
+        timed = []
+        for e in entries:
+            sid = e["shot"]["id"]
+            line = (e["shot"].get("line") or "").strip()
+            if not line:
+                continue
+            segs = detect_speech(cfg, e["clip"], exe) if ff_has_audio(e["clip"], exe) else []
+            if segs:
+                merged = [list(segs[0])]
+                for a, b in segs[1:]:
+                    if a - merged[-1][1] < 0.6:
+                        merged[-1][1] = b
+                    else:
+                        merged.append([a, b])
+                a, b = max(merged, key=lambda x: x[1] - x[0])
+                start = e["start"] + max(0.0, a - 0.15)
+                end = min(e["start"] + e["duration"] - 0.05, e["start"] + b + 0.45)
+                timed.append((e["shot"], start, end))
+                info("%s 原声人声 %.2f-%.2fs，字幕已对齐" % (sid, a, b))
+            else:
+                subs = e["shot"].get("subs") or []
+                if subs:
+                    s0 = float(subs[0].get("t", 0.0))
+                    d0 = float(subs[0].get("d", 2.0))
+                    timed.append((e["shot"], e["start"] + s0, e["start"] + s0 + d0))
+                    info("%s 原声无人声，字幕用镜头表时间轴" % sid)
+                else:
+                    info("%s 原声无人声且无字幕时间轴，跳过" % sid)
+        if timed:
+            sub_path = write_subs(cfg, paths, timed)
+    elif use_subs and any(e["shot"].get("subs") for e in entries):
         # 镜头表里写了逐句字幕：按时间轴自动生成，长句自动切成两条单排
         sub_path = write_shot_subs(paths, entries,
                                    margin_v=max(60, 150 - int(crop_bottom or 0)))
@@ -4859,7 +5454,8 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
         # 用真实文件名（外部覆盖时是 _subs_override.ass），否则滤镜会烧到旧字幕
         parts.append("[0:v]ass=%s[vout]" % os.path.basename(sub_path))
 
-    final = os.path.join(paths["out"], "final.mp4")
+    final = os.path.join(paths["out"], (out_name or "final.mp4"))
+    out_base = os.path.basename(final)
 
     def render(burn):
         # 滤镜图很长（51 镜 = 50+ 个配音/音效输入 + 36 段配乐），
@@ -4875,7 +5471,7 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
             cmd += ["-c:v", "libx264", "-crf", "20", "-preset", "veryfast", "-pix_fmt", "yuv420p"]
         else:
             cmd += ["-c:v", "copy"]
-        cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", "final.mp4"]
+        cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", out_base]
         try:
             ff_run(exe, cmd, cwd=paths["out"])
         finally:
@@ -4905,7 +5501,14 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
     if os.path.isdir(norm_dir):
         shutil.rmtree(norm_dir, ignore_errors=True)
     normalize_loudness(final, exe)
-    info("成片 -> out/final.mp4  (%.1f MB, %.1fs)" % (os.path.getsize(final) / 1e6, total))
+    # 🔴 成片时长自检：ffmpeg 有些滤镜失败是**静默**的（退出码 0，但输出只剩一段）。
+    #    ep03 实测踩过：10 段 xfade 拼出来只有 7.33 秒，日志还报「转场后总时长 57.96 秒」，
+    #    不自己量一下就会把 7 秒的废片当正片交付。
+    real = ff_duration(final, exe)
+    if total > 1.0 and real < total * 0.85:
+        die("成片时长异常：应为 %.1fs，实际只有 %.1fs（%.0f%%）。"
+            "多半是 xfade/滤镜链静默截断了，检查各片段尺寸帧率是否一致。" % (total, real, real / total * 100))
+    info("成片 -> out/%s  (%.1f MB, %.1fs)" % (out_base, os.path.getsize(final) / 1e6, real or total))
     return final
 
 
@@ -4914,7 +5517,9 @@ def cmd_assemble(args):
     do_assemble(cfg, paths, use_subs=args.subs, use_voice=args.voice,
                 transition=getattr(args, "transition", None),
                 tighten=not getattr(args, "no_tighten", False),
-                crop_bottom=int(getattr(args, "crop_bottom", 0) or 0))
+                crop_bottom=int(getattr(args, "crop_bottom", 0) or 0),
+                native_voice=bool(getattr(args, "native_voice", False)),
+                out_name=getattr(args, "out", None))
 
 
 def cmd_seam(args):
@@ -5010,6 +5615,7 @@ def do_audit(cfg, paths):
     shots = load_json(paths["shots"])["shots"]
     rows = []
     issues = []
+    notes = []          # 提示（不是缺陷），不进问题计数
     total_planned = 0
     total_actual = 0.0
     image_count = 0
@@ -5060,11 +5666,25 @@ def do_audit(cfg, paths):
             # ⚠ 「开口太晚」只在**这一镜确实有台词**时才检查。
             # 无台词的镜头里，VAD 会把风声、远处车声、鸟叫检成人声 ——
             # 拿它当台词时间去报「台词到 5.5s 才开口」是纯误报（实测踩过）。
+            # 🔴 而且这条**只是提示**，不是缺陷：assemble 阶段本来就会按人声
+            #    自动收紧（砍掉开口前的空等），所以报出来等于重复提醒、
+            #    还让人以为成片有问题。降级成「提示」区，不进问题计数。
             if rec["line"] and rec["speech"] and d > 0 and rec["speech"][0][0] > 0.45 * d and not is_vo:
-                issues.append("%s 台词到 %.1fs 才开口（占 %.0f%%），前段空等，合成前建议收紧"
-                              % (sid, rec["speech"][0][0], 100.0 * rec["speech"][0][0] / d))
-            if rec["res"] and rec["res"] not in ("704x1280", "720x1280"):
-                issues.append("%s 分辨率 %s 与竖屏 720P 预期不符" % (sid, rec["res"]))
+                notes.append("%s 台词到 %.1fs 才开口（占 %.0f%%），合成时已按人声自动收紧"
+                             % (sid, rec["speech"][0][0], 100.0 * rec["speech"][0][0] / d))
+            # 🔴 分辨率白名单：Agnes 视频模型实际会出 **720x1080**（不是 720x1280），
+            #    竖屏 9:16 的合法宽高组合有多个，旧白名单只认 704x1280/720x1280，
+            #    于是每一镜都报「与竖屏 720P 预期不符」——22 镜 22 条纯误报。
+            #    现在按「竖屏 + 宽高比接近 9:16」来判断，不再拿固定像素串比对。
+            if rec["res"]:
+                try:
+                    ww, hh = (int(x) for x in rec["res"].split("x"))
+                    portrait = hh > ww
+                    ratio_ok = hh > 0 and 0.5 <= (ww / float(hh)) <= 0.72
+                    if not (portrait and ratio_ok):
+                        issues.append("%s 分辨率 %s 不是竖屏 9:16" % (sid, rec["res"]))
+                except Exception:
+                    pass
         else:
             issues.append("%s 缺视频片段" % sid)
         rows.append(rec)
@@ -5074,11 +5694,26 @@ def do_audit(cfg, paths):
     for name in all_char_names(paths):
         cdir = char_dir(paths, name)
         if os.path.isdir(cdir):
+            # 🔴 三视图可能在**共享角色库**里（本集目录没有但 cast/ 里有）。
+            #    系列剧里角色都是复用的，只查本集目录会把所有复用角色
+            #    都误报成「缺三视图」（实测 ep05 报了 maoge/maosao/daye 三个）。
+            #    另外：只要有**角度图**（views/front.jpg 等）就说明角色资产是齐的——
+            #    turnaround.jpg 是可选的设定稿，不是必需产物，不该当成缺陷。
+            ta = os.path.join(cdir, "turnaround.jpg")
+            views_ok = False
+            for alt in _cast_char_dirs(paths):
+                cand = os.path.join(alt, name, "turnaround.jpg")
+                if os.path.exists(cand):
+                    ta = cand
+                    break
+                vdir = os.path.join(alt, name, "views")
+                if os.path.isdir(vdir) and any(f.lower().endswith(".jpg") for f in os.listdir(vdir)):
+                    views_ok = True
             c = {
                 "name": name,
                 "source": os.path.exists(os.path.join(cdir, "source.jpg")),
                 "face_ref": os.path.exists(os.path.join(cdir, "face_ref.jpg")),
-                "turnaround": os.path.exists(os.path.join(cdir, "turnaround.jpg")),
+                "turnaround": os.path.exists(ta) or views_ok,
             }
             if not c["turnaround"]:
                 issues.append("角色 %s 缺三视图" % name)
@@ -5094,9 +5729,16 @@ def do_audit(cfg, paths):
     frames_done = sum(1 for r in rows if r["frame"])
     speech_done = sum(1 for r in rows if r["speech"])
     dialogue = sum(1 for r in rows if r["line"])
+    # 🔴 成片检查：只认 out/final.mp4 的话，用 --out 命名成别的（比如
+    #    final-native.mp4 / final-tts.mp4）就全报「还没有成片」。
+    #    现在扫 out/ 下所有成片（final*.mp4），报告里列出实际文件名。
+    out_files = []
+    if os.path.isdir(paths["out"]):
+        out_files = sorted(f for f in os.listdir(paths["out"])
+                           if f.lower().endswith(".mp4") and not f.startswith("_"))
     final = os.path.join(paths["out"], "final.mp4")
     final_ok = os.path.exists(final)
-    if not final_ok:
+    if not final_ok and not out_files:
         issues.append("还没有成片 out/final.mp4")
 
     video_cost = total_actual * 0.025
@@ -5121,7 +5763,9 @@ def do_audit(cfg, paths):
     md.append("| 场景扩写 + 场景图 | `ac.py scene-gen` | `assets/scenes/` | %d/%d 个场景 |" % (scenes_done, len(plate_keys)))
     md.append("| 首帧图 | `ac.py frame` | `frames/` | %d/%d |" % (frames_done, len(rows)))
     md.append("| 视频 | `ac.py video` | `clips/` | %d/%d |" % (clips_done, len(rows)))
-    md.append("| 合成 | `ac.py assemble` | `out/final.mp4` | %s |" % ("OK" if final_ok else "未完成"))
+    md.append("| 合成 | `ac.py assemble` | `out/%s` | %s |"
+              % (("、".join(out_files) if out_files else "final.mp4"),
+                 "OK" if (final_ok or out_files) else "未完成"))
     md.append("")
     md.append("## 二、资产清单")
     md.append("")
@@ -5196,6 +5840,12 @@ def do_audit(cfg, paths):
             md.append("- " + x)
     else:
         md.append("全部检查项通过：场景图、首帧、片段、分辨率、音轨、人声均正常。")
+    if notes:
+        md.append("")
+        md.append("### 提示（不影响成片）")
+        md.append("")
+        for x in notes:
+            md.append("- " + x)
     md.append("")
     md.append("## 五、成本估算")
     md.append("")
@@ -5230,6 +5880,738 @@ def do_audit(cfg, paths):
 def cmd_audit(args):
     cfg, paths = load_project(args.dir)
     do_audit(cfg, paths)
+
+
+# ----------------------------------------------------------------------------- check（剧本逻辑自检）
+
+# 转折镜前必须出现的线索词——用来自动提示「转折缺铺垫」
+TURN_HINTS = {
+    "和解": ("犹豫", "松口", "心软", "道歉", "低头", "眼眶", "手", "看", "沉默", "收起", "放下"),
+    "真相": ("不对劲", "细节", "奇怪", "异样", "偷偷", "藏", "假的", "其实是", "露出"),
+    "身份": ("说辞", "借口", "遮", "挡", "躲", "谎", "假装", "掩"),
+    "反败为胜": ("被压", "欺负", "抢", "夺", "落后", "缺", "资源", "但是", "却"),
+}
+
+# 结尾高潮的动作词——末镜只有台词没有这些词，说明是平淡结尾
+ENDING_ACTION_WORDS = ("抱", "抓", "揪", "扇", "打", "扛", "抬", "扫", "泼", "浇",
+                       "挥", "推", "拉", "扔", "冲", "跪", "鞠躬", "按", "揉", "搓",
+                       "递", "塞", "接", "扶", "拍", "摸", "捏", "倒", "扑", "挤",
+                       "冲上", "跑", "跳", "转身", "回头")
+
+
+# ---------------------------------------------------------------- 问答闭环判定
+# 标点集合：观众念台词感受的是实词多少，标点不占时间。
+PUNCT = set(chr(c) for c in (0xff0c, 0x3002, 0xff01, 0xff1f, 0x3001, 0xff1b,
+                           0xff1a, 0x2026, 0x2014, 0x300c, 0x300d, 0xff08,
+                           0xff09, 0x2c, 0x2e, 0x21, 0x3f, 0x3b, 0x3a,
+                           0x28, 0x29, 0x20, 0x22, 0x201c, 0x201d, 0x2018, 0x2019))
+
+
+def _cn_bare(line):
+    """去掉标点和空格，只留实词——观众念台词感受的是这个长度。"""
+    return "".join(ch for ch in (line or "") if ch not in PUNCT)
+
+
+def _is_real_question(line):
+    """只认真问句：以问号结尾，或句尾带「吗/呢/?」这类疑问语气词。
+
+    句中带「谁/怎么」但其实是陈述的（"我怎么知道"）不算，避免误报。
+    """
+    l = (line or "").strip()
+    if not l:
+        return False
+    if l.endswith(("？", "?")):
+        return True
+    # 去掉省略号和语气词后的结尾判定
+    tail = l.rstrip("…").rstrip()
+    if tail.endswith(("吗", "呢")):
+        return True
+    # 结尾两字里出现疑问词（覆盖没标问号的写法）
+    return any(w in tail[-3:] for w in ("谁", "哪儿", "哪里", "为何", "多少"))
+
+
+def _is_answer_to(answer, question):
+    """判断 answer 是不是对 question 的回答（粗判：共享实词或属于应答套语）。
+
+    用于区分「同一个人下一镜在回答上一镜的问句」（合法）
+    与「同一个人下一镜在讲别的事」（问句悬空）。
+    """
+    a = (answer or "").strip()
+    if not a:
+        return False
+    # 常见的应答开头 / 短应答
+    # 「就配」「没错」「配得上」这类是把对方的命题接过来否定，属于标准应答
+    ACK = ("我", "就", "嗯", "是", "对", "好", "行", "在", "嗯嗯", "哈哈",
+           "没", "不", "您", "您呐", "您也", "没错", "当然", "未必", "就是",
+           "配", "能", "敢", "凭")
+    if a[:1] in ACK or a.startswith(("这样", "怎么", "咋")):
+        return True
+    # 共享 2 字词组即视为相关
+    STOP = ("您", "我", "他", "她", "这", "那", "什么", "怎么", "一个", "没有",
+            "不是", "就在", "已经", "正在", "一下", "一个")
+    aw = a
+    for st in STOP:
+        aw = aw.replace(st, " ")
+    qw = question
+    for st in STOP:
+        qw = qw.replace(st, " ")
+    kw = set()
+    for seg in aw.split():
+        for k in range(len(seg) - 1):
+            kw.add(seg[k:k + 2])
+    if not kw:
+        return False
+    return any(g in qw for g in kw)
+
+
+def _is_soft_new_topic(line):
+    """换人回答时，判断这句是否明显在讲别的事（用于给「观众能不能听出谁在答」提个醒）。"""
+    l = (line or "").strip()
+    if not l:
+        return True
+    # 以应答语开头，或很短（<=6 字）→ 大概率是在应答
+    if l[:1] in ("嗯", "是", "对", "好", "行", "在", "我", "就", "没", "不"):
+        return False
+    return len(l) > 10
+
+
+def _shot_text(s):
+    """这一镜的全部可读文本。
+
+    🔴 必须包含 frame.prompt（实测漏过）：
+    「界碑」这类**画面线索**是写在 frame.prompt 里的
+    （因为要真的画出来），只读 action/video_prompt 会漏掉，
+    导致「反派天降」检查失效。
+    """
+    fr = (s.get("frame") or {}).get("prompt") or ""
+    return " ".join([(s.get("action") or ""), (s.get("micro") or ""),
+                      (s.get("video_prompt") or ""), (s.get("line") or ""), fr])
+
+
+def _check_structural_holes(shots, issues, warns):
+    """🔴 结构级逻辑硬伤检查（ep05 实测，用户反馈「情节不顺畅」）。
+
+    之前 do_logic_check 只查**字段完整性**（because 有没有填、intensity 分布），
+    所以 ep05 全绿，但连起来看有三处硬伤：
+      ① **反派天降** —— 挖了 14 秒的菜，讹人的老乡才慢悠悠出现。
+         观众第一个问题是「他刚才在哪、怎么现在才发现」。
+      ② **问句和答句不是同一个问题** —— 问「一斤卖几个钱」，答「您尝尝值不值这个价」。
+         问的是价格，答的是好吃程度，老汉全程没答那句问。
+      ③ **突然离场又回来** —— 化解完了「端起锅就跑」，下一镜又坐回去吃饭。
+
+    这三条都会「逐镜看没问题、连起来看莫名其妙」，靠人眼看 22 镜很难不漏，
+    所以必须机器查。
+    """
+
+    # ---------- ① 反派天降：冲突方首次出现前，有没有交代过他的存在 ----------
+    # 判定：某个角色（尤其冲突方）首次出现在 N 镜，
+    #       检查他出现之前的 N-1 镜里有没有任何一句提到他（名字/身份/来由）。
+    # 「来由线索」专用词表：只认**归属/标记**类，
+    # 不能把「快步走」「赔钱」「谁让你们」算进来——
+    # 那是冲突**本身**的描述，不是「他为什么在这儿」的交代。
+    ORIGIN_HINTS = ("界碑", "石碑", "石牌", "石柱", "界石", "围栏", "栅栏",
+                     "标记", "木牌", "牌子", "从我家的", "守着的", "我家的地",
+                     "我家那片", "我家这坡", "是他们的", "是我家的", "这地是",
+                     "这块地是", "我们家", "我家地", "祖上的", "祖传的地")
+    CONFLICT_HINTS = ("讹", "找上门", "拦住去路", "拦下", "拦住了",
+                      "赔钱", "要钱", "算账", "讨个说法", "凭什么", "谁让你们",
+                      "这地", "这块地", "这片地", "我家的", "是我家的")
+    # ⚠️ 之前这里写了 "的地" 和 "走过来" —— **"的地" 几乎每句中文都有**，
+    #    导致 has_hint 永远为真，反派天降的检查形同虚设（实测反例漏报）。
+    #    现在只保留有区分度的词。
+    for i, s in enumerate(shots):
+        cast = [c for c in (s.get("cast") or []) if c]
+        if not cast:
+            continue
+        txt = _shot_text(s)
+        # 冲突感强的一镜（intensity <= -3 或 purpose=转折 且台词带火药味）
+        hot = (s.get("intensity") or 0) <= -3 or any(
+            k in txt for k in ("赔钱", "谁让你们", "不许", "滚", "赔"))
+        if not hot:
+            continue
+        newcomers = [c for c in cast if i > 0 and c not in (shots[i - 1].get("cast") or [])]
+        if not newcomers:
+            continue
+        # 🔴 只对**真正的对抗方**判定（实测 ep03 误报）：
+        #    ep03 S09 猫嫂（主角）被当成冲突方、S10 新闻主播（媒体）被当成冲突方——
+        #    都不是「找茬的人」。
+        #    判定：这一镜必须真的有**对抗性台词**（索赔/质问/威胁/驱赶），
+        #    而且说话人就是那个新人，才算冲突方。
+        line = (s.get("line") or "").strip()
+        spk = (s.get("speaker") or "").strip()
+        hostile = any(k in line for k in ("赔钱", "要钱", "谁让你们", "凭什么",
+                                          "不许", "滚", "滚开", "算账", "欠",
+                                          "报警", "赔我", "给钱", "拿走"))
+        if not hostile:
+            continue
+        if spk and spk not in newcomers:
+            # 说话人不是新人 → 这一镜的对抗不是新人发起的，跳过
+            continue
+        # 往前看 3 镜（最多）有没有交代
+        lookback = " ".join(_shot_text(x) for x in shots[max(0, i - 3):i])
+        has_hint = any(k in lookback for k in ORIGIN_HINTS)
+        # 🔴 同一镜里交代来由也算数（实测 ep05 修法）：
+        #    「老汉**从坡边那块旧石碑的方向**快步走来」——
+        #    观众在画面里看到了界碑、看到他从界碑那边来，
+        #    「他刚才在哪」的疑问当场消解，不必非要在前一镜埋。
+        self_hint = any(k in txt for k in ORIGIN_HINTS)
+        if not (has_hint or self_hint):
+            # 冲突方是「陌生角色」（前面没出现过）且没任何铺垫 → 天降
+            for nc in newcomers:
+                appeared_before = any(nc in (x.get("cast") or []) for x in shots[:i])
+                if appeared_before:
+                    continue
+                issues.append(
+                    "%s 冲突方「%s」是**天降**的 —— 前面 3 镜完全没交代过他的存在，"
+                    "观众会问「他刚才在哪、怎么现在才发现」。"
+                    "修法：提前一镜埋信息（界碑/围栏/标牌/村民提过这块地有人管/"
+                    "或主角先说了「这是谁家的」但没人当回事），冲突才有根"
+                    % (s.get("id"), nc))
+
+    # ---------- ② 问句与答句是不是同一个问题 ----------
+    # 关键：不能只看「下一镜有没有台词」，要看**答的是不是同一个问题**。
+    # 问价格 → 答好不好吃 = 没答。
+    Q_TOPIC = {
+        "价": ("价", "多少钱", "几个钱", "卖", "斤", "贵", "便宜", "值", "算"),
+        "值": ("值", "划算", "值不值", "配", "亏", "赚"),
+        "好吃": ("好吃", "香", "难吃", "味道", "尝", "好吃吗"),
+        "哪": ("哪", "哪儿", "哪里", "在哪"),
+        "谁": ("谁",),
+        "怎么": ("怎么", "咋"),
+        "为什么": ("为什么", "为啥", "原因"),
+        "是不是": ("是不是", "对不对", "行不行", "好不好"),
+    }
+
+    def q_topic(line):
+        l = line or ""
+        # 先判更具体的
+        if any(k in l for k in ("几个钱", "多少钱", "卖几个", "一斤")):
+            return "价"
+        if "值不值" in l or "值" in l and "不值" not in l:
+            return "值"
+        for k, words in Q_TOPIC.items():
+            if k in ("价", "值"):
+                continue
+            if any(w in l for w in words):
+                return k
+        return None
+
+    for i, s in enumerate(shots[:-1]):
+        line = (s.get("line") or "").strip()
+        if not _is_real_question(line):
+            continue
+        topic = q_topic(line)
+        if not topic:
+            continue
+        nxt = shots[i + 1]
+        nline = (nxt.get("line") or "").strip()
+        ntopic = q_topic(nline)
+        # 答句必须在同一话题上（或者完全没话题词 = 泛化应答）
+        if not nline:
+            continue
+        if ntopic and ntopic != topic:
+            issues.append(
+                "%s 问的是「%s」（%s），但下一镜 %s 回答的是「%s」（%s）—— "
+                "**问的和答的不是一回事**，被问的人全程没答那句问，观众会一直等着听答案"
+                % (s.get("id"), line, topic, nxt.get("id"), nline, ntopic))
+        elif not ntopic and not any(k in nline for k in ("您", "咱", "我")):
+            warns.append(
+                "%s 问句「%s」的下一镜 %s 台词「%s」看不出是否在应答 —— 确认一下"
+                % (s.get("id"), line, nxt.get("id"), nline))
+
+    # ---------- ③ 突然离场又回来 ----------
+    # 判定：某镜里出现「跑/走/撤/溜」等离场动作，下一镜或下两镜里同一批人又回来了
+    #       且中间没有任何交代他们为什么回来 → 观众懵。
+    LEAVE = ("就跑", "跑走", "撒腿跑", "钻进了草丛", "溜了", "逃走", "跑掉",
+             "一窝蜂", "端起锅就跑", "跑了", "离开", "散去")
+    BACK = ("坐下", "坐下来", "摆开", "宴", "回来", "回到", "又坐", "围过来",
+            "盛饭", "夹了一筷子", "给每个人")
+    for i, s in enumerate(shots[:-1]):
+        txt = _shot_text(s)
+        if not any(k in txt for k in LEAVE):
+            continue
+        # 往后 2 镜
+        window = shots[i + 1:i + 3]
+        if not window:
+            continue
+        back_txt = " ".join(_shot_text(x) for x in window)
+        if any(k in back_txt for k in BACK):
+            # 中间有没有交代「为什么回来」
+            bridge = " ".join(_shot_text(x) for x in window)
+            explains = any(k in bridge for k in (
+                "又回来了", "回来了", "折返", "掉头", "回头", "算了", "舍不得",
+                "索性", "干脆", "算了留下", "还是留下", "又坐下",
+                # 🔴 补（ep05 S20/S21 修法）：把跑掉的人**请回来 / 追回来**，
+                #    也是交代折返，常见的说法还有「拉回来」「拽回来」「请回」。
+                "追上来", "追回去", "追了", "请回来", "请回", "拉回来", "拉回",
+                "拽回来", "拽回", "劝回来", "劝回", "硬拉", "拉回座位",
+                "重新摆开", "重新开席", "又开席", "重新坐"))
+            if not explains:
+                issues.append(
+                    "%s 出现「跑/走」的离场动作，但 %s 又聚回来吃饭 —— "
+                    "中间没有任何交代为什么折返，观众会懵「跑了怎么又回来了」。"
+                    "修法：① 删掉离场镜；② 或者补一句交代（羊大爷「跑啥，菜都炒好了」）"
+                    % (s.get("id"), "/".join(x.get("id") for x in window)))
+
+    # ---------- ④ 冲突镜之前有没有「利益/前提」的铺垫 ----------
+    # 反派要讹人，前提是他**有理**（哪怕是歪理）。如果冲突方一上来就纯发火，
+    # 而观众从没听过他索赔的依据，主角接战就没意义。
+    for i, s in enumerate(shots):
+        if (s.get("intensity") or 0) > -3:
+            continue
+        line = (s.get("line") or "").strip()
+        if not line:
+            continue
+        if not any(k in line for k in ("赔", "钱", "我家", "我家的", "这是我的", "要钱")):
+            continue
+        # 索赔依据要在冲突前 3 镜里有影子（提到地/归属/这是谁家的）
+        lookback = " ".join(_shot_text(x) for x in shots[max(0, i - 3):i])
+        if not any(k in lookback for k in ("界", "碑", "牌", "围栏", "栅栏", "谁家的",
+                                          "这片", "这坡", "地", "标记", "标识", "绳子")):
+            warns.append(
+                "%s 反派索赔（%s）但前 3 镜没有任何「这片地是谁的」的铺垫 —— "
+                "建议提前埋一个界碑/围栏/标牌，观众才会觉得「哦原来是他们的地」"
+                "而不是「这老头怎么知道这是他家的」" % (s.get("id"), line))
+
+
+def do_logic_check(cfg, paths):
+    """剧本阶段逻辑自检：因果链 / 情绪曲线 / 转折铺垫 / 结尾高潮。
+
+    对应 references/logic_check.md。输出问题清单，有问题时退出码非 0。
+    """
+    story = load_json(paths["shots"], {"shots": []})
+    shots = story.get("shots") or []
+    if not shots:
+        die("script/shots.json 里没有镜头")
+    issues = []
+    warns = []
+
+    # ---- 0. 角色档案（characters 字段）----
+    # 🔴 shots.json 顶层缺 characters 时，_cast_clause 拿不到任何角色描述，
+    #    白名单里只剩角色名（"1) maoge (maoge)"），双人同框的镜头模型会把两张脸
+    #    "平均"——猫哥的海豹重点色面罩被冲淡（ep04 S05/S06 真实事故）。
+    chars_meta = story.get("characters") or []
+    if not chars_meta:
+        warns.append(
+            "shots.json 顶层没有 characters 字段 —— 首帧的服装锁和锁脸描述都拿不到，"
+            "双人同框时模型会把两张脸「平均」。加 characters: [{name, desc_en, outfit_en}]")
+    else:
+        allcast = set()
+        for s in shots:
+            for c in (s.get("cast") or []):
+                allcast.add(c)
+        no_meta = [c for c in sorted(allcast)
+                   if c not in {str((x or {}).get("name")) for x in chars_meta}]
+        if no_meta:
+            warns.append(
+                "这些角色在 characters 里没有档案（首帧锁不住脸和服装）：%s" % "、".join(no_meta))
+
+    # ---- 1. 因果链字段 ----
+    for s in shots:
+        sid = s.get("id") or "?"
+        if not (s.get("because") or "").strip():
+            issues.append("%s 没有 because（为什么会有这一镜）" % sid)
+        if not (s.get("audience") or "").strip():
+            warns.append("%s 没有 audience（观众此刻该想什么）" % sid)
+
+    # ---- 2. 情绪曲线 ----
+    ints = []
+    for s in shots:
+        v = s.get("intensity")
+        if isinstance(v, (int, float)):
+            ints.append((s.get("id"), float(v)))
+        else:
+            ints.append((s.get("id"), None))
+    vals = [v for _, v in ints if v is not None]
+    if len(vals) == len(ints) and vals:
+        if max(vals) - min(vals) < 2:
+            issues.append("情绪曲线太平（最高 %.0f 最低 %.0f，至少要差 2）" % (max(vals), min(vals)))
+        for i in range(2, len(vals)):
+            if vals[i] == vals[i - 1] == vals[i - 2]:
+                issues.append("%s %s %s 连续三镜 intensity 都是 %.0f"
+                              % (ints[i - 2][0], ints[i - 1][0], ints[i][0], vals[i]))
+    else:
+        warns.append("部分镜头没有 intensity（情绪曲线无法检查）")
+
+    # ---- 2·五 短剧节奏门禁：首钩 / 爆点数 / 尾钩 / 关系网闭环 ----
+    # 🔴 参考 short-drama-writer 的短剧节奏铁律（这四条我原来完全没有）：
+    #   ① **首钩**：第一镜 3 秒内必须有钩子（冲突前置/强悬念/极致反差），
+    #      不许从「人物起床、走路」这种铺垫开场。
+    #   ② **爆点数 ≥3**：一集里至少要有 3 个刺激点（冲突/反转/爽点/揭穿），
+    #      不然就是一条平铺直叙的流水账。
+    #   ③ **尾钩**：最后一镜必须留钩子（悬念/危机/反转），不能自然收尾。
+    #   ④ **关系网闭环**：≥3 角色时，每个角色至少和另一个角色同框过一次——
+    #      孤立角色就是凑人数的，模型还会画丢。
+    if shots:
+        # ① 首钩
+        first = shots[0]
+        ftxt = _shot_text(first)
+        HOOK_WORDS = ("冲突", "对峙", "质问", "赔钱", "吵架", "打架", "抢", "打",
+                      "突然", "竟然", "居然", "不料", "反倒", "愣住", "震惊",
+                      "瞪", "怒", "吼", "拦住", "追", "闯", "摔", "掀",
+                      "凭什么", "谁让", "你敢", "别动", "住手", "反转", "揭穿")
+        first_line = (first.get("line") or "").strip()
+        has_hook = any(k in ftxt for k in HOOK_WORDS)
+        if not has_hook and not first_line:
+            warns.append(
+                "%s 是第一镜，但没有冲突/悬念/反差的钩子 —— "
+                "短剧铁律：前 3 秒就要抓住人，不许从铺垫开场"
+                % first.get("id"))
+
+        # ② 爆点数
+        #    ⚠️ 词表要够宽，且**必须扫台词**——
+        #    爆点常常就在台词里（「就配」「您尝尝」「赔钱！」），
+        #    只扫动作描述会漏成 0 处（实测三集都误报「0 处」）。
+        BEAT_WORDS = ("打脸", "反转", "亮出", "揭露", "翻盘", "逆转", "耳光", "巴掌",
+                      "撕", "摔", "跪下", "揭穿", "愣住", "震惊", "瞪", "傻眼",
+                      "不服", "认输", "服了", "折服", "征服", "抢", "护",
+                      "接单", "接了", "赔钱", "凭什么", "谁让", "值不值",
+                      "我家的", "我的味道", "尝尝", "就配", "够吃一辈子",
+                      "没人要", "别挖", "住手", "你敢", "滚")
+        alltxt = " ".join(_shot_text(x) for x in shots)
+        beats = sum(alltxt.count(w) for w in BEAT_WORDS)
+        # 情绪落差也算爆点：强度跳变 ≥3 的地方
+        jumps = 0
+        for i in range(1, len(shots)):
+            a = shots[i - 1].get("intensity") or 0
+            b = shots[i].get("intensity") or 0
+            if abs(a - b) >= 3:
+                jumps += 1
+        beats_total = beats + jumps
+        if beats_total < 3 and len(shots) >= 8:
+            warns.append(
+                "全片刺激点约 %d 处（建议 ≥3）—— "
+                "短剧要有「打脸/反转/揭穿」这类爆点，"
+                "不然就是一条流水账。检查是不是冲突都压在最后一段"
+                % beats_total)
+
+        # ③ 尾钩
+        last = shots[-1]
+        ltxt = _shot_text(last)
+        TAIL_WORDS = ("悬念", "回头", "追", "来了", "电话", "又", "还没完",
+                      "却", "突然", "结果", "怎么", "为什么", "愣", "惊",
+                      "看着", "望着", "消失", "不见", "远处", "身后")
+        tail_line = (last.get("line") or "").strip()
+        if not any(k in ltxt for k in TAIL_WORDS) and not tail_line.endswith(("！", "？")):
+            warns.append(
+                "%s 是最后一镜，但没有尾钩（悬念/危机/反转）—— "
+                "要么在结尾留个钩子，要么用动作收（见 ending_modes.md）"
+                % last.get("id"))
+
+        # ④ 关系网闭环
+        #    只算**同框过**就算有关系（群戏里的配角也算数），
+        #    真正的问题是「从没出现过」而不是「没和别人同框」。
+        appeared = set()
+        co = {}
+        for s in shots:
+            cs = [c for c in (s.get("cast") or []) if c]
+            appeared.update(cs)
+            for a in cs:
+                for b in cs:
+                    if a != b:
+                        co.setdefault(a, set()).add(b)
+        never = [c.get("name") for c in chars_meta
+                 if c.get("name") and c.get("name") not in appeared]
+        if never:
+            warns.append(
+                "这些角色从头到尾没出现过：%s —— "
+                "要么给他一场戏，要么从 characters 里删掉（写了不演的角色是浪费）"
+                % "、".join(never))
+
+    # ---- 3. 转折镜铺垫 ----
+    # 判定方式：把 because 里提到的「上一镜的东西」拿去前两镜的文本里找。
+    # 找不到 = 观众不可能预感到这个转折（因为依据根本没出现在画面里）。
+    STOP = ("因为", "所以", "这一镜", "上一镜", "这一", "上一", "镜头", "观众", "此刻",
+            "该想", "什么", "已经", "正在", "于是", "就在", "而是", "不是", "没有", "一个")
+    for i, s in enumerate(shots):
+        purpose = (s.get("purpose") or "").strip()
+        if purpose not in ("转折", "高潮"):
+            continue
+        prev_txt = ""
+        for j in range(max(0, i - 2), i):
+            prev_txt += " ".join(str(shots[j].get(k) or "") for k in ("action", "micro", "line"))
+        because = (s.get("because") or "").strip()
+        if not prev_txt.strip():
+            issues.append("%s 是「%s」镜，但前两镜没有任何内容可作铺垫" % (s.get("id"), purpose))
+            continue
+        if not because:
+            continue
+        # 从 because 里切出 2 字词组，去掉停用词
+        kw = set()
+        b = because
+        for st in STOP:
+            b = b.replace(st, " ")
+        for seg in b.split():
+            for k in range(len(seg) - 1):
+                g = seg[k:k + 2]
+                if g not in ("这一", "所以", "因为", "镜头", "观众"):
+                    kw.add(g)
+        if not kw:
+            continue
+        hit = [g for g in kw if g in prev_txt]
+        if not hit:
+            issues.append("%s 是「%s」镜，但它的依据在前两镜里找不到（观众不可能预感到）：%s"
+                          % (s.get("id"), purpose, because))
+
+    # ---- 4. 结尾高潮 ----
+    last = shots[-1]
+    lid = last.get("id")
+    mode = (last.get("ending_mode") or "").strip()
+    if not mode:
+        issues.append("%s 是最后一镜，但没有 ending_mode（结尾必须是动作高潮，见 references/ending_modes.md）" % lid)
+    li = last.get("intensity")
+    if not isinstance(li, (int, float)):
+        warns.append("%s 没有 intensity" % lid)
+    else:
+        known = [v for _, v in ints if isinstance(v, (int, float))]
+        if known and li < max(known) - 1:
+            issues.append("%s 末镜 intensity=%.0f，明显低于全片最高 %.0f（结尾应该是峰或接近峰）"
+                          % (lid, li, max(known)))
+    last_action = "%s %s" % (last.get("action") or "", last.get("video_prompt") or "")
+    if not any(w in last_action for w in ENDING_ACTION_WORDS):
+        issues.append("%s 末镜看不到任何肢体动作词，只有台词 → 这是平淡结尾" % lid)
+    if (last.get("duration") or 0) < 5:
+        warns.append("%s 末镜只有 %ss，动作可能演不完，建议 ≥ 6s" % (lid, last.get("duration")))
+    if not (last.get("sfx") or []):
+        warns.append("%s 末镜没有音效，结尾会显得干" % lid)
+
+    # 🔴 触发条件要严：ep03 是温情剧，里面也切菜炒豆角，但**不是美食号**。
+    # 判定：场景名必须命中 FOOD_SCENE，且≥3 镜在做菜动作；
+    # 另外「自家灶间」这种生活场景要排除——那是顺手做饭，不是美食号主线。
+    FOOD_SCENE = ("后厨", "厨房", "灶间", "kitchen", "后场", "中央厨房")
+    NOT_FOOD_SCENE = ("自家", "家里", "家灶", "客厅", "院子")
+    COOK_KW = ("炒", "颠勺", "颠锅", "翻锅", "下锅", "装盘", "妥菜", "备菜",
+               "热锅", "切菜", "剁", "wok", "toss", "chop", "cleaver", "plating")
+    cook_shots = [s for s in shots
+                  if any(k in ((s.get("scene") or {}).get("id") or "") for k in FOOD_SCENE)
+                  and not any(k in ((s.get("scene") or {}).get("id") or "")
+                              for k in NOT_FOOD_SCENE)]
+    #自家灶间不算；那就把「自家灶间」从 FOOD_SCENE 里去掉的效果等价
+    food_mode = len(cook_shots) >= 3 and sum(
+        1 for s in cook_shots
+        if any(k in ((s.get("action") or "") + (s.get("video_prompt") or ""))
+               for k in COOK_KW)) >= 3
+
+    if food_mode:
+        # 连续无台词的做菜镜 = 炒菜段（用户原话：炒菜的镜头一句台词都不要）
+        best, cur = [], []
+        for s in shots:
+            txt = (s.get("action") or "") + " " + (s.get("video_prompt") or "")
+            silent = not (s.get("line") or "").strip()
+            cooking = silent and any(k in txt for k in COOK_KW)
+            if cooking:
+                cur.append(s)
+                if sum(x.get("duration") or 0 for x in cur) > \
+                        sum(x.get("duration") or 0 for x in best):
+                    best = list(cur)
+            else:
+                cur = []
+        cook_dur = sum(s.get("duration") or 0 for s in best)
+        if cook_dur < 30:
+            warns.append(
+                "炒菜段只有 %.1f 秒（%d 镜），美食号至少要 30 秒纯做菜画面才够看"
+                "（见 references/food_show.md）" % (cook_dur, len(best)))
+        # 招牌动作：切菜 / 颠勺 / 装盘，至少命中 3 种
+        KNIFE = ("切", "剁", "刀")
+        TOSS = ("颠", "翻锅", "抛", "接住")
+        PLATE = ("装盘", "摆盘", "妥菜", "瓷盘", "甩进", "白瓷盘", "盘里")
+        hits = []
+        alltxt = " ".join((s.get("action") or "") + (s.get("video_prompt") or "")
+                          for s in shots)
+        if any(k in alltxt for k in KNIFE):
+            hits.append("切菜")
+        if any(k in alltxt for k in TOSS):
+            hits.append("颠勺/翻锅")
+        if any(k in alltxt for k in PLATE):
+            hits.append("装盘")
+        if len(hits) < 3:
+            warns.append("美食号招牌动作只找到 %s（%d 种），至少要有切菜/颠勺/装盘三种"
+                         % ("、".join(hits) or "无", len(hits)))
+
+        # ---- 6.2 温度梯度（用户明确要求：不要出现穿帮镜头）----
+        # 观众对温度是敏感的：上一镜说「油冒烟」，下一镜说「油炸开」，物理上不成立。
+        # 见 references/heat_ladder.md
+        SMOKE = ("冒烟", "起烟", "油烟大", "smoking", "smoke")
+        EXPLODE = ("炸开", "爆开", "explode", "erupt", "violent")
+        LOWHEAT = ("小火", "最小火", "文火", "low flame", "lowest", "low blue")
+        HIGHHEAT = ("大火", "猛火", "旺火", "high flame", "roaring")
+        TEMP_UP = ("调大", "转大", "开大", "knob UP", "turns the burner knob UP")
+        TEMP_DOWN = ("调小", "转小", "拧小", "调至小", "knob DOWN", "flame down")
+        LID_MIN = ("盖上锅盖", "盖锅盖", "盖上盖", "压住锅盖", "cover the wok",
+                   "lifts a round metal lid", "lowers a round metal lid")
+        STEAM_BURST = ("蒸汽腾起", "白汽腾", "蒸汽爆发", "burst of white steam",
+                       "dense burst", "一股白汽腾起来", "蒸汽冲")
+        STEAM_THIN = ("薄薄一层", "持续渗出", "细线", "thin veil", "thin wisps")
+        for s in best:                       # best = 炒菜段那几镜
+            txt = (s.get("action") or "") + " " + (s.get("video_prompt") or "")
+            sid = s.get("id")
+            has_smoke = any(k in txt for k in SMOKE)
+            has_explode = any(k in txt for k in EXPLODE)
+            # ① 同一镜里既冒烟又炸开 = 物理矛盾（冒烟的油遇干料是焙不是炸）
+            if has_smoke and has_explode:
+                issues.append("%s 同镜里既有「冒烟」又有「炸开」—— 冒烟的油已经过热，"
+                              "下干料是焙不是炸，会穿帮（见 references/heat_ladder.md）" % sid)
+            # ② 说冒烟了，就不能再写「五成热/还没冒烟」
+            #    🔴 「还没冒烟 / NOT yet smoking / 不冒烟」是**否定**表述，不能算「写了冒烟」——
+            #    这里要把否定句剥掉再判，否则「还没冒烟」会被误判成「写了冒烟」。
+            neg_smoke = re.sub(r"(还没冒烟|没有冒烟|不冒烟|not yet smoking|NOT yet smoking|"
+                               r"is not smoking|不冒青烟)", "", txt, flags=re.I)
+            real_smoke = any(k in neg_smoke for k in SMOKE)
+            if real_smoke and ("五成" in txt or "not yet smoking" in txt
+                               or "NOT yet smoking" in txt):
+                issues.append("%s 同时写了「冒烟」和「五成热/还没冒烟」，前后矛盾" % sid)
+            # ③ 蒸汽量要匹配火候。
+            #    ⚠️ 允许「同镜两次火候变化」：淋水时还是大火（蒸汽腾起合理）→
+            #    盖盖后转最小火（只能薄薄渗出）。所以只有当**蒸汽在转小火之后**
+            #    才出现，或者同镜没有任何升温动作时，才算穿帮。
+            has_burst = any(k in txt for k in STEAM_BURST)
+            has_low = any(k in txt for k in LOWHEAT)
+            # 剥掉「先大火淋水…盖盖…拧到最小火」这种先后描述
+            seq_ok = any(k in txt for k in (
+                "淋下一圈清水", "淋一圈", "淋水", "沿锅边", "盖上锅盖", "盖锅盖",
+                "拧到最小", "拧小", "立刻盖上", "压住"))
+            if has_burst and has_low and not seq_ok:
+                issues.append("%s 同时写「最小火」和「蒸汽爆发/一股白汽腾起来」—— "
+                              "小火焖出来的只是薄薄一层，蒸汽爆发是大火滚的（见 heat_ladder）" % sid)
+            elif has_burst and has_low and seq_ok:
+                # 顺序合法，但要确认「薄」和「腾起」不在同一段
+                if re.search(r"(拧到最小|调至小|转小)[^.;]{0,60}(一股白汽腾起来|蒸汽腾起|白汽腾起)",
+                             txt):
+                    issues.append("%s 转成最小火之后又写「白汽腾起」—— "
+                                  "焖的蒸汽只能是薄薄一层持续渗出（见 heat_ladder）" % sid)
+        # ④ 盖盖那一镜必须交代调小火（否则观众不知道下一步是什么火）
+        for i, s in enumerate(best):
+            txt = (s.get("action") or "") + " " + (s.get("video_prompt") or "")
+            if any(k in txt for k in LID_MIN) and any(k in txt for k in ("浇", "淋", "淋水")):
+                if not any(k in txt for k in LOWHEAT + TEMP_DOWN):
+                    warns.append("%s 盖上锅盖焖，但没交代把火调小——观众会不知道下一步是什么火"
+                                 % s.get("id"))
+                break
+
+    # ---- 5. 台词与新信息 ----
+    # 新闻播报/旁白这类「不是角色对白」的台词可以长（有字幕兜底，观众读得到）。
+    LONG_LINE_OK = ("anchor", "VO", "news", "announcer", "reporter")
+    # 🔴 台词长度分三级（参考 short-drama-writer 的短剧铁律，但按本系列调过）：
+    #    ≤10 字 = 理想（短剧标准：删、短、狠）
+    #    11-14 字 = 红线（还能用，但偏长）
+    #    >14 字 = 必改（解释性台词，观众会走神）
+    #    原来只有 18 字一道门槛，等于没有门槛。
+    LINE_IDEAL = 10
+    LINE_RED = 14
+    long_lines = []
+    for s in shots:
+        line = (s.get("line") or "").strip()
+        spk = (s.get("speaker") or "").strip()
+        n = len(_cn_bare(line))
+        if n > LINE_RED and spk not in LONG_LINE_OK:
+            long_lines.append((s, n))
+            issues.append("%s 台词 %d 字，超过红线 %d 字（短剧铁律：删、短、狠；"
+                          "台词靠动作承载，不靠解释）"
+                          % (s.get("id"), n, LINE_RED))
+        elif n > LINE_IDEAL and spk not in LONG_LINE_OK:
+            warns.append("%s 台词 %d 字，偏长（短剧理想 ≤%d 字：删、短、狠）"
+                         % (s.get("id"), n, LINE_IDEAL))
+    # 超长台词占比：说明整集都在念台词
+    if len(long_lines) >= 3 and len(shots) and len(long_lines) / float(len(shots)) > 0.25:
+        issues.append("超长台词（>%d 字）有 %d 镜，占比 %d%% —— "
+                      "台词要砍，冲突要用动作演"
+                      % (LINE_RED, len(long_lines),
+                         int(100 * len(long_lines) / len(shots))))
+    for s in shots:
+        # 🔴 同框人数：默认上限 2 人（多人同框模型容易串脸/丢人）。
+        #    但**群戏镜**是另一种需求（用户明确要求「野炊来的动物要多」），
+        #    这时用 shot.group_scene = true 显式声明这一镜就是群戏，放宽到 6 人。
+        #    声明了就要求写清楚每个人的站位，避免模型自己分配位置。
+        cast = s.get("cast") or []
+        if len(cast) > 2:
+            if s.get("group_scene"):
+                if len(cast) > 6:
+                    issues.append("%s 群戏镜同框 %d 人，超过 6 人上限" % (s.get("id"), len(cast)))
+                elif not (s.get("group_note") or "").strip():
+                    issues.append(
+                        "%s 声明了 group_scene 但没写 group_note —— "
+                        "群戏镜必须说明每个人站在哪、谁在画面中心，否则模型会自己乱排" % s.get("id"))
+            else:
+                issues.append("%s 同框 %d 人，超过 2 人"
+                              "（群戏镜请加 group_scene=True + group_note）" % (s.get("id"), len(cast)))
+
+    # ---- 5.5 问答闭环：谁问了，下一镜必须有人答 ----
+    # ep03 实测事故：S04 羊大爷问「小伙子，你跟谁住一块啊？」，
+    # 猫哥一句没答就切到下一镜（下一镜是灶间，只有猫哥一个人）——
+    # 大爷问完就退场了，观众会一直等着听答案，对话悬空。
+    # 判定：问句的说话人若不在下一镜的同框名单里，且下一镜说话人不是
+    # 媒介角色（电视主播/画外音/电话那头），就说明**没人接这句问**。
+    MEDIA_SPEAKER = ("anchor", "vo", "news", "announcer", "reporter", "tv", "radio", "phone")
+    for i, s in enumerate(shots[:-1]):
+        line = (s.get("line") or "").strip()
+        if not _is_real_question(line):
+            continue
+        nxt = shots[i + 1]
+        spk = (s.get("speaker") or "").strip().lower()
+        nspk = (nxt.get("line") is not None) and (nxt.get("speaker") or "").strip().lower() or ""
+        ncast = [(n or "").strip().lower() for n in (nxt.get("cast") or [])]
+
+        if spk in ncast:
+            # 回答者在画面里 —— 再看他这句台词是不是真在应答
+            if _is_answer_to(nxt.get("line"), line):
+                continue
+            issues.append(
+                "%s 台词是问句「%s」，%s 虽然有%s在画面里，但那句台词「%s」"
+                "不是对问句的回答 —— 问句被晾在一边"
+                % (s.get("id"), line, nxt.get("id"), spk,
+                   (nxt.get("line") or "").strip()))
+            continue
+
+        # 回答者不在下一镜画面里 —— 但如果**下一镜的台词本身就是在应答这句问**
+        # （隔空回应：A 挑衅完转身走，B 下一镜回一句「就配」），这是成立的，不报。
+        # 实测：ep04S02 狼兄问「你那豆角子配叫镇店菜？」，S03 猫哥只身在街上答「就配。」
+        # 提问者退场了，但问句和应答紧挨着，观众完全接得上。
+        nline = (nxt.get("line") or "").strip()
+        if nline and _is_answer_to(nline, line):
+            continue
+        if nspk in MEDIA_SPEAKER:
+            continue  # 电视/广播/电话那头在回应，不算悬空
+        issues.append(
+            "%s 台词是问句「%s」，但下一镜 %s 的画面里只有 %s（没有提问者%s），"
+            "台词「%s」也没接这句问 —— 问句悬空没人接"
+            % (s.get("id"), line, nxt.get("id"),
+               "、".join(nxt.get("cast") or []) or "空镜",
+               "" if (nxt.get("speaker") or "").strip() in
+                       [c for c in (nxt.get("cast") or [])] else "（连说话人都不是问的人）",
+               (nxt.get("line") or "").strip()))
+
+    # ---- 5.6 结构级硬伤：反派来由 / 问句同题 / 突然离场又回来 ----
+    # 🔴 这三类是 ep05 实测出的真问题，用户原话「情节不顺畅」——
+    #    逐镜看都通，连起来看「怎么突然就…」「问的和答的不是一回事」。
+    #    之前的检查只看字段完整性（because 有没有填），看不出这种结构伤。
+    _check_structural_holes(shots, issues, warns)
+
+    # ---- 输出 ----
+    print("")
+    print("── 剧本逻辑自检 ──")
+    print("镜头数：%d" % len(shots))
+    if issues:
+        print("")
+        print("【必须改】")
+        for x in issues:
+            print("  ✗ " + x)
+    if warns:
+        print("")
+        print("【建议确认】")
+        for x in warns:
+            print("  · " + x)
+    if not issues and not warns:
+        print("OK：因果链字段、情绪曲线、结尾高潮、台词长度、问答闭环、美食号专项、温度梯度均通过")
+    print("")
+    if issues:
+        print("结论：%d 个必须改的问题" % len(issues))
+        sys.exit(1)
+    print("结论：通过（%d 条待确认）" % len(warns))
+
+
+def cmd_check(args):
+    cfg, paths = load_project(args.dir)
+    do_logic_check(cfg, paths)
 
 
 # ----------------------------------------------------------------------------- auto
@@ -6637,6 +8019,245 @@ def cmd_music_ui(args):
         info("配乐台已关闭")
 
 
+# ----------------------------------------------------------------------------- flow / studio / analyze
+
+def _flow_imports():
+    import importlib
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    flow = importlib.import_module("flow")
+    analysis = importlib.import_module("analysis")
+    return flow, analysis
+
+
+def _flow_paths(paths):
+    """给 flow 模块用的 paths（补上 report 目录）。"""
+    p = dict(paths)
+    p["report"] = os.path.join(paths["root"], "report")
+    os.makedirs(p["report"], exist_ok=True)
+    return p
+
+
+def _flow_work_order():
+    """编剧作业单（和 story 阶段落盘的一致）。"""
+    return (
+        "\n---\n\n"
+        "## 你必须按这个顺序作业（不许跳步）\n\n"
+        "### Step 1：先写这六行（写到 script/story_brief.md）\n\n"
+        "```\n我想让观众感觉到：\n主角想要：\n他的阻碍：\n最后他变成了：\n"
+        "必须出现的画面：（最多 3 个）\n绝对不能出现的：\n```\n\n"
+        "### Step 2：三张表（情绪曲线 / 母题 / 出场表）\n\n"
+        "### Step 3：逐镜填四个空（作用 / 因为上一镜…所以… / 动作 / 观众该想什么）\n\n"
+        "### Step 4：结构硬伤自查\n\n"
+        "- 问句和答句是同一个问题吗？\n- 冲突方天降了吗？\n- 人跑了又回来有交代吗？\n"
+        "- 每镜删掉测试：删了故事照样成立的是废镜\n\n"
+        "### Step 5：才写 script/shots.json，然后跑 ac.py check\n\n"
+        "完整方法论见 references/screenwriting_playbook.md。")
+
+
+def cmd_flow(args):
+    """分阶段跑流程。每阶段可单独重跑；需求改了用 --from 接着跑。"""
+    flow, analysis = _flow_imports()
+    cfg, paths = load_project(args.dir)
+    paths = _flow_paths(paths)
+    root = paths["root"]
+    os.makedirs(os.path.join(root, "script"), exist_ok=True)
+
+    if args.list:
+        print("")
+        print("  可用阶段：")
+        for k, label, arts, desc in flow.STAGES:
+            print("    %-10s %-14s %s" % (k, label, desc))
+            print("    %-10s %-14s 产物：%s" % ("", "", "、".join(arts)))
+        print("")
+        return
+
+    def mark(k, status, note):
+        flow.mark(paths, k, status, note)
+
+    def do_stage(k):
+        label = flow.STAGE_BY_KEY[k][1]
+        print("\n" + "-" * 62)
+        print("  > %s" % label)
+        print("-" * 62)
+        t0 = time.time()
+        pth = paths          # 闭包里不要重新赋值 paths（UnboundLocalError）
+
+        if k == "init":
+            if not os.path.exists(os.path.join(root, "project.json")):
+                init_project(root, os.path.basename(root))
+                cfg2, p2 = load_project(root)
+                pth.update(_flow_paths(p2))
+            mark(k, "done", "目录骨架已建")
+            print("  [OK] 项目目录就绪")
+
+        elif k == "brief":
+            idea = ""
+            bp = os.path.join(root, "script", "brief.md")
+            if os.path.exists(bp):
+                with io.open(bp, encoding="utf-8") as f:
+                    idea = f.read()
+            n = 22
+            sj = os.path.join(root, "script", "shots.json")
+            if os.path.exists(sj):
+                st = load_json(sj, {})
+                n = len(st.get("shots") or [])
+            flow.brief_template(cfg, pth, idea or "（在工单里写下你的创意）", n, 8)
+            mark(k, "done", "工单已生成，等确认")
+            print("  [OK] 需求分析工单 -> script/brief.md")
+            print("      改完任意一行，然后跑 --from story")
+            print("      或者开控制台：ac.py studio %s" % root)
+
+        elif k == "story":
+            bp = os.path.join(root, "script", "brief.md")
+            if not os.path.exists(bp):
+                warn("还没有需求分析工单，先跑 brief 阶段")
+                return False
+            prompt = (STORY_SYSTEM + "\n\n---\n\n创意：见 script/brief.md 的「一句话创意」段\n"
+                      "镜头数：按 brief.md 的目标\n%s\n" % _flow_work_order())
+            pp = os.path.join(root, "script", "story_prompt.md")
+            with io.open(pp, "w", encoding="utf-8") as f:
+                f.write(prompt)
+            mark(k, "done", "作业单已落盘，等当前会话模型写故事")
+            print("  [OK] 编剧作业单 -> script/story_prompt.md")
+            print("      当前会话模型按它写 script/story.md，写完再跑 --from shots")
+
+        elif k == "shots":
+            sj = os.path.join(root, "script", "shots.json")
+            if not os.path.exists(sj):
+                warn("还没有分镜表（script/shots.json）")
+                return False
+            mark(k, "done", "分镜表就绪")
+            p, _jp = analysis.write_report(pth, analysis.analyze(pth))
+            print("  [OK] 分镜表就绪")
+            print("  [OK] 剧本分析报告 -> %s" % os.path.relpath(p, root))
+            print("      里面有 logline四要素/情绪曲线/母题/因果链/问答闭环/结尾高潮")
+
+        elif k == "check":
+            p = subprocess.run([sys.executable, os.path.abspath(__file__), "check", root],
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="ignore")
+            txt = (p.stdout or "") + (p.stderr or "")
+            cp = os.path.join(paths["report"], "check.md")
+            with io.open(cp, "w", encoding="utf-8") as f:
+                f.write(txt)
+            print(txt)
+            if p.returncode != 0:
+                mark(k, "failed", "有必须改的问题")
+                return False
+            mark(k, "done", "自检通过")
+            print("  [OK] 逻辑自检通过（报告 -> report/check.md）")
+
+        elif k == "cast":
+            st = load_json(paths["shots"], {})
+            chars = st.get("characters") or []
+            for c in chars:
+                cdir = char_dir(paths, c["name"])
+                if os.path.exists(os.path.join(cdir, "face_ref.jpg")):
+                    info("%s 已有形象，跳过" % c["name"])
+                    continue
+                print("  -> 生成角色形象：%s" % c["name"])
+                do_char_gen(cfg, paths, c["name"],
+                            c.get("desc_en") or c.get("desc") or c["name"],
+                            with_turnaround=True)
+            mark(k, "done", "%d 个角色形象已生成" % len(chars))
+            print("  [OK] 角色定妆完成 -> assets/characters/")
+
+        elif k == "props":
+            st = load_json(paths["shots"], {})
+            for pr in st.get("props") or []:
+                pp = os.path.join(paths["props"], pr["name"] + ".jpg")
+                if os.path.exists(pp):
+                    continue
+                print("  -> 生成道具图：%s" % pr["name"])
+                do_prop_gen(cfg, paths, pr["name"],
+                            pr.get("desc_en") or pr.get("desc") or pr["name"])
+            mark(k, "done", "道具图完成")
+            print("  [OK] 道具参考图 -> assets/props/")
+
+        elif k == "frame":
+            do_frames(cfg, paths, None, False, dry=False)
+            n = len([f for f in os.listdir(paths["frames"]) if f.endswith(".jpg")]) \
+                if os.path.isdir(paths["frames"]) else 0
+            mark(k, "done", "%d 张首帧" % n)
+            print("  [OK] 首帧 %d 张 -> frames/" % n)
+
+        elif k == "video":
+            do_videos(cfg, paths, None, False, wait=True)
+            n = len([f for f in os.listdir(paths["clips"]) if f.endswith(".mp4")]) \
+                if os.path.isdir(paths["clips"]) else 0
+            mark(k, "done" if n else "failed", "%d 个片段" % n)
+            print("  [OK] 视频 %d 段 -> clips/" % n)
+
+        elif k == "assemble":
+            do_assemble(cfg, paths, use_subs=True, native_voice=True,
+                        out_name="final-native.mp4")
+            mark(k, "done", "成片已出")
+            print("  [OK] 成片 -> out/")
+
+        print("  %.1fs" % (time.time() - t0))
+        return True
+
+    if args.stage:
+        ok = do_stage(args.stage)
+        flow.print_flow(paths)
+        if not ok:
+            sys.exit(1)
+        return
+
+    start = args.from_ or "init"
+    end = args.to_ or "check"
+    if start not in flow.STAGE_KEYS or end not in flow.STAGE_KEYS:
+        die("阶段名不对，用 --list 看有哪些")
+    si, ei = flow.STAGE_KEYS.index(start), flow.STAGE_KEYS.index(end)
+    if ei < si:
+        die("--to 必须在 --from 之后")
+
+    for k in flow.STAGE_KEYS[si:ei + 1]:
+        if not do_stage(k):
+            break
+    flow.print_flow(paths)
+
+
+def cmd_analyze(args):
+    """出剧本分析报告。"""
+    _flow, analysis = _flow_imports()
+    cfg, paths = load_project(args.dir)
+    paths = _flow_paths(paths)
+    if not os.path.exists(paths["shots"]):
+        die("还没有分镜表（script/shots.json）")
+    data = analysis.analyze(paths)
+    p, jp = analysis.write_report(paths, data)
+    print("")
+    print("  剧本分析报告")
+    print("  -----------------------------------------")
+    print("  %d 镜 / 计划 %d 秒" % (data["n_shots"], data["total_seconds"]))
+    print("  最低点 %s（%+d）　最高点 %s（%+d）"
+          % ((data["low"] or {}).get("id", "-"), (data["low"] or {}).get("v", 0),
+             (data["high"] or {}).get("id", "-"), (data["high"] or {}).get("v", 0)))
+    if data.get("flat_runs"):
+        print("  [!] 平直段：%s"
+              % "、".join("%s~%s" % (a, b) for a, b in data["flat_runs"]))
+    print("")
+    print("  -> %s" % os.path.relpath(p, paths["root"]))
+    print("  -> %s" % os.path.relpath(jp, paths["root"]))
+    print("")
+
+
+def cmd_studio(args):
+    """打开流程控制台。"""
+    import importlib
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    studio = importlib.import_module("studio")
+    base = os.path.abspath(args.dir)
+    if not os.path.isdir(base):
+        die("目录不存在：%s" % base)
+    studio.serve(base, port=args.port)
+
+
 # ----------------------------------------------------------------------------- 世界观工作台
 
 def cmd_worldview(args):
@@ -6793,6 +8414,10 @@ def main():
                    help="转场：none / dissolve:0.7 / fadewhite:0.4（穿越、闪回用白闪）")
     p.add_argument("--voice", action="store_true",
                    help="生成并混入 TTS 配音（默认关闭；模型自己会出声时别开，会双重人声）")
+    p.add_argument("--native-voice", action="store_true",
+                   help="原声模式：不用 TTS，保留模型自己念的台词（配乐自动让位，字幕按原声人声对齐）")
+    p.add_argument("--out", default=None,
+                   help="成片文件名（默认 final.mp4），例：--out final-native.mp4")
     p.add_argument("--crop-bottom", type=int, default=0,
                    help="裁掉底部多少像素（去掉视频模型自己烧进画面的字幕/水印）")
     p.set_defaults(func=cmd_assemble)
@@ -6821,6 +8446,10 @@ def main():
     p = sub.add_parser("audit", help="出成片审计报告（逐镜核对 + 质检 + 成本）")
     p.add_argument("dir")
     p.set_defaults(func=cmd_audit)
+
+    p = sub.add_parser("check", help="剧本逻辑自检（因果链 / 情绪曲线 / 转折铺垫 / 结尾高潮）")
+    p.add_argument("dir")
+    p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("status", help="查看进度")
     p.add_argument("dir")
@@ -6852,6 +8481,29 @@ def main():
     p.add_argument("--port", type=int, default=8777)
     p.add_argument("--no-open", action="store_true", help="不自动开浏览器")
     p.set_defaults(func=cmd_worldview)
+
+    # ── 流程化：分阶段执行 + 流程控制台 ──
+    p = sub.add_parser("flow", help="分阶段跑流程（需求分析→编剧→分镜→角色→首帧→视频→成片），"
+                                     "每阶段可单独重跑，需求改了从 --from 接着跑")
+    p.add_argument("dir")
+    p.add_argument("--stage", default=None,
+                   help="只跑这一个阶段：init/brief/story/shots/check/cast/props/frame/video/assemble")
+    p.add_argument("--from", dest="from_", default=None,
+                   help="从这一阶段开始跑（前面的阶段必须已完成）")
+    p.add_argument("--to", dest="to_", default="check",
+                   help="跑到哪一阶段就停（默认 check，视频和成片要单独跑）")
+    p.add_argument("--list", action="store_true", help="列出所有阶段")
+    p.set_defaults(func=cmd_flow)
+
+    p = sub.add_parser("studio", help="打开流程控制台（本地网页：阶段进度/需求工单/情绪分析/真实角色图与首帧图）")
+    p.add_argument("dir", help="项目所在目录（会列出其中所有集）")
+    p.add_argument("--port", type=int, default=8770)
+    p.add_argument("--no-open", action="store_true", help="不自动开浏览器")
+    p.set_defaults(func=cmd_studio)
+
+    p = sub.add_parser("analyze", help="出剧本分析报告（logline四要素/情绪曲线/母题/因果链/问答闭环）")
+    p.add_argument("dir")
+    p.set_defaults(func=cmd_analyze)
 
     p = sub.add_parser("setup", help="配置 Agnes 凭据（写入 ~/.workbuddy/agnes-clip.json）")
     p.add_argument("--agnes-endpoint", default=None)

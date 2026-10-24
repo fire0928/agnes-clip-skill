@@ -19,6 +19,8 @@
 与 agnes-clip 共用同一套文案（那边叫 CN_STREET_ANCHOR / _auto_scene_anchor）。
 """
 
+import re
+
 # 室外街道锚：全正向，一个负面词都没有
 CN_STREET_ANCHOR = (
     "Setting: contemporary mainland China, a modern Chinese city street at dusk. "
@@ -98,8 +100,60 @@ def _auto_anchor(shot):
     return CN_STREET_ANCHOR
 
 
+def _is_interior_shot(shot):
+    """室内镜头？（scene.interior 明确为 True，或机位/场景描述指向店内）"""
+    if not isinstance(shot, dict):
+        return False
+    sc = shot.get("scene") or {}
+    if not isinstance(sc, dict):
+        return False
+    if sc.get("interior") is True:
+        return True
+    if sc.get("interior") is False:
+        return False
+    return False
+
+
+# 室内镜头的地域锚：纯正向描述 + 剥掉项目 anchor 里的“街上”表述。
+# 为什么要剥：project.json 的 scene_anchor 常常写成
+#   "A small neighbourhood Chinese noodle shop and the street outside it in a modern Chinese city"
+# 而这个 anchor 会被拼到提示词**最前面**（压先验），
+# 于是 "the street outside it" 反而把整帧推成室外街景 —— 实测室内镜整帧跑出街头。
+_INTERIOR_SCENE_PREFIX = (
+    # 🔴 只做地域约束，**不带任何具体陈设**。
+    #    之前这里硬写了「白墙 / 木家具 / 刷金属吊灯 / 一摞碗」——那是某一间店堂的样子，
+    #    套到菜市场、后厨、灶间上就成了串味（ep04 菜市场首帧里冒出来米面馆的吊灯和纸条）。
+    #    陈设一律由各场景自己的 anchor + scene.set 负责。
+    "Authentic contemporary Chinese setting. "
+    "Everything visible in frame belongs to this same location. "
+    "Contemporary Chinese, not a Japanese izakaya, not a sushi bar, not a western diner, "
+    "not a Japanese street with torii gates or shrine lanterns. "
+)
+
+
+def _strip_outdoor_bits(anchor):
+    """把 anchor 里指向街道/室外的片段删掉，保留地域风格约束。"""
+    if not anchor:
+        return ""
+    out = anchor
+    # 常见写法："A and the street outside it in a modern Chinese city" / "and the street outside"
+    for pat in (
+        r",?\s*and the street outside it[^,.;]*",
+        r",?\s*and the street outside[^,.;]*",
+        r",?\s*and the street[^,.;]*",
+        r",?\s*with the street outside[^,.;]*",
+    ):
+        out = re.sub(pat, "", out, flags=re.I)
+    return out.strip()
+
+
 def scene_anchor(cfg, paths=None, shot=None):
-    """地域锁定锚。项目 project.json 的 scene_anchor 优先，其次全局配置，最后自动选。"""
+    """地域锁定锚。项目 project.json 的 scene_anchor 优先，其次全局配置，最后自动选。
+
+    🔴 分场景锚（实测 ep03 踩过）：项目级 scene_anchor 写的是主场景（比如面馆），
+       于是**同一片子里其它场景**（比如老大爷家的灶间）也被这个锚带偏 ——
+       灶间里冒出面馆的菜单条和挂轴。所以场景自己带 `anchor` 字段时优先用它。
+    """
     anchor = (cfg or {}).get("scene_anchor") or ""
     root = (paths or {}).get("root") or (paths or {}).get("proj") or "."
     import os
@@ -112,10 +166,22 @@ def scene_anchor(cfg, paths=None, shot=None):
             anchor = pconf.get("scene_anchor") or anchor
         except Exception:
             pass
+    # 场景自带锚优先（scene.anchor / scene.scene_anchor）
+    if shot:
+        sc = shot.get("scene") or {}
+        if isinstance(sc, str):
+            sc = {}
+        sa = (sc.get("anchor") or sc.get("scene_anchor") or "").strip()
+        if sa:
+            anchor = sa
     if not anchor:
         anchor = _auto_anchor(shot)
     if isinstance(anchor, str):
         anchor = SCENE_ANCHOR_PRESETS.get(anchor.strip(), anchor)
+    # 🔴 室内镜头：把 anchor 里的“街上”表述剥掉，并强制用内景正向锚。
+    #    anchor 会被拼在提示词最前面，"the street outside it" 会把整帧推成室外。
+    if _is_interior_shot(shot):
+        anchor = _INTERIOR_SCENE_PREFIX + " " + _strip_outdoor_bits(anchor)
     return anchor
 
 

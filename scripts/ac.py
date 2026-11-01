@@ -44,8 +44,10 @@ import hmac
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -54,8 +56,34 @@ import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import region_lock
+import web_guard  # noqa: E402  本地 HTTP 服务的跨站请求防护
 
-# 部分中转（apibase.cc 等）用 Cloudflare 拦 python-urllib 默认 UA，会 403 / 读超时。
+
+def _fix_console_encoding():
+    """🔴 v2.0.0：控制台编码兜底。
+
+    Windows 的 cmd.exe 默认 GBK（936），而本 skill 大量用 🔴 ✅ ❌ ⚠ ▸ 等符号
+    做标记和提示。这些字符 GBK 编不了，一旦 print 就会抛
+    `UnicodeEncodeError: 'gbk' codec can't encode character '\\U0001f534'`，
+    **整个脚本当场崩掉** —— 而且崩的地方往往跟真正的错误毫无关系，
+    排查起来非常误导。
+
+    这里把 stdout/stderr 切到 UTF-8 并对无法编码的字符降级处理，
+    保证「提示信息本身永远不会成为崩溃原因」。
+    """
+    for name in ("stdout", "stderr"):
+        s = getattr(sys, name, None)
+        if s is None:
+            continue
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_fix_console_encoding()
+
+# 部分中转网关用 Cloudflare 拦 python-urllib 默认 UA，会 403 / 读超时。
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
@@ -239,6 +267,10 @@ DEFAULT_CFG = {
 # 本 skill 自己的凭据文件，与 ai-video-pipeline 完全隔离
 GLOBAL_CFG_PATH = os.path.join(os.path.expanduser("~"), ".workbuddy", "agnes-clip.json")
 
+# ffmpeg 默认超时（秒）。跑完一整集合成也就几分钟，30 分钟足够宽裕；
+# 超时说明卡死了（读不到输入 / 滤镜死循环 / 磁盘满），必须中止而不是永远挂着。
+FF_TIMEOUT = 1800
+
 # aspect_ratio -> 首帧裁切尺寸（与 Agnes 输出一致的比例）
 RATIO_SIZE = {
     "9:16": (720, 1280),
@@ -416,9 +448,28 @@ def load_json(path, default=None):
 
 
 def save_json(path, obj):
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+    """写 JSON。**原子写**：先写同目录临时文件，再 os.replace 覆盖。
+
+    🔴 v2.0.0：原来直接 open(path, "w") 覆盖写。中途崩溃（断电、Ctrl+C、
+    磁盘满）会留下**半截 JSON**，下次读就是「配置文件损坏」——
+    凭据文件（~/.workbuddy/agnes-clip.json）损坏 = 用户的 key 全丢，
+    镜头表损坏 = 整集剧本没了。原子写保证要么完整、要么还是原来那份。
+    """
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def project_paths(root):
@@ -524,6 +575,20 @@ def have_ffmpeg(cfg):
         candidates.append(imageio_ffmpeg.get_ffmpeg_exe())
     except Exception:
         pass
+    # 🔴 兜底：本机 PATH 里没有 ffmpeg，3.13 环境也没装 imageio_ffmpeg，
+    #    但 WorkBuddy 自带的 envs/default 里有 —— 不兜底的话 seam/assemble 会
+    #    崩在 subprocess 拿到 None（ep08 踩过）。
+    try:
+        import glob as _glob
+        for _pat in (os.path.expanduser(
+                         "~/.workbuddy/binaries/python/envs/*/Lib/site-packages/"
+                         "imageio_ffmpeg/binaries/ffmpeg*.exe"),
+                     os.path.expanduser(
+                         "~/.workbuddy/binaries/python/envs/*/lib/python*/site-packages/"
+                         "imageio_ffmpeg/binaries/ffmpeg*")):
+            candidates.extend(sorted(_glob.glob(_pat), reverse=True))
+    except Exception:
+        pass
     for exe in candidates:
         if not exe:
             continue
@@ -536,9 +601,22 @@ def have_ffmpeg(cfg):
     return None
 
 
-def ff_run(exe, args, check=True, cwd=None):
+def ff_run(exe, args, check=True, cwd=None, timeout=None):
+    """跑 ffmpeg。
+
+    🔴 v2.0.0：加超时。ffmpeg 偶尔会挂死（读网络路径、滤镜死循环、
+    磁盘满时卡在写输出），没有 timeout 就是整个流程永久卡住，
+    用户的终端看上去像"死机了"，只能强杀。
+    默认 1800 秒（30 分钟）足够跑完一整集；重的合成步骤可以显式传更大的值。
+    """
     cmd = [exe] + args
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd)
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           cwd=cwd, timeout=(timeout or FF_TIMEOUT))
+    except subprocess.TimeoutExpired:
+        die("ffmpeg 超时（%d 秒）被中止：%s\n"
+            "多半是输入文件读不到、滤镜卡死或磁盘满了。"
+            % (timeout or FF_TIMEOUT, " ".join(cmd[:12]) + " ..."))
     if check and p.returncode != 0:
         die("ffmpeg 失败: %s\n%s" % (" ".join(cmd), p.stderr.decode("utf-8", "ignore")[-1500:]))
     return p
@@ -742,6 +820,21 @@ def video_tier_list(cfg):
     return out
 
 
+def _log_api_error(where, raw):
+    """把通道返回的原文完整记下来（不截断）。
+
+    🔴 用户要拿这个去找 Agnes 客服。以前只 print 前 80 个字符，
+       一个 "You have used up today's video generati" 根本没法沟通（2026-10-31）。
+       现在统一写到 ~/.workbuddy/agnes-clip-errors.log，完整 JSON 原文 + 时间 + 档位名。
+    """
+    try:
+        p = os.path.expanduser("~/.workbuddy/agnes-clip-errors.log")
+        with io.open(p, "a", encoding="utf-8") as f:
+            f.write("[%s] %s\n%s\n\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), where, raw))
+    except Exception:
+        pass
+
+
 def _tier_at(cfg, idx):
     tiers = video_tier_list(cfg)
     if tiers and idx is not None and 0 <= int(idx) < len(tiers):
@@ -837,7 +930,7 @@ def check_channel_ready(cfg, ch):
 
 
 # 通道健康度：某个通道连续失败后先跳过它，冷却一段时间再试。
-# 背景：中转站（apibase.cc）带参考图的请求有时挂 300s+ 没反应，
+# 背景：某些中转站带参考图的请求有时挂 300s+ 没反应，
 # 每次都等满超时太浪费；直接失败回退又会让第一段白跑。
 _CHANNEL_HEALTH = {}          # {channel: {"fail": n, "until": ts}}
 _CHANNEL_COOLDOWN = 900       # 冷却 15 分钟
@@ -857,6 +950,37 @@ def mark_channel_fail(ch):
     h = _CHANNEL_HEALTH.setdefault(ch, {"fail": 0, "until": 0})
     h["fail"] = h.get("fail", 0) + 1
     h["until"] = time.time() + _CHANNEL_COOLDOWN
+
+
+def record_channel_fallback(paths, frm, to, reason, shot_id=None):
+    """🔴 出图通道回退必须留痕（ep09 事故，2026-10-27）。
+
+    ep09 三条渠道全挂，31 张首帧被**静默**回退到 agnes，
+    整集画风从 Zootopia 卡通掉成照片写实，直到成片才发现、整集重做。
+
+    回退本身是合理的自保，问题在于「回退了却没人知道」。
+    所以每次回退都写进 <root>/qa/channel_fallback.json，
+    audit 会据此报警，逼着人复查画风。
+    """
+    if not paths or not paths.get("root"):
+        return
+    try:
+        qa = os.path.join(paths["root"], "qa")
+        os.makedirs(qa, exist_ok=True)
+        fp = os.path.join(qa, "channel_fallback.json")
+        d = load_json(fp, {}) or {}
+        ev = d.setdefault("events", [])
+        ev.append({
+            "from": frm,
+            "to": to,
+            "shot": shot_id,
+            "reason": (reason or "")[:200],
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        d["count"] = len(ev)
+        save_json(fp, d)
+    except Exception:
+        pass
 
 
 def mark_channel_ok(ch):
@@ -951,12 +1075,12 @@ def gpt_image_generate(cfg, prompt, ref_paths=None, size=None, ratio=None,
         payload["input"] = [{"type": "input_image", "image_url": file_to_data_uri(p)} for p in refs]
 
     url = endpoint + "/images/generations"
-    # 部分中转（apibase.cc 等）会用 Cloudflare 拦 python-urllib 的默认 UA，
+    # 部分中转网关会用 Cloudflare 拦 python-urllib 的默认 UA，
     # 报 403 error code 1010（浏览器签名不符）。带上完整浏览器头才能出图。
     headers = {"Authorization": "Bearer " + key}
     headers.update(_browser_headers(endpoint))
     last = ""
-    # 中转站有时会把带参考图的请求挂住（实测 apibase.cc 挂 300s+ 没反应）。
+    # 中转站有时会把带参考图的请求挂住（实测某些网关挂 300s+ 没反应）。
     # 给足排队时间，但必须有提示 —— 否则用户只看到"卡住"，不知道在等什么。
     wait = int(img.get("timeout") or 180)
     for attempt in range(3):
@@ -988,7 +1112,11 @@ def gpt_image_generate(cfg, prompt, ref_paths=None, size=None, ratio=None,
 
     # 中转站挂了不要连累整条链路：自动回退到 Agnes 出图
     if fallback:
-        print("[ac] GPT Image 通道失败（%s），自动回退 Agnes 出图" % last[:120], flush=True)
+        print("[ac] [FALLBACK] GPT Image 通道失败（%s），自动回退 Agnes 出图" % last[:120],
+              flush=True)
+        print("[ac] [FALLBACK] 注意：agnes 画风偏写实、角色一致性弱，"
+              "和 gpt-image 不是一路。回退超过 3 张就成片前必须抽查。", flush=True)
+        record_channel_fallback(project_paths, "gpt-image", "agnes", last)
         mark_channel_fail("gpt-image")     # 记下来，下次先跳过它
         return agnes_image_generate(
             cfg, prompt, ref_paths=ref_paths, size=size, ratio=ratio,
@@ -998,15 +1126,19 @@ def gpt_image_generate(cfg, prompt, ref_paths=None, size=None, ratio=None,
 
 def banana_image_generate(cfg, prompt, ref_paths=None, size=None, ratio=None,
                           project_paths=None, fallback=True):
-    """Nano Banana 通道（Gemini 原生 generateContent，apibase.cc 网关）。
+    """Nano Banana 通道（Gemini 原生 generateContent 网关）。
 
     和另外两条通道的差别：
     - 协议是 Gemini 原生，不是 OpenAI 的 /images/generations，也不是 /chat/completions；
     - 参考图走 parts[].inlineData（base64 + mimeType），顺序就是"主人脸、场景板"；
     - 尺寸是 imageSize(1K/2K/4K) + aspectRatio，不是像素值。
+
+    🔴 endpoint **必须自己配**（~/.workbuddy/agnes-clip.json 的 banana.endpoint）。
+    这里不给默认地址：写死别人的服务器 = 别人装了 skill 会把请求和自己的 key
+    发到那台机器上，既不礼貌也容易被滥用。
     """
     b = cfg.get("banana") or {}
-    endpoint = (b.get("endpoint") or "https://apibase.cc").rstrip("/")
+    endpoint = (b.get("endpoint") or "").rstrip("/")
     key = b.get("key") or ""
     model = b.get("model") or "nano-banana-pro"
     image_size = (size or b.get("image_size") or "2K").strip()
@@ -1020,6 +1152,15 @@ def banana_image_generate(cfg, prompt, ref_paths=None, size=None, ratio=None,
                                         ratio=ratio, project_paths=project_paths,
                                         force_channel="agnes")
         die("banana 通道缺少 key（~/.workbuddy/agnes-clip.json 的 banana.key）")
+
+    if not endpoint:
+        if fallback:
+            warn("banana 通道没有配 endpoint，回退 Agnes 出图")
+            return agnes_image_generate(cfg, prompt, ref_paths=ref_paths, size=size,
+                                        ratio=ratio, project_paths=project_paths,
+                                        force_channel="agnes")
+        die("banana 通道缺少 endpoint（~/.workbuddy/agnes-clip.json 的 banana.endpoint）。"
+            "这个 skill 不内置任何默认网关地址，请填你自己用的那个。")
 
     parts = [{"text": prompt}]
     for p in (ref_paths or []):
@@ -1063,7 +1204,11 @@ def banana_image_generate(cfg, prompt, ref_paths=None, size=None, ratio=None,
             last = str(e)
             time.sleep(min(20, 4 * (attempt + 1)))
     if fallback:
-        print("[ac] banana 通道失败（%s），自动回退 Agnes 出图" % last[:160], flush=True)
+        print("[ac] [FALLBACK] banana 通道失败（%s），自动回退 Agnes 出图" % last[:160],
+              flush=True)
+        print("[ac] [FALLBACK] 注意：agnes 画风偏写实、角色一致性弱。"
+              "回退超过 3 张就成片前必须抽查。", flush=True)
+        record_channel_fallback(project_paths, "banana", "agnes", last)
         mark_channel_fail("banana")
         return agnes_image_generate(cfg, prompt, ref_paths=ref_paths, size=size,
                                     ratio=ratio, project_paths=project_paths,
@@ -1156,7 +1301,8 @@ def frame_source(cfg, frame_path):
         if not parts:
             die("frame_upload 是空的")
         parts = [p.replace("{file}", frame_path) for p in parts]
-        p = subprocess.run(parts, shell=False, capture_output=True, text=True)
+        p = subprocess.run(parts, shell=False, capture_output=True, text=True,
+                           timeout=300)
         out = (p.stdout or "").strip()
         url = out.splitlines()[-1].strip() if out else ""
         if not url.startswith("http"):
@@ -1298,7 +1444,17 @@ def agnes_video_submit(cfg, prompt, seconds, aspect_ratio, first_frame=None,
         d["_tier"] = idx
         return d
 
+    # 🔴 降级之后要定期回头试高优先级的档（ep10 事故，2026-10-28）
+    #    原来一旦某档排不上就「永久降级」，之后每个镜头都从降级那档开始试，
+    #    结果 ep10 的日志里 610 次全撞在企业档（503），
+    #    第一档「订阅·cpk」一次都没试过 —— 用户明确要求优先用它。
     start = min(_VIDEO_TIER.get("idx", 0), len(tiers) - 1)
+    _back = float(_VIDEO_TIER.get("back_after") or 0)
+    if start > 0 and _back and time.time() >= _back:
+        start = 0
+        _VIDEO_TIER["idx"] = 0
+        _VIDEO_TIER["back_after"] = 0
+        info("  回到第 1 档（%s）重试" % (tiers[0]["name"] if tiers else "?"))
     errors = []
     for idx in range(start, len(tiers)):
         tier = tiers[idx]
@@ -1328,12 +1484,15 @@ def agnes_video_submit(cfg, prompt, seconds, aspect_ratio, first_frame=None,
             d["_tier"] = idx
             return d
         except SubmitError as e:
-            errors.append("%s: %s" % (tier["name"], str(e)[:120]))
+            full = str(e)
+            errors.append("%s: %s" % (tier["name"], full))
+            _log_api_error(tier["name"], full)
             if idx + 1 < len(tiers):
-                info("  第 %d 档 %s 排不上（%s），换下一档"
-                     % (idx + 1, tier["name"], str(e)[:80]))
-                # 降档后，之后都从这一档开始试
+                info("  第 %d 档 %s 排不上：%s"
+                     % (idx + 1, tier["name"], full.replace("\n", " ")[:300]))
+                # 降档后，之后从这一档开始试；但 5 分钟后再回头试第 1 档
                 _VIDEO_TIER["idx"] = idx + 1
+                _VIDEO_TIER["back_after"] = time.time() + 300
     raise SubmitError("所有视频通道都失败：\n  " + "\n  ".join(errors))
 
 
@@ -1343,13 +1502,22 @@ def agnes_video_status(cfg, video_id, tier_idx=None):
     host = base[:-3] if base.endswith("/v1") else base
     headers = _tier_headers(tier, cfg)
     q = urllib.parse.urlencode({"video_id": video_id, "model_name": _tier_model(cfg, tier)})
+    # 🔴 socket 兜底超时（ep10 事故，2026-10-28）
+    #    urllib 的 timeout 参数管不住 SSL 握手阶段：一次查询真的挂死过，
+    #    整条轮询链卡了 30 分钟，S04/S07/S10 三个**已经生成完**的任务一直没被下载。
+    #    加 socket 默认超时兜底，任何一步卡住都会抛异常、交给上层重试。
+    _old_to = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(30)
     try:
-        return http_json(host + "/agnesapi?" + q, headers=headers, timeout=60)
-    except urllib.error.HTTPError as e:
-        if e.code not in (404, 405):
-            raise
-    # 兜底：部分入口只有 OpenAI Videos 兼容的 /v1/videos/{id}
-    return http_json(base + "/videos/" + video_id, headers=headers, timeout=60)
+        try:
+            return http_json(host + "/agnesapi?" + q, headers=headers, timeout=45)
+        except urllib.error.HTTPError as e:
+            if e.code not in (404, 405):
+                raise
+        # 兜底：部分入口只有 OpenAI Videos 兼容的 /v1/videos/{id}
+        return http_json(base + "/videos/" + video_id, headers=headers, timeout=45)
+    finally:
+        socket.setdefaulttimeout(_old_to)
 
 
 # ----------------------------------------------------------------------------- music (optional, comfy)
@@ -3145,6 +3313,25 @@ def cmd_episode_new(args):
 
 # ----------------------------------------------------------------------------- props
 
+def _prop_shape_lock(paths, name):
+    """读 props/<name>.json 的 shape_lock 字段（道具形态锁定句）。
+
+    🔴 为什么需要：只喂道具参考图 + "Reference photo N is a close-up of tianma"，
+    模型并不认识「天麻」，会往自己认识的形状上靠 —— ep06 实测把天麻画成了
+    玉米棒（S05）、一堆小土豆（S03）、小萝卜（S01）三种不同东西。
+    参考图是唯一事实来源，但**文字必须把形态说到模型不会替换的程度**。
+    shape_lock 就是那句「说到位」的话：正向写死 + 排他列举。
+    """
+    p = os.path.join(paths["props"], str(name) + ".json")
+    if not os.path.exists(p):
+        return ""
+    try:
+        d = load_json(p, {})
+    except Exception:
+        return ""
+    return (d.get("shape_lock") or "").strip()
+
+
 def do_prop_gen(cfg, paths, name, desc, force=False):
     require_agnes_creds(cfg)
     exe = have_ffmpeg(cfg)
@@ -3304,6 +3491,128 @@ def cmd_scene_gen(args):
 
 
 # ----------------------------------------------------------------------------- frames
+
+# ================================================================
+# 时长估算 + 三类正文声明（v2.0.0，借鉴 PRINTFILM）
+# ================================================================
+# 🔴 为什么要有这两个东西
+#
+# ep07 实测：29 个有台词镜头，台词开口时间集中在 3.5-6.8 秒 ——
+# 也就是说每个镜头前面先静着看 4-6 秒动作，然后才说话，
+# 全片累计 100 多秒无声等待。用户看完只说了一句「冗长」。
+#
+# 病根是「整镜只给一个 duration」：时长了，台词就得等；时长短了，台词被切。
+# 解法两条：
+#   ① 时长按台词字数算（estimate_narration_duration）
+#   ② 每镜声明 kind（visual / dialogue / vo），把声画契约写进提示词
+#
+# ⚠️ 语速这个值要按内容调：
+#    喜剧短剧偏快 → 4.2-4.5 字/秒
+#    科普口播慢速 → 3.0-3.5 字/秒
+#    （PRINTFILM 文档里「5 字/秒」是估算用，「3 字/秒」是提示模型放慢用，别混）
+NARRATION_CPS = 4.2
+
+# 剪辑节奏六式（借鉴 PRINTFILM 的 dramaEditRhythm）：
+# 给「无台词镜」按情绪段落分配时长，而不是一律 3/4/6 秒。
+# 权重会归一化到 2-7 秒区间，循环取用。
+RHYTHM_PRESETS = {
+    "breath":         ([3, 5, 4, 3],    "呼吸式：缓入—展开—回落，建立与抒情"),
+    "heartbeat":      ([2, 2, 3, 2, 4], "心跳式：短促加速，冲突与对峙"),
+    "wave":           ([3, 4, 5, 6, 3], "海浪式：层层推高再泄力，高潮戏"),
+    "elastic":        ([2, 6, 2, 3],    "弹性时间：关键动作拉长，其余压缩"),
+    "pulse":          ([3, 3, 3, 3],    "脉冲式：规律跳动，卡点与群像"),
+    "silence_hammer": ([5, 2, 6],       "静默锤击：蓄势静场后猛切，反转"),
+}
+
+VISUAL_KINDS = ("visual", "empty", "plate", "broll", "silent")
+VO_SPEAKERS = ("vo", "narrator", "narration", "画外", "旁白", "画外音")
+
+
+def estimate_narration_duration(text, cps=None, lo=2, hi=12):
+    """按字数估算一句台词需要多少秒（不含起势和收尾）。"""
+    clean = re.sub(r"\s+", "", str(text or "").strip())
+    clean = re.sub(r"^【[^】]*】", "", clean).strip()
+    if not clean:
+        return lo
+    cps = cps or NARRATION_CPS
+    secs = int(math.ceil(len(clean) / float(cps))) + 1   # +1 留半拍呼吸
+    return max(lo, min(hi, secs))
+
+
+def estimate_visual_duration(text, lo=2, hi=8):
+    """纯画面镜按信息量给时长：<20 字 3s，<50 字 4s，再长 6s。"""
+    clean = str(text or "").strip()
+    if len(clean) < 20:
+        return max(lo, 3)
+    if len(clean) < 50:
+        return 4
+    return min(hi, 6)
+
+
+def suggest_shot_duration(shot):
+    """建议时长：有台词 = 起势 1.2s + 台词 + 收尾 0.6s；无台词按画面信息量。"""
+    line = str(shot.get("line") or "").strip()
+    if line:
+        return round(1.2 + estimate_narration_duration(line) + 0.6, 1)
+    return float(estimate_visual_duration(shot.get("action") or ""))
+
+
+def shot_kind(shot):
+    """本镜属于哪一类：visual（无台词）/ dialogue（对白）/ vo（旁白）。
+
+    镜头里显式写 kind 可以覆盖自动推导。
+    """
+    explicit = str(shot.get("kind") or "").strip().lower()
+    if explicit:
+        return explicit
+    if not str(shot.get("line") or "").strip():
+        return "visual"
+    spk = str(shot.get("speaker") or "").strip().lower()
+    if spk in VO_SPEAKERS:
+        return "vo"
+    return "dialogue"
+
+
+def _load_style_block(paths):
+    """读项目根目录的 style.md / camera.md，外置画风与运镜偏好（v2.0.0）。
+
+    🔴 以前风格和运镜硬编码在 make_ep0N.py 里，换个题材就要复制一整个生成器。
+       现在把这两块抽成纯文本，改风格不用改代码。
+       （借鉴 PRINTFILM 的 AgentSkill：用户可上传 markdown 导演手册注入生成）
+    """
+    out = []
+    for fn in ("style.md", "camera.md"):
+        p = os.path.join(paths.get("root") or "", fn)
+        if not p or not os.path.exists(p):
+            continue
+        try:
+            txt = io.open(p, encoding="utf-8").read().strip()
+        except Exception:
+            continue
+        if txt:
+            out.append(txt.replace("\r", " ").replace("\n", " "))
+    return (" " + " ".join(out)) if out else ""
+
+
+def _voice_clause(shot):
+    """声画契约：告诉模型这一镜要不要说话、要不要对口型。
+
+    🔴 空镜被念、该说话时不说，根因都是提示词里只有画面描述，
+       没有「这段配音 / 不配音」的显式声明。
+    """
+    kind = shot_kind(shot)
+    if kind in VISUAL_KINDS:
+        return (" VOICE CONTRACT: this shot is a SILENT VISUAL ONLY — no dialogue, no voice-over, "
+                "nobody speaks, no lip movement, no mouthing words. Only ambient sound and music. "
+                "Do NOT add any speech or narration.")
+    if kind == "vo":
+        return (" VOICE CONTRACT: a VOICE-OVER narration is heard off-screen in this shot — "
+                "the on-screen character does NOT move their lips and does NOT mouth the words; "
+                "keep the mouth relaxed and closed.")
+    return (" VOICE CONTRACT: this shot contains spoken DIALOGUE — the speaking character moves "
+            "their lips and jaw in precise lip-sync with the spoken line, natural Mandarin mouth "
+            "shapes, while the other characters stay silent and listen.")
+
 
 FACE_LOCK = (" Keep the face, identity, hairstyle and body proportions exactly as in the reference image; "
              "same person, no morphing, no identity drift.")
@@ -3640,6 +3949,12 @@ def _frame_for_shot(cfg, paths, shot, exe, chars=None, dry=False):
                    "same location — no other room, no street outside, no different venue.%s"
                    % (where, detail))
 
+    # 🔴 声画契约（v2.0.0）：明确这一镜是「静音画面 / 对白 / 旁白」。
+    #    空镜被念、该说话时不说，根因都是提示词只有画面描述、没有配音声明。
+    prompt += _voice_clause(shot)
+    # 外置画风 / 运镜（项目根目录的 style.md、camera.md），有就拼上
+    prompt += _load_style_block(paths)
+
     # shot.faces / 参考图收集：已在上面（人物白名单之前）完成，
     # 因为白名单里的「哪张脸是谁」绑定声明要用到 ref_bind。
 
@@ -3657,11 +3972,27 @@ def _frame_for_shot(cfg, paths, shot, exe, chars=None, dry=False):
         # 🔴 编号要接着人脸图往后数，不能从 1 开始——
         #    人脸绑定声明已经用了「Reference photo 1 / 2」，重复编号会让模型混乱。
         base = len(ref_bind)
-        prop_desc = " ".join(
-            "Reference photo %d is a close-up of %s itself — the actual food, correctly coloured "
-            "and correctly textured. Reproduce its exact colour and texture in this frame."
-            % (base + i + 1, pn) for i, (pn, _) in enumerate(prop_refs))
-        prompt += " " + prop_desc
+        prop_bits = []
+        for i, (pn, _) in enumerate(prop_refs):
+            bit = ("Reference photo %d is a close-up of %s itself — the actual food, correctly "
+                   "coloured and correctly textured. Reproduce its exact colour and texture in "
+                   "this frame." % (base + i + 1, pn))
+            lock = _prop_shape_lock(paths, pn)
+            if lock:
+                bit += " " + lock
+            prop_bits.append(bit)
+        prompt += " " + " ".join(prop_bits)
+
+    # 🔴 只锁形态、不喂图（shot.shape_props）
+    #    ep07 事故：食物特写参考图 + 长形态锁定句，会把人物整体压掉 ——
+    #    S02（猫哥端锅）、S05（狼兄凑近砂锅）出图里一个人都没有，台词全成了画外音。
+    #    所以分成两档：
+    #      props       = 喂参考图 + 加锁定句（只给「纯食物镜」用）
+    #      shape_props = 只加锁定句，不喂图（「有人物的镜」用，保证人画得出来）
+    for pn in (shot.get("shape_props") or []):
+        lock = _prop_shape_lock(paths, str(pn))
+        if lock:
+            prompt += " " + lock
 
     # shot.no_plate=true：极近景时不给场景板。板是中景，模型会照抄它的构图，压不住景别。
     plate = None if shot.get("no_plate") else plate_for(paths, shot)
@@ -3766,12 +4097,25 @@ def _submit_one(cfg, task, force_tier=None, force_max_attempts=None):
     a = cfg["agnes"]
     sid = task["shot"]
     prev = task.get("link_prev")
+    first = None
     if prev and os.path.exists(prev):
         exe = have_ffmpeg(cfg)
         if exe:
-            extract_tail_frame(prev, task["frame"], exe)
-            info("%s 首帧 = %s 的尾帧（接力，不重新构图）" % (sid, os.path.basename(prev)))
-    first = frame_source(cfg, task["frame"])
+            # 🔴 接力帧必须抽到 **frames/_chain/** 下，绝不覆盖 frames/<sid>.jpg。
+            #    （2026-10-25 修：旧代码直接写 task["frame"]，把 skill 生成的原始首帧
+            #     覆盖成了接力帧——audit 对不上、frame --only 重出后视频却是旧接力帧、
+            #     --force 重提时再被覆盖一次，资产纯净性被破坏。）
+            #    原首帧是「这一镜的官方构图」，接力帧只是「这一镜的入点」，
+            #    两者用途不同，都要留。
+            chain_dir = os.path.join(os.path.dirname(task["frame"]), "_chain")
+            os.makedirs(chain_dir, exist_ok=True)
+            chain_in = os.path.join(chain_dir, sid + "_in.jpg")
+            extract_tail_frame(prev, chain_in, exe)
+            first = frame_source(cfg, chain_in)
+            info("%s 首帧 = %s 的尾帧（接力，不重新构图；原首帧保留在 frames/%s.jpg）"
+                 % (sid, os.path.basename(prev), sid))
+    if first is None:
+        first = frame_source(cfg, task["frame"])
     last = None
     if task.get("tail"):
         last = frame_source(cfg, task["tail"])
@@ -3830,6 +4174,18 @@ def do_videos(cfg, paths, only=None, force=False, wait=False, allow_partial=Fals
         #    所以镜头里有真人时，视频提示词必须再声明一次。
         if chars and _human_cast_clause(shot, chars):
             prompt += " " + _human_cast_clause(shot, chars)
+        # 🔴 声画契约（v2.0.0）：视频是配音的载体，比首帧更需要这一句。
+        #    空镜被念、该说话时不说，根因都是这里没写清。
+        prompt += _voice_clause(shot)
+        # 🔴 视频提示词也要锁爪子（ep06 S14/S16 事故）：
+        #    首帧写了「furry animal paws」不代表视频里手还是爪子。
+        #    视频链只吃「首帧图 + 文字」，文字不提手，模型在运动里就把毛爪画成
+        #    白皮肤的人手（S16 甚至画出了做美甲的人手）。
+        #    以前只在首帧链路追加 _paws_clause，视频链路漏了 —— 这里补齐。
+        if chars:
+            paw = _paws_clause(shot, chars)
+            if paw:
+                prompt += " " + paw.strip()
         # 🔴 极近景不露脸（ep05 S06）：视频模型容易在运动中把人「带进画」——
         #    首帧只有爪子，运镜一推就可能拉出半张脸。
         #    视频提示词也要钉死「全程不露脸」。
@@ -3837,6 +4193,17 @@ def do_videos(cfg, paths, only=None, force=False, wait=False, allow_partial=Fals
             prompt += (" The camera stays in an extreme close-up on the paws, the soil and the plants "
                        "for the whole shot. No face, no head and no body ever enters the frame; "
                        "the subjects stay cropped at the wrist and the elbow throughout.")
+        # 🔴 道具形态锁定也要进视频提示词（ep06 事故）：
+        #    首帧画对了不代表视频里不跑偏——视频模型同样只看到首帧 + 文字，
+        #    文字里不提形态，它在运动中就会把天麻「演化」成玉米棒/萝卜。
+        for pn in (shot.get("props") or []):
+            lock = _prop_shape_lock(paths, str(pn))
+            if lock:
+                prompt += " " + lock
+        for pn in (shot.get("shape_props") or []):
+            lock = _prop_shape_lock(paths, str(pn))
+            if lock:
+                prompt += " " + lock
         link = (shot.get("link") or "").strip().lower()
         prev_clip = None
         if link in ("prev", "tail", "prev-tail", "prev_tail") and idx > 0:
@@ -3975,13 +4342,25 @@ def _run_scheduler(cfg, paths, jobs, queue):
                     tl = video_tier_list(cfg)
                     n_tier = len(tl)
                     order = [(tier_rr + k) % n_tier for k in range(n_tier)] if n_tier else []
+                    # 🔴 可用的档排前面：不然免费的刚冷却完又被排到队首，白白撞一次
+                    #    （ep11 实测：免费档 503 冷却后，每轮还是先试它，订阅档空着不用）
+                    order.sort(key=lambda t: 0 if _tier_ready(t, time.time()) else 1)
                     placed = False
+                    _slot_full = False
+                    _any_free = False
                     for tidx in order:
                         cap = _tier_cap(tidx)
                         if cap <= 0:
                             continue
                         if tier_used.get(tidx, 0) >= cap:
+                            # 🔴 这一档本进程的配额满了 —— 跳过它看下一档，**不要整体干等**。
+                            #    旧逻辑一满就 break，结果订阅档 3 路占满后剩下 4 个空槽
+                            #    全程闲着，31 镜要跑 3.7 小时（ep11 实测 65 分钟才出 6 个）。
+                            #    现在改成：满的档跳过，还有别的档有空位就继续投喂；
+                            #    全满才等（_any_free 全 False）。
+                            _slot_full = True
                             continue
+                        _any_free = True
                         # 限流冷却中的档位直接跳过，别再拿请求去撞墙
                         if not _tier_ready(tidx, time.time()):
                             continue
@@ -4005,18 +4384,42 @@ def _run_scheduler(cfg, paths, jobs, queue):
                                 # 速率限制：冷却 3 分钟，别再拿请求去撞墙
                                 tier_cooldown[tidx] = time.time() + 180
                                 info("  %s 档被限流，冷却 180s" % tl[tidx]["name"])
+                            elif "503" in str(e) or "queue_full" in str(e):
+                                # 🔴 队列满（503 video_queue_full）也要冷却。
+                                #    不冷却的话，占满的档会被每一个任务反复去撞 ——
+                                #    ep11 实测：企业档 2 分钟被撞 106 次，日志全是 503，
+                                #    而轮询一次都没跑到。
+                                tier_cooldown[tidx] = time.time() + 120
+                                info("  %s 档队列满，冷却 120s" % tl[tidx]["name"])
                             info("  %s 档排不上（%s），换下一档"
                                  % (tl[tidx]["name"], str(e)[:70]))
                         placed = True
                         break
+                    if _slot_full and not _any_free:
+                        # 所有档的本进程配额都满了：不再补位，先把 inflight 里的跑完再补。
+                        # 🔴 这里必须 break，绝对不能 continue ——
+                        #    continue 会跳过后面的**轮询段**，inflight 里的任务永远不被查询，
+                        #    整个调度死锁。ep10 实测：日志 15 分钟零输出，三个任务
+                        #    一直 pending 0%，而直接查接口 1 秒就返回。
+                        break
                     if placed:
                         continue
-                    # 所有配额档都在冷却 → 等最早的冷却结束，别空转刷请求
+                    # 有档在冷却 —— 但**不等于要整体干等**：
+                    #   只要还有别的档空着且可用，就退出内层回到轮询，下一轮自然会去试它。
+                    #   ep11 实测 bug：免费档 503 冷却后直接整体等 120s，
+                    #   订阅档明明空着 2 个槽位，却一个镜头都没提交进去。
                     if tier_cooldown:
-                        soonest = min(tier_cooldown.values())
-                        wait_cd = max(5.0, min(180.0, soonest - time.time()))
-                        info("  各档都在限流冷却，%.0fs 后再试" % wait_cd)
-                        next_fill = max(next_fill, time.time() + wait_cd)
+                        _any_ready = any(
+                            _tier_cap(_t) > 0
+                            and tier_used.get(_t, 0) < _tier_cap(_t)
+                            and _tier_ready(_t, time.time())
+                            for _t in order
+                        )
+                        if not _any_ready:
+                            soonest = min(tier_cooldown.values())
+                            wait_cd = max(5.0, min(180.0, soonest - time.time()))
+                            info("  各档都在限流冷却，%.0fs 后再试" % wait_cd)
+                            next_fill = max(next_fill, time.time() + wait_cd)
                         break
                     # 没有冷却信息 → 回落到普通降级链
                     task = runnable[0]
@@ -4133,7 +4536,17 @@ def cmd_fetch(args):
     for j in jobs:
         if j.get("clip") and os.path.exists(j["clip"]):
             j["status"] = "completed"
-    _run_scheduler(cfg, paths, jobs, queue)
+    result = _run_scheduler(cfg, paths, jobs, queue)
+    # 🔴 v2.0.0：只有**全部成功**才清 pending。
+    #    之前不管成败一律 os.remove —— 有镜失败时状态被抹掉，
+    #    用户既不知道哪个镜没成，也没法只补跑那几个（fetch 读的就是这个文件）。
+    bad = [j for j in (result or []) if j.get("status") == "failed"]
+    if bad:
+        save_json(p, {"jobs": [j for j in result if j.get("status") != "completed"],
+                       "queue": []})
+        warn("有 %d 个镜头失败，_pending.json 已保留（可用 fetch 继续查）：%s"
+             % (len(bad), "、".join(str(j.get("shot")) for j in bad)))
+        return
     # 清理 pending 失败不能崩：崩了会丢任务状态，后面无法续查
     try:
         os.remove(p)
@@ -4251,6 +4664,61 @@ def have_edge_tts():
         return True
     except Exception:
         return False
+
+
+_EDGE_VOICE_NAMES = None
+
+
+def edge_voice_names():
+    """edge-tts 实际支持的声线名集合（查一次缓存在进程里）。
+
+    🔴 为什么必须有这个：edge-tts 遇到不存在的声线名**不报错**，只是返回空音频，
+    上层只能拿到 NoAudioReceived —— 结果就是「配音命令跑成功了，但某个角色的台词全是哑的」。
+    ep06 就因为写了 zh-CN-XiaomoNeural / zh-CN-YunyeNeural（两个都不存在），
+    小猪弟弟和羊大爷的 8 句台词全部静音，日志里只有一行 warn。查不到返回 None（不阻断）。
+    """
+    global _EDGE_VOICE_NAMES
+    if _EDGE_VOICE_NAMES is not None:
+        return _EDGE_VOICE_NAMES
+    try:
+        r = subprocess.run([sys.executable, "-m", "edge_tts", "--list-voices"],
+                           capture_output=True, text=True, timeout=40)
+        names = set()
+        for line in (r.stdout or "").splitlines():
+            for tok in line.replace("|", " ").split():
+                if tok.count("-") >= 2 and tok.endswith("Neural") and tok[0].isalpha():
+                    names.add(tok)
+        _EDGE_VOICE_NAMES = names or None
+    except Exception:
+        _EDGE_VOICE_NAMES = None
+    return _EDGE_VOICE_NAMES
+
+
+def _assert_voices_valid(char_voice, vcfg):
+    """配音前把不存在的声线名拦下来，别让它静默变成空音频。"""
+    valid = edge_voice_names()
+    if not valid:
+        return
+    default_provider = (vcfg.get("provider") or "edge").lower()
+    if default_provider == "doubao":
+        return
+    bad = []
+    for name, voice in (char_voice or {}).items():
+        if not voice:
+            continue
+        # 只校验走 edge 的角色；豆包声线是另一套命名
+        spk = _spk_conf(vcfg, name) or {}
+        if (spk.get("provider") or default_provider) == "doubao":
+            continue
+        if voice not in valid:
+            bad.append((name, voice))
+    if not bad:
+        return
+    zh = sorted(v for v in valid if v.startswith("zh-"))
+    die("这些角色的配音声线不存在：%s\n"
+        "  edge-tts 可用中文声线：%s\n"
+        "  ⚠ 不存在的声线不会报错，只会返回空音频 —— 台词会变成哑的。请改成上面任意一个。"
+        % ("、".join("%s → %s" % (n, v) for n, v in bad), ", ".join(zh)))
 
 
 def _spk_conf(cfg, speaker):
@@ -4421,13 +4889,14 @@ def _tts_one(cfg, voice, txt, dst, rate_pct=None, pitch=None, spk=None):
     tv = spk.get("tts_volume", vcfg.get("tts_volume"))
     if tv and "%" in str(tv):
         cmd += ["--volume=%s" % str(tv)]
-    pr = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    pr = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
     if pr.returncode != 0 or not os.path.exists(dst):
         err = pr.stderr.decode("utf-8", "ignore")[-200:]
         # 回退：带 rate/pitch 失败时，去掉这两个参数再试一次（至少要出人声）
         if any(a.startswith("--rate") or a.startswith("--pitch") for a in cmd):
             cmd2 = [a for a in cmd if not a.startswith("--rate") and not a.startswith("--pitch")]
-            pr2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            pr2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 timeout=300)
             if pr2.returncode == 0 and os.path.exists(dst):
                 return True, ""
             err = err + " | 回退后仍失败: " + pr2.stderr.decode("utf-8", "ignore")[-120:]
@@ -4462,6 +4931,7 @@ def do_voice(cfg, paths, force=False, only=None, fit=True):
     os.makedirs(vo_dir, exist_ok=True)
     stored = load_json(paths["shots"], {"shots": []})
     char_voice = {c.get("name"): c.get("voice") for c in stored.get("characters", []) if c.get("voice")}
+    _assert_voices_valid(char_voice, vcfg)
     made = []
     for s in lines:
         sid = s["id"]
@@ -4617,17 +5087,45 @@ def write_subs(cfg, paths, timed_lines):
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
     count = 0
-    for shot, start, end in timed_lines:
-        line = (shot.get("line") or "").strip()
-        extras = [x.get("line") for x in (shot.get("extra_lines") or [])
-                  if (x.get("line") or "").strip()]
-        if extras:
-            line = line + (" / " if line else "") + " / ".join(extras)
-        if not line or end <= start:
+    for item in timed_lines:
+        shot, start, end = item[0], item[1], item[2]
+        shot_start = item[3] if len(item) > 3 else start
+        shot_dur = item[4] if len(item) > 4 else max(0.0, end - shot_start)
+        # 🔴 一镜多句必须逐句出一条字幕，并按字数把 VAD 给的人声区间切分。
+        #    以前只取 shot["line"]（第一句），三句的镜只显示第一句，
+        #    观众听到「多了抢味」却看不到字幕（ep12 实测）。
+        seq = [(x.get("line") or "").strip() for x in (shot.get("lines") or [])]
+        seq = [x for x in seq if x]
+        if not seq:
+            one = (shot.get("line") or "").strip()
+            seq = [one] if one else []
+        if shot.get("id") in ("S04","S05","S26"):
+            print("DBG", shot.get("id"), "start=%.2f end=%.2f shot_start=%.2f dur=%.2f seq=%s"
+                  % (start, end, shot_start, shot_dur, seq))
+        if not seq or end <= start:
             continue
-        rows.append("Dialogue: 0,%s,%s,Default,,0,0,0,,%s"
-                    % (_ass_time(start), _ass_time(end), _ass_text(line)))
-        count += 1
+        total = sum(len(x) for x in seq) or 1
+        cur = start
+        span = end - start
+        # 🔴 VAD 有时只框到第一两个音节（ep12 S04：三句 14 字只给了 1.0 秒，
+        #    结果每句 0.15 秒，根本看不清）。按字数反推需要的时间，不够就往下延。
+        need = total / 4.6 + 0.3 * (len(seq) - 1)
+        if span < need * 0.9:
+            # VAD 框歪了（ep12 S04：14 字只框到最后 1 秒），回到镜头起点按字数重排，
+            # 并且不越过本镜末尾。
+            start = shot_start + 0.6
+            span = min(need, max(0.6, shot_dur - 0.6 - 0.05))
+            end = start + span
+        for k, text in enumerate(seq):
+            d = span * len(text) / total
+            s0 = cur
+            s1 = min(end, cur + d - (0.05 if k < len(seq) - 1 else 0.0))
+            cur += d
+            if s1 <= s0:
+                continue
+            rows.append("Dialogue: 0,%s,%s,Default,,0,0,0,,%s"
+                        % (_ass_time(s0), _ass_time(s1), _ass_text(text)))
+            count += 1
     path = os.path.join(paths["out"], "_subs.ass")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(rows) + "\n")
@@ -4715,7 +5213,8 @@ def detect_speech(cfg, clip, exe):
     try:
         p = subprocess.run([exe, "-v", "error", "-i", clip, "-ac", "1", "-ar", "16000",
                             "-f", "s16le", "-acodec", "pcm_s16le", "-"],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=FF_TIMEOUT)
         raw = p.stdout
         if not raw:
             return []
@@ -5078,6 +5577,65 @@ def do_sfx(cfg, paths, into=None, out=None):
     return dst
 
 
+def _clip_levels(exe, path, cache=None):
+    """量一条片段原声的 (mean_volume, max_volume)，单位 dBFS。"""
+    if cache is not None and path in cache:
+        return cache[path]
+    res = (None, None)
+    try:
+        r = subprocess.run([exe, "-hide_banner", "-i", path, "-af", "volumedetect",
+                            "-f", "null", "-"], capture_output=True, timeout=FF_TIMEOUT)
+        txt = r.stderr.decode("utf8", "ignore")
+        m = re.search(r"mean_volume:\s*(-?[\d.]+)", txt)
+        pk = re.search(r"max_volume:\s*(-?[\d.]+)", txt)
+        res = (float(m.group(1)) if m else None,
+               float(pk.group(1)) if pk else None)
+    except Exception:
+        pass
+    if cache is not None:
+        cache[path] = res
+    return res
+
+
+def build_level_chain(entries, exe, cache, target_line=-20.0, target_amb=-26.0,
+                      peak_cap=2.0, max_gain=18.0):
+    """🔴 把逐镜原声的电平拉齐（ep09 事故，2026-10-27）。
+
+    ### 为什么必须做
+    每个片段是模型**独立生成**的，原声音量互不相干。ep09 实测 31 镜：
+        mean_volume 从 -49.4 dB（豆浆盆特写，几乎无声）
+                   到 -13.4 dB（磨浆，环境音很响）—— **跨度 36 dB**
+    直接 concat 拼起来，听感就是「忽大忽小」。用户原话：「好难听啊」。
+
+    配乐还叠加一层：每镜 bgm 值 0.20~0.32 各不相同，段间切换又加一层起伏。
+
+    ### 做法
+    按镜头时间区间分段设增益：volume=XdB:enable='between(t,a,b)'。
+
+    - 有台词的镜 → target_line（人声是主角，对齐到 -20）
+    - 无台词的镜 → target_amb（略低，保留安静镜头的呼吸感）
+    - **峰值保护**：增益不能把 max_volume 顶到 peak_cap 以上，否则削波
+    - **增益上限** max_gain：避免把极轻镜的底噪放大成嘶声
+    """
+    chain, stats = [], []
+    for e in entries:
+        sid = e["shot"]["id"]
+        a0 = e["start"]
+        b0 = a0 + e["duration"]
+        mean, peak = _clip_levels(exe, e["clip"], cache)
+        if mean is None:
+            continue
+        has_line = bool((e["shot"].get("line") or "").strip())
+        target = target_line if has_line else target_amb
+        gain = target - mean
+        if peak is not None:
+            gain = min(gain, peak_cap - peak)
+        gain = max(-20.0, min(gain, max_gain))
+        chain.append("volume=%.2fdB:enable='between(t,%.3f,%.3f)'" % (gain, a0, b0))
+        stats.append((sid, mean, gain))
+    return chain, stats
+
+
 def _clip_mean_db(exe, path, cache=None):
     """量一条片段原声的平均电平（dBFS）。用来判断模型是不是自己念了台词。
 
@@ -5089,7 +5647,7 @@ def _clip_mean_db(exe, path, cache=None):
     lvl = None
     try:
         r = subprocess.run([exe, "-hide_banner", "-i", path, "-af", "volumedetect",
-                            "-f", "null", "-"], capture_output=True)
+                            "-f", "null", "-"], capture_output=True, timeout=FF_TIMEOUT)
         txt = r.stderr.decode("utf8", "ignore")
         m = re.search(r"mean_volume:\s*(-?[\d.]+)", txt)
         if m:
@@ -5295,13 +5853,22 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
         #     这时原声是**主角**，音量给足（1.0），配乐要给它让路。
         if native_voice:
             amb_vol = 1.0
+            # 🔴 逐镜拉齐原声（ep09：31 镜跨度 36 dB，拼起来忽大忽小）
+            _lvl_chain, _lvl_stats = build_level_chain(entries, exe, mute_cache)
         else:
             amb_vol = 0.22 if tts_full else (0.82 if bgm_idx is not None else 1.0)
+            _lvl_chain, _lvl_stats = [], []
         # 双人对白集：模型在「角色开口说话」的镜头里会**自己念中文台词**（ep01/ep02/ep03 实测确认）。
         # TTS 模式下会把这些镜的原声压到 0.10，避免跟 TTS 撞声；
         # 原声模式（--native-voice）下不压，一镜都不静音。
         # project.json audio.mute_native_on_dialogue=false 可关。
-        amb_chain = "[0:a]volume=%.2f" % amb_vol
+        if native_voice and _lvl_chain:
+            amb_chain = "[0:a]" + ",".join(_lvl_chain)
+            info("原声逐镜拉齐 %d 镜（增益 %.1f ~ %.1f dB，有台词对 -20、无台词对 -26）"
+                 % (len(_lvl_stats), min(x[2] for x in _lvl_stats),
+                    max(x[2] for x in _lvl_stats)))
+        else:
+            amb_chain = "[0:a]volume=%.2f" % amb_vol
         mute_on_dlg = True
         try:
             mute_on_dlg = (pconf.get("audio") or {}).get("mute_native_on_dialogue", True)
@@ -5330,21 +5897,32 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
         parts.append(amb_chain + "[amb]")
         labels.append("[amb]")
     if bgm_idx is not None:
-        chain = build_bgm_chain(bgm_idx, entries, total)
-        if chain:
-            segs = _bgm_segments(entries)
-            info("配乐分段：%d 段，音量 %s" % (
-                len(segs),
-                " / ".join("%.2fs起%.2f" % (s["start"], s["v"]) for s in segs)))
-            parts.extend(chain)
-        else:
-            parts.append("[%d:a]atrim=0:%.3f,apad,volume=0.85[mus]" % (bgm_idx, total))
-        # 🔴 原声模式：配乐是背景，要给模型的人声让路 —— 整体压到 45%。
-        #     TTS 模式下配乐是主角（人声是 TTS，混音平衡已调好），不压。
         if native_voice:
-            parts.append("[mus]volume=0.45[musv]")
+            # 🔴 原声模式：配乐**全片固定一个音量**，首尾各淡一点。
+            #    ep09 原来是逐镜 0.20~0.32 分段跳，段间还有淡入淡出，
+            #    叠在原声的 36 dB 波动上，听感就是「忽大忽小 / 好难听」。
+            #    固定 0.26 ≈ 比拉齐后的原声低 10 dB，只做氛围，不抢人声。
+            # 再加一道轻度压缩：音乐本身的动态常有 10-14 dB（ep10 实测 12.7），
+            # 用户会觉得「忽大忽小」。压到 6-8 dB，只留乐句起伏，不留音量跳。
+            parts.append("[%d:a]atrim=0:%.3f,apad,"
+                         "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,"
+                         "volume=0.26,"
+                         "acompressor=threshold=-22dB:ratio=2.5:attack=25:release=400,"
+                         "afade=t=in:st=0:d=2.0,"
+                         "afade=t=out:st=%.2f:d=2.5[musv]"
+                         % (bgm_idx, total, max(0.0, total - 2.5)))
             labels.append("[musv]")
+            info("配乐：全片固定 0.26，首尾淡入淡出（不再逐镜跳音量）")
         else:
+            chain = build_bgm_chain(bgm_idx, entries, total)
+            if chain:
+                segs = _bgm_segments(entries)
+                info("配乐分段：%d 段，音量 %s" % (
+                    len(segs),
+                    " / ".join("%.2fs起%.2f" % (s["start"], s["v"]) for s in segs)))
+                parts.extend(chain)
+            else:
+                parts.append("[%d:a]atrim=0:%.3f,apad,volume=0.85[mus]" % (bgm_idx, total))
             labels.append("[mus]")
     vol = float((cfg.get("voices") or {}).get("volume", 1.6))
     for i, (vi, start) in enumerate(vo_inputs):
@@ -5364,6 +5942,7 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
 
     if len(labels) > 1:
         parts.append("%samix=inputs=%d:duration=first:normalize=0,"
+                     "acompressor=threshold=-18dB:ratio=2:attack=15:release=250,"
                      "alimiter=limit=0.9:level=disabled,aresample=44100[a]"
                      % ("".join(labels), len(labels)))
         audio_map = "[a]"
@@ -5394,7 +5973,7 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
                 a, b = max(merged, key=lambda x: x[1] - x[0])
                 start = e["start"] + max(0.0, a - 0.15)
                 end = min(e["start"] + e["duration"] - 0.05, e["start"] + b + 0.45)
-                timed.append((e["shot"], start, end))
+                timed.append((e["shot"], start, end, e["start"], e["duration"]))
                 info("%s 原声人声 %.2f-%.2fs，字幕已对齐" % (sid, a, b))
             else:
                 subs = e["shot"].get("subs") or []
@@ -5431,7 +6010,7 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
                 d = ff_duration(vo_p, exe)
                 start = e["start"] + 0.3
                 end = min(e["start"] + e["duration"] - 0.1, start + d + 0.4)
-                timed.append((e["shot"], start, end))
+                timed.append((e["shot"], start, end, e["start"], e["duration"]))
             elif ff_has_audio(e["clip"], exe):
                 segs = detect_speech(cfg, e["clip"], exe)
                 if segs:
@@ -5444,7 +6023,7 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
                     a, b = max(merged, key=lambda x: x[1] - x[0])
                     start = e["start"] + max(0.0, a - 0.15)
                     end = min(e["start"] + e["duration"] - 0.05, e["start"] + b + 0.45)
-                    timed.append((e["shot"], start, end))
+                    timed.append((e["shot"], start, end, e["start"], e["duration"]))
                     info("%s 人声 %.2f-%.2fs，字幕已对齐" % (sid, a, b))
                 else:
                     info("%s 未检测到人声，跳过字幕" % sid)
@@ -5558,6 +6137,377 @@ def _gray_thumb(path, exe, w=48, h=80):
     return data[i:i + w * h]
 
 
+def do_chain(cfg, paths, apply=False, max_tail_run=3, allow_faces=False):
+    """自动给镜头配对「首尾帧接力」，消灭分镜跳跃。
+
+    🔴🔴 v2.0.0（用户拍板的铁律，改掉了旧规矩）：
+
+        **首尾帧只用于「没有人物」的镜头。有人物的镜头一律单帧驱动。**
+
+        > 用户原话：「镜头语言，是为了表达出更好更顺畅且没有人物的才需要用首尾帧。」
+
+        为什么（ep10 实测）：人物镜挂 tail_frame=next，等于要求模型把本镜结尾
+        **收敛到下一镜的人物构图**。两个首帧里人物的姿态、朝向、手的位置都不一样，
+        模型只能插值 —— 于是段尾出现「人物没演完就往下一镜漂」「车把歪」「手多出来」。
+        观众看到的就是「东西乱飞 / 动作怪」。
+
+        而没有人物可漂的镜头（空镜、道具特写、风景、做菜手部特写），
+        桥接纯粹赚到运镜的顺，一点风险都没有。
+
+        **人物镜怎么保证顺畅？靠剪辑本身：同场景、同机位、动作接动作、视线接视线。
+        不靠首尾帧硬钉。**
+
+    两种模式（都只作用于无人物镜）：
+
+    ① **尾帧截图接力**（link=prev，无脸特写专用）
+       连续 no_faces=True 的镜组（做菜六连、挖掘特写等），第 2 镜起把
+       **上一镜视频的尾帧**抽出来当自己的首帧——动作真正接续，不是重新构图。
+       画面里没有脸，不存在「尾帧连传把脸带漂移」的风险，所以允许连传多段。
+
+    ② **尾帧桥接**（tail_frame=next）
+       🔴 默认**关闭**。只有显式加 `--allow-faces` 才允许给人物镜配对，
+       而且必须先用 `seam` 量过、确认没有漂移才用。这是应急口子，不是常规手段。
+       原来无人物镜组收尾时挂一个 tail_frame（落点是后面的人物镜首帧）——
+       这个保留：挂的是无脸镜，没有脸可漂，只是让镜头切回人物时构图不跳。
+    """
+    exe = have_ffmpeg(cfg)
+    shots = load_json(paths["shots"])["shots"]
+    n = len(shots)
+    plan = []          # [(sid, 字段, 值, 模式, 理由)]
+
+    def usable(idx):
+        s = shots[idx]
+        return not s.get("reuse") and not s.get("recall")
+
+    # ---------- ① 无脸特写连续镜组 → link=prev 连传 ----------
+    i = 0
+    while i < n:
+        if usable(i) and shots[i].get("no_faces"):
+            j = i
+            while j + 1 < n and usable(j + 1) and shots[j + 1].get("no_faces"):
+                j += 1
+            run = j - i + 1
+            if run >= 2:
+                for k in range(i + 1, j + 1):
+                    sid = shots[k]["id"]
+                    if (shots[k].get("link") or "").strip().lower() in ("prev", "tail", "prev-tail", "prev_tail"):
+                        continue
+                    plan.append((sid, "link", "prev", "尾帧截图接力",
+                                 "无脸特写连传（%s→%s，共 %d 镜）：上一镜尾帧直接当本镜首帧，动作真接续"
+                                 % (shots[k - 1]["id"], sid, run)))
+                # 链尾镜：如果下一镜有人物且同场景，把整组收在下一镜构图上
+                if j + 1 < n and usable(j + 1):
+                    nxt = shots[j + 1]
+                    if not nxt.get("no_faces") and (nxt.get("scene") or {}).get("id") == (shots[j].get("scene") or {}).get("id"):
+                        if not shots[j].get("tail_frame"):
+                            plan.append((shots[j]["id"], "tail_frame", "next", "尾帧桥接",
+                                         "特写链的收尾镜：落点钉在 %s 的首帧上，特写段切回人物镜头时零跳" % nxt["id"]))
+            i = j + 1
+        else:
+            i += 1
+
+    # ---------- ② 有人物的同场景相邻镜 → tail_frame=next ----------
+    # 🔴 v2.0.0：**默认关闭**。首尾帧只给无人物镜头用（见 docstring）。
+    #    要开必须显式 --allow-faces，且开之前先用 seam 量过。
+    if not allow_faces:
+        info("首尾帧只给无人物镜用（v2.0.0 铁律），人物镜一律单帧驱动 —— 已跳过人物镜配对")
+    # 🔴 连续桥接要设上限（--tail-run，默认 3）：每一镜都挂尾帧，意味着每一镜的
+    #    结尾都在向下一镜构图收敛。连挂太多镜，中间几镜会出现「人物没演完就往
+    #    下一镜漂」的观感。同场景内连挂 N 镜就停一次，让下一镜自然呼吸。
+    tail_run = 0
+    for k in range(n - 1):
+        a, b = shots[k], shots[k + 1]
+        # 🔴 v2.0.0：没人物的镜才允许走首尾帧桥接
+        if not allow_faces:
+            tail_run = 0
+            continue
+        if not usable(k) or not usable(k + 1):
+            tail_run = 0
+            continue
+        if a.get("no_faces") or b.get("no_faces"):
+            tail_run = 0
+            continue                      # 特写镜归模式①管
+        if a.get("link"):
+            tail_run = 0
+            continue                      # 已在接力链里，不叠加
+        if a.get("tail_frame"):
+            tail_run += 1
+            continue                      # 已配过，幂等（仍计数，防超限）
+        if (a.get("scene") or {}).get("id") != (b.get("scene") or {}).get("id"):
+            tail_run = 0
+            continue                      # 跨场景必然切换，桥接没意义
+        if tail_run >= max_tail_run:
+            tail_run = 0
+            continue                      # 连挂达到上限，这一镜放松
+        # 🔴 容错（v2.0.0，借鉴 PRINTFILM 的 previous_usable_shot）：
+        #    tail_frame 的落点靠「下一镜的首帧图」。如果下一镜还没出图/生成失败，
+        #    这里配了也是空指向 —— 生成时静默跳过，剪辑点上还是硬跳。
+        #    所以缺图就不配，让这一处自然放松，而不是留一条断链。
+        nb_frame = os.path.join(paths["frames"], b["id"] + ".jpg")
+        if not os.path.exists(nb_frame):
+            tail_run = 0
+            warn("%s→%s 跳过尾帧桥接：%s 还没有首帧图" % (a["id"], b["id"], b["id"]))
+            continue
+        plan.append((a["id"], "tail_frame", "next", "尾帧桥接",
+                     "同场景相邻（%s→%s，%s）：把 %s 的首帧钉成本镜尾帧，剪辑点零跳变"
+                     % (a["id"], b["id"], (a.get("scene") or {}).get("id"), b["id"])))
+        tail_run += 1
+
+    if not plan:
+        info("没有需要配对的镜头（可能都已是特写链或跨场景）")
+        return []
+    print("")
+    print("── 首尾帧接力配对方案（%d 处）──" % len(plan))
+    print("%-6s %-12s %-6s %-10s %s" % ("镜", "字段", "值", "模式", "理由"))
+    for sid, field, val, mode, why in plan:
+        print("%-6s %-12s %-6s %-10s %s" % (sid, field, val, mode, why))
+    print("")
+    print("效果：模式①的镜头入点接上一镜尾帧（动作真接续）；模式②的镜头落点 = 下一镜首帧（剪辑点零跳）。")
+    print("生成后跑 `ac.py seam %s` 量接缝差值验收（<35 顺，>=60 是硬跳）。" % paths["root"])
+    if not apply:
+        print("")
+        print("以上是预览。加 --apply 写回 shots.json。")
+        return plan
+
+    by_id = {s["id"]: s for s in shots}
+    for sid, field, val, _mode, _why in plan:
+        by_id[sid][field] = val
+    story = load_json(paths["shots"])
+    story["shots"] = shots
+    save_json(paths["shots"], story)
+    info("已写回 %d 处配对 → script/shots.json" % len(plan))
+    return plan
+
+
+def cmd_retime(args):
+    """按台词字数重算每镜时长（v2.0.0）。
+
+    🔴 解决的问题：ep07 的 29 个有台词镜头，台词开口集中在 3.5-6.8 秒，
+       前面全是无声动作，全片累计 100 多秒空等 —— 用户只说了「冗长」两个字。
+       根因是 duration 凭感觉给 7-9 秒，没跟台词字数挂钩。
+
+    规则：
+      有台词 → 起势(--pad) + 台词时长 + 收尾(--tail)
+      无台词 → 按画面信息量 3 / 4 / 6 秒
+    """
+    cfg, paths = load_project(args.dir)
+    shots_path = paths["shots"]
+    data = load_json(shots_path)
+    shots = data.get("shots") or []
+    cps = args.cps or NARRATION_CPS
+    total_old = total_new = 0.0
+    changed = 0
+
+    # 节奏模板（可选）：只作用于「无台词镜」，按情绪段落给不同长度，
+    # 比一律 3/4/6 秒更贴剪辑感。有台词镜仍按字数精确算。
+    rhythm_w = None
+    if getattr(args, "rhythm", None):
+        preset = RHYTHM_PRESETS.get(args.rhythm)
+        if not preset:
+            die("未知节奏「%s」，可选：%s" % (args.rhythm, " / ".join(RHYTHM_PRESETS.keys())))
+        rhythm_w = preset[0]
+        info("节奏模板：%s —— %s" % (args.rhythm, preset[1]))
+    v_idx = 0
+
+    print("%-6s %8s %8s  %s" % ("镜头", "原时长", "建议", "依据"))
+    for s in shots:
+        sid = s.get("id")
+        try:
+            old = float(s.get("duration") or 0)
+        except (TypeError, ValueError):
+            old = 0.0
+        line = (s.get("line") or "").strip()
+        if line:
+            need = estimate_narration_duration(line, cps)
+            new = round(args.pad + need + args.tail, 1)
+            n_chars = len(re.sub(r"\s+", "", line))
+            why = "台词 %d 字 → 口播 %gs" % (n_chars, need)
+        elif rhythm_w:
+            w = rhythm_w[v_idx % len(rhythm_w)]
+            v_idx += 1
+            new = float(max(2, min(7, w)))
+            why = "无台词，%s 第 %d 拍 → %gs" % (args.rhythm, v_idx, new)
+        else:
+            new = float(estimate_visual_duration(s.get("action") or ""))
+            why = "无台词，按画面 %d 字" % len(s.get("action") or "")
+        total_old += old
+        total_new += new
+        mark = "" if abs(new - old) < 0.6 else ("  ↓ 砍 %.1fs" % (old - new) if new < old
+                                                else "  ↑ 加 %.1fs" % (new - old))
+        print("%-6s %7.1fs %7.1fs  %s%s" % (sid, old, new, why, mark))
+        if abs(new - old) >= 0.6:
+            changed += 1
+        if args.apply:
+            s["duration"] = new
+
+    print("")
+    print("原总长 %.1fs（%.1f 分钟）→ 建议 %.1fs（%.1f 分钟）｜改动 %d 镜"
+          % (total_old, total_old / 60.0, total_new, total_new / 60.0, changed))
+    if args.apply:
+        save_json(shots_path, data)
+        info("已写回 %s" % shots_path)
+        warn("时长改了要重跑首帧/视频才会真正生效（已生成的片段不会自动变短）")
+    else:
+        info("预览模式，确认后加 --apply 写回")
+
+
+def cmd_assemble_image(args):
+    """image_text 档：静图 + 推拉运镜 + TTS 配音 + 字幕（v2.0.0）。
+
+    🔴 借鉴 PRINTFILM 的 pipeline_mode 双档设计：
+       full       = 图 + 视频模型 + 合成（贵、慢，但画面会动）
+       image_text = 静图 + 推拉 + 配音 + 字幕（成本几十分之一，几分钟出片）
+
+    用途：**先出静图版验证节奏和台词，对了再决定要不要花额度出视频版**。
+    ep07 的教训是「44 个视频跑完才发现节奏冗长」，有了这一档就不用再赌。
+    """
+    cfg, paths = load_project(args.dir)
+    shots = load_json(paths["shots"])["shots"]
+    if not shots:
+        die("没有镜头")
+    missing = [s["id"] for s in shots
+               if not os.path.exists(os.path.join(paths["frames"], s["id"] + ".jpg"))]
+    if missing:
+        die("这些镜头还没有首帧图：%s（先跑 ac.py frame）" % ", ".join(missing))
+
+    exe = have_ffmpeg(cfg)
+    # 🔴 兜底：某些 python 环境里没装 imageio_ffmpeg，have_ffmpeg 会返回 None，
+    #    接下来的 subprocess 就会因为参数是 None 而崩（报 expected str, not NoneType）。
+    if not exe:
+        for cand in (r"C:\Users\fire0\.workbuddy\binaries\python\envs\default\Lib"
+                     r"\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe",):
+            if os.path.exists(cand):
+                exe = cand
+                break
+    if not exe:
+        die("找不到 ffmpeg（装一下 imageio-ffmpeg，或把 ffmpeg 放进 PATH）")
+    w, h = OUT_SIZE.get(cfg["agnes"].get("aspect_ratio", "9:16"), (720, 1080))
+    fps = 24
+    tmp = os.path.join(paths["out"], "_imgtmp")
+    os.makedirs(tmp, exist_ok=True)
+
+    # ① 配音（复用现有 do_voice；没装 edge-tts 就退化成纯画面版）
+    info("生成配音 …")
+    try:
+        do_voice(cfg, paths, force=args.force, fit=True)
+    except Exception as e:
+        warn("配音失败（%s），继续出无声版" % str(e)[:80])
+
+    # ② 每镜静图 → 推拉片段
+    segs, timeline, t = [], [], 0.0
+    for i, s in enumerate(shots):
+        sid = s["id"]
+        dur = float(s.get("duration") or 4)
+        src = os.path.join(paths["frames"], sid + ".jpg")
+        dst = os.path.join(tmp, sid + ".mp4")
+        frames = max(2, int(dur * fps))
+        # 奇偶交替推近/拉远，避免所有镜头一个方向显得呆
+        if i % 2 == 0:
+            z = "min(zoom+0.0011,1.12)"
+        else:
+            z = "if(eq(on,1),1.12,max(zoom-0.0011,1.0))"
+        vf = ("scale=%d:%d,zoompan=z='%s':d=%d:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+              ":s=%dx%d,fps=%d,setsar=1" % (w * 2, h * 2, z, frames, w, h, fps))
+        subprocess.run([exe, "-y", "-loop", "1", "-i", src, "-t", "%.2f" % dur,
+                        "-vf", vf, "-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
+                        "-pix_fmt", "yuv420p", dst], capture_output=True, timeout=FF_TIMEOUT)
+        if not os.path.exists(dst):
+            warn("%s 推拉片段生成失败，跳过" % sid)
+            continue
+        segs.append(dst)
+        timeline.append((s, t))
+        t += dur
+
+    if not segs:
+        die("没有可用的静图片段")
+    info("推拉片段 %d 个，总长 %.1fs" % (len(segs), t))
+
+    # ③ 拼接（重编码，音轨稍后统一做）
+    lst = os.path.join(tmp, "list.txt")
+    with io.open(lst, "w", encoding="utf-8") as f:
+        for p in segs:
+            f.write("file '%s'\n" % p.replace("\\", "/").replace("'", r"'\''"))
+    body = os.path.join(tmp, "body.mp4")
+    subprocess.run([exe, "-y", "-f", "concat", "-safe", "0", "-i", lst,
+                    "-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
+                    "-pix_fmt", "yuv420p", body], capture_output=True, timeout=FF_TIMEOUT)
+    if not os.path.exists(body):
+        die("拼接失败")
+
+    # ④ 字幕
+    sub_path = os.path.join(paths["out"], "_subs_image.ass")
+    timed = []
+    for s, st in timeline:
+        line = (s.get("line") or "").strip()
+        if not line:
+            continue
+        pad = 0.35
+        timed.append((s, st + pad, st + float(s.get("duration") or 4) - 0.2))
+    write_subs(cfg, paths, timed)
+    src_ass = os.path.join(paths["out"], "_subs.ass")
+    if os.path.exists(src_ass):
+        shutil.copy2(src_ass, sub_path)
+
+    # ⑤ 混音：按时间轴摆各镜配音 + 配乐垫底
+    vo_dir = os.path.join(paths["audio"], "vo")
+    inputs, filters, mix_labels = [], [], []
+    idx = 1                       # 0 = body
+    inputs += ["-i", body]
+    for s, st in timeline:
+        p = os.path.join(vo_dir, s["id"] + ".mp3")
+        if not os.path.exists(p):
+            continue
+        ms = int(round(st * 1000))
+        inputs += ["-i", p]
+        filters.append("[%d:a]adelay=%d|%d,volume=1.0[v%d]" % (idx, ms, ms, idx))
+        mix_labels.append("[v%d]" % idx)
+        idx += 1
+    bgm = os.path.join(paths["audio"], "bgm.mp3")
+    has_bgm = os.path.exists(bgm)
+    if has_bgm:
+        inputs += ["-stream_loop", "-1", "-i", bgm]
+        filters.append("[%d:a]volume=0.10,atrim=0:%.2f,afade=t=in:st=0:d=1.2,"
+                       "afade=t=out:st=%.2f:d=1.5[bg]" % (idx, t, max(0, t - 1.5)))
+        mix_labels.append("[bg]")
+
+    out_mp4 = os.path.join(paths["out"], args.out or "final-image.mp4")
+    if mix_labels:
+        fc = ";".join(filters) + ";" + "".join(mix_labels) + \
+             "amix=inputs=%d:duration=first:normalize=0,loudnorm=I=-16:TP=-1.5:LRA=11[a]" % len(mix_labels)
+        cmd = [exe, "-y"] + inputs + ["-filter_complex", fc,
+                                      "-map", "0:v", "-map", "[a]",
+                                      "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                                      "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+                                      "-movflags", "+faststart", out_mp4]
+    else:
+        cmd = [exe, "-y"] + inputs + ["-c:v", "copy", "-an", out_mp4]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=FF_TIMEOUT)
+
+    # 烧字幕（ass 滤镜只认相对路径，cd 到 out 目录）
+    if os.path.exists(sub_path):
+        burned = os.path.join(paths["out"], "_img_burned.mp4")
+        subprocess.run([exe, "-y", "-i", out_mp4,
+                        "-vf", "ass=_subs_image.ass",
+                        "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                        "-c:a", "copy", burned], capture_output=True, cwd=paths["out"],
+                       timeout=FF_TIMEOUT)
+        if os.path.exists(burned):
+            os.replace(burned, out_mp4)
+
+    if os.path.exists(out_mp4):
+        mb = os.path.getsize(out_mp4) / 1048576.0
+        info("image_text 成片 -> %s（%.1f MB，%.1f 秒）" % (out_mp4, mb, t))
+        info("成本约为 full 档的几十分之一；确认节奏没问题再跑 ac.py video 出动态版")
+    else:
+        die("合成失败：%s" % (r.stderr or "")[-300:])
+
+
+def cmd_chain(args):
+    cfg, paths = load_project(args.dir)
+    do_chain(cfg, paths, apply=args.apply, max_tail_run=args.tail_run,
+             allow_faces=getattr(args, "allow_faces", False))
+
+
 def do_seam(cfg, paths, window=0.4):
     """量相邻两镜的「接缝跳变」：上一镜最后一帧 vs 下一镜第一帧的灰度差。
 
@@ -5616,6 +6566,21 @@ def do_audit(cfg, paths):
     rows = []
     issues = []
     notes = []          # 提示（不是缺陷），不进问题计数
+
+    # 🔴 出图通道回退复查（ep09 事故，2026-10-27）
+    # 三条渠道全挂时脚本会自动回退 agnes 把活干完，但 agnes 和 gpt-image 画风不是一路：
+    # 猫头变小、脸变尖、面罩发灰、比例失衡，整集从 Zootopia 卡通掉成照片写实。
+    # ep09 就是 31 张全被静默回退，直到成片才发现、整集重做。
+    _fb = os.path.join(paths["root"], "qa", "channel_fallback.json")
+    if os.path.exists(_fb):
+        _fbd = load_json(_fb, {}) or {}
+        _n = int(_fbd.get("count") or 0)
+        if _n:
+            _tos = sorted({e.get("to") for e in _fbd.get("events", []) if e.get("to")})
+            issues.append(
+                "出图通道回退 %d 次（→ %s）：回退出的图与主通道画风不同（agnes 偏写实、"
+                "角色一致性弱），必须逐张抽查画风" % (_n, "/".join(_tos) or "?"))
+
     total_planned = 0
     total_actual = 0.0
     image_count = 0
@@ -5988,7 +6953,237 @@ def _shot_text(s):
                       (s.get("video_prompt") or ""), (s.get("line") or ""), fr])
 
 
-def _check_structural_holes(shots, issues, warns):
+# =============================================================================
+# 镜头体检（v2.0.0）—— ep11 实测：31 镜只有 1 种景别、0 个特写、30/31 镜没运动
+#
+# 🔴 为什么要机器查（ep11 观众原话）：
+#   「对话的时候要有特写镜头来展现表情细节」← 特写 0 镜
+#   「场景还是变化太多，角度一会儿又变了一会儿又变了」← 机位只有一种，但缺焦段/高度锚点
+#   「镜头语言还是过于死板」← 30/31 镜静态，景别单一
+#   这三条逐镜看每一条都合理，连起来才出事。人眼扫 31 镜很难不漏。
+#
+# 判定口径（与 references/shot_coverage.md 一致）：
+#   景别取 shot_size，缺失时从 camera 句里认；都没有就判 "unknown"（算问题）。
+#   「特写」= medium close-up / close-up / extreme close-up / insert / macro
+# =============================================================================
+
+# 景别 → 归一化标签。顺序有意义：先匹配更具体的。
+# 🔴 two-shot（双人）必须和单人 medium 分开算——它们视觉差别不小，
+#    合成一个标签会把「28 镜双人对话」误判成「28 镜同景别」。
+_SHOT_SIZE_ORDER = ("insert", "macro", "extreme close-up", "close-up",
+                    "medium close-up", "medium wide", "medium", "wide")
+
+
+def _norm_shot_size(shot):
+    """取这一镜的景别标签。
+
+    🔴 实战里景别**不是**写在结构化字段上的（ep11/ep12/ep13 三集 100 镜，
+    `shot_size` 全空、`camera` 全空），而是直接写进 `frame.prompt` 的
+    framing 句和 `video_prompt` 的时间码里。所以识别要按这个优先级：
+      ① shot_size  ② camera  ③ frame.prompt + video_prompt
+    只查字段会把 100 镜全判成"没景别"，那是误报。
+    """
+    raw = (shot.get("shot_size") or "").strip().lower()
+    if not raw:
+        raw = (shot.get("camera") or "").strip().lower()
+    if not raw:
+        fr = (shot.get("frame") or {}).get("prompt") or ""
+        raw = ("%s %s" % (fr, shot.get("video_prompt") or "")).lower()
+    if not raw:
+        return ""
+    # 🔴 two-shot 单独成类：双人同框和单人 medium 视觉差别不小，
+    #    混成一个标签会把「28 镜双人对话」误判成「28 镜同景别跳切」。
+    if "two-shot" in raw or "two shot" in raw:
+        # two-shot 前面若带景别（medium two-shot / wide two-shot），
+        # 优先取那个更具体的景别，但保留"双人"这个信息。
+        for k in _SHOT_SIZE_ORDER:
+            if k in raw:
+                return "two-shot " + k
+        return "two-shot"
+    for k in _SHOT_SIZE_ORDER:
+        if k in raw:
+            return k
+    if "medium" in raw:
+        return "medium"
+    return raw
+
+
+def _is_close_shot(size):
+    """特写。带 "two-shot " 前缀的也要算（人数不影响它是不是特写）。"""
+    z = (size or "").replace("two-shot ", "").strip()
+    return z in ("medium close-up", "close-up", "extreme close-up", "insert", "macro")
+
+
+def _is_wide_shot(size):
+    z = (size or "").replace("two-shot ", "").strip()
+    return z in ("wide", "medium wide")
+
+
+def _check_camera_coverage(shots, issues, warns, paths=None):
+    """镜头覆盖体检：景别单一 / 特写占比 / 相邻同景别 / wide 次数 / 越轴 / 字段缺失。
+
+    对应 references/shot_coverage.md 第八节。
+    """
+    if not shots:
+        return
+
+    sizes = [_norm_shot_size(s) for s in shots]
+    have = [z for z in sizes if z]
+
+    # ---- ① 景别识别不到 = 这一镜没写景别 ----
+    # 🔴 景别可以从 frame.prompt / video_prompt 里认（实战都这么写），
+    #    所以只有三处都没有才判"没写"。
+    missing_size = [s.get("id") for s, z in zip(shots, sizes) if not z]
+    if missing_size:
+        issues.append(
+            "这些镜认不出景别（shot_size 空、camera 空、frame.prompt 里也没有）——%s。"
+            "不写景别模型一律给中景，一集下来就是「死板」。"
+            "写 shot_size 字段，或在 frame.prompt 里写明景别"
+            "（见 references/shot_coverage.md）"
+            % ("、".join(str(x) for x in missing_size[:8])
+               + ("等 %d 镜" % len(missing_size) if len(missing_size) > 8 else "")))
+
+    # ---- ①b 机位句的物理锚点 ----
+    # 🔴 实战都把景别写进 frame.prompt，但**焦段/机位高度/物理锚点**往往没写。
+    #    ep11 实测：「角度一会儿又变了一会儿又变了」——因为只有景别没有锚点，
+    #    模型每生成一次就自己挑一个角度。
+    #    判据：这一镜的文本里有没有镜头焦段（xxmm）或物理机位/运动词。
+    ANCHOR_RE = re.compile(
+        r"\b\d{2,3}\s?mm\b"          # 85mm / 35 mm
+        r"|\bcamera\s+(?:at|on|resting|across|behind|over|from|beside)\b"
+        r"|\beye[\s-]?level\b"
+        r"|\blow\s+angle\b|\bhigh\s+angle\b|\boverhead\b"
+        r"|\bstatic\b|\bpush[\s-]?in\b|\bpull[\s-]?out\b|\btilt\b|\btrack\b|\barc\b",
+        re.I)
+    no_anchor = []
+    for s in shots:
+        txt = " ".join([(s.get("camera") or ""),
+                        ((s.get("frame") or {}).get("prompt") or ""),
+                        (s.get("video_prompt") or "")])
+        if not ANCHOR_RE.search(txt):
+            no_anchor.append(s.get("id"))
+    if no_anchor:
+        warns.append(
+            "这些镜的提示词里没有焦段/机位锚点/运动词（%s）——只写景别的话，"
+            "模型每次生成会自己挑角度，同一场戏看着像换了好几个机位"
+            "（ep11 观众原话：「角度一会儿又变了一会儿又变了」）。"
+            "补一句 `on an 85mm lens, camera resting on the counter at eye level, static locked-off tripod`"
+            % ("、".join(str(x) for x in no_anchor[:8])
+               + ("等 %d 镜" % len(no_anchor) if len(no_anchor) > 8 else "")))
+
+    # ---- ② 景别种类：全集只有一种 = 死板 ----
+    # ep11 实测：31 镜只有 medium 一种 → 观众直接说「镜头语言过于死板」
+    if len(shots) >= 6:
+        # 🔴 景别"种类"要把 two-shot 去掉前缀再算大类：
+        #    medium two-shot 和 medium 单人属于同一档景别，区别在人数不在景别。
+        distinct = sorted(set(z.replace("two-shot ", "").strip() for z in have))
+        if len(distinct) <= 1 and have:
+            issues.append(
+                "全片 %d 镜只有一种景别（%s）——观众会直接说「镜头语言死板」。"
+                "对话戏至少要 wide（定空间）+ medium close-up（表情）+ insert（手/道具）三种。"
+                "见 references/shot_coverage.md" % (len(shots), distinct[0]))
+
+    # ---- ③ 特写占比：对话戏至少 30% ----
+    # ep11 实测：特写 0/31 镜 → 观众要「用特写展现表情细节」
+    if len(shots) >= 8:
+        n_close = sum(1 for z in sizes if _is_close_shot(z))
+        pct = int(100.0 * n_close / len(shots))
+        if pct < 30:
+            issues.append(
+                "特写（medium close-up / close-up / insert）只有 %d 镜，占 %d%%，低于 30%% —— "
+                "对话戏的表情全靠特写，缺了就是「只有两张脸在中间说话」。"
+                "把有台词的关键镜改成 medium close-up（脸占画面三分之一）"
+                % (n_close, pct))
+
+    # ---- ④ 相邻镜景别：连续 3 镜**同景别且同机位** = 跳切 ----
+    # 🔴 必须加机位条件：同景别但机位不同（比如从 table 切到 two-shot），
+    #    画面角度变了，观众读到的是"换了个角度"，不是跳切。
+    #    ep07 S37-S42 就是这种——景别全是 medium，但机位在 two-shot/table 之间换。
+    best_run = []          # [(idx, size, angle), ...]
+    cur = []
+    for i, z in enumerate(sizes):
+        ang = (shots[i].get("angle") or "wide").strip()
+        if z and cur and cur[-1][1] == z and cur[-1][2] == ang:
+            cur.append((i, z, ang))
+        elif z:
+            cur = [(i, z, ang)]
+        else:
+            cur = []
+        if len(cur) > len(best_run):
+            best_run = list(cur)
+    if len(best_run) >= 3:
+        issues.append(
+            "连续 %d 镜同一景别**且同一机位**（%s / %s）——剪在一起观众读到的是跳切，"
+            "不是换镜头。相邻镜必须换一档景别，或换机位"
+            "（wide → medium close-up → medium → insert）。涉及：%s"
+            % (len(best_run), best_run[0][1], best_run[0][2],
+               "→".join(str(shots[i].get("id")) for i, _, _ in best_run)))
+
+    # ---- ⑤ wide 至少 2 次（开场 + 结尾）----
+    if len(shots) >= 8:
+        n_wide = sum(1 for z in sizes if _is_wide_shot(z))
+        if n_wide < 2:
+            warns.append(
+                "wide / medium wide 只有 %d 镜——开场和结尾各需要一个交代空间的镜头，"
+                "少一个整集就像一直贴在脸上说话" % n_wide)
+
+    # ---- ⑥ 越轴：同一场景内同一角色的左右位置不能变 ----
+    # 🔴 ep11 实测：S31 猫哥突然从右跳到左。
+    #    判据：同一个 angle（= 同一个机位）下，同一角色的机位句里
+    #    左/右的位置词不能翻转。camera 句里没有位置词就查不出来，跳过。
+    POS_WORDS = (("left", "left"), ("right", "right"),
+                 ("画面左", "left"), ("画面右", "right"),
+                 ("画左", "left"), ("画右", "right"),
+                 ("on the left", "left"), ("on the right", "right"),
+                 ("screen left", "left"), ("screen right", "right"))
+    side_by_angle = {}
+    for s in shots:
+        ang = (s.get("angle") or "wide").strip()
+        cam = (s.get("camera") or "").strip().lower()
+        if not cam:
+            continue
+        hits = set()
+        for w, tag in POS_WORDS:
+            if w in cam:
+                hits.add(tag)
+        if len(hits) != 1:
+            continue  # 没有位置词，或同时写了左右（本身就有问题，另说）
+        side_by_angle.setdefault((ang, s.get("char")), set()).update(hits)
+    for (ang, who), sides in side_by_angle.items():
+        if len(sides) > 1:
+            issues.append(
+                "机位「%s」下角色「%s」的位置左右翻转了（%s）——这是越轴，"
+                "观众会突然不知道谁站在哪。同一机位的左右写死不变"
+                % (ang, who or "?", "/".join(sorted(sides))))
+
+    # ---- ⑦ 场景板必须在（angle 有对应板）----
+    # 🔴 ep07 事故：机位定义 7 个、场景板只有 4 个，缺板的镜
+    #    没喂场景参照，模型自由发挥 → 场景直接漂到另一家店。
+    #    这条能查：assets/scenes/{场景}__{机位}.jpg 不存在就是没板。
+    if paths:
+        sp = paths.get("scenes")
+        if sp and os.path.isdir(sp):
+            miss = []
+            for s in shots:
+                ang = (s.get("angle") or "wide").strip() or "wide"
+                sc = s.get("scene") or {}
+                sid = (sc.get("id") or "").strip()
+                if not sid:
+                    continue
+                p = os.path.join(sp, "%s__%s.jpg" % (
+                    re.sub(r"[^\w\-]+", "_", sid),
+                    re.sub(r"[^\w\-]+", "_", ang)))
+                if not os.path.exists(p):
+                    miss.append("%s(%s)" % (s.get("id"), ang))
+            if miss:
+                issues.append(
+                    "这些镜的机位没有对应场景板——%s。"
+                    "没板 = 没喂场景参照，模型会自己编一个场景（实测直接漂到另一家店，甚至画成日式）。"
+                    "先跑 ac.py scene-gen 补齐，或把 angle 改指到已有板的机位上"
+                    % ("、".join(miss[:8]) + ("等 %d 镜" % len(miss) if len(miss) > 8 else "")))
+
+
+def _check_structural_holes(shots, issues, warns, paths=None):
     """🔴 结构级逻辑硬伤检查（ep05 实测，用户反馈「情节不顺畅」）。
 
     之前 do_logic_check 只查**字段完整性**（because 有没有填、intensity 分布），
@@ -6172,6 +7367,49 @@ def _check_structural_holes(shots, issues, warns):
                 "%s 反派索赔（%s）但前 3 镜没有任何「这片地是谁的」的铺垫 —— "
                 "建议提前埋一个界碑/围栏/标牌，观众才会觉得「哦原来是他们的地」"
                 "而不是「这老头怎么知道这是他家的」" % (s.get("id"), line))
+
+    # ---------- ④ 首尾帧接力配置校验（chain 命令配套，2026-10-25 加）----------
+    # link=prev：本镜首帧取上一镜视频尾帧。链上每一环的上一镜必须存在且不是
+    # 回忆/复用片段（那种不是本集新生成的视频，没有可接的尾帧）。
+    # 🔴 有人物的镜不许连传超过 2 段（ep04 脸漂移事故：尾帧接力一镜一镜往下传，
+    #    脸会累积漂移）。无脸特写镜（no_faces）没有脸可漂，连传正是它的用途。
+    LINK_WORDS = ("prev", "tail", "prev-tail", "prev_tail")
+    link_run = 0
+    for i, s in enumerate(shots):
+        sid = s.get("id")
+        link = (s.get("link") or "").strip().lower()
+        if link in LINK_WORDS:
+            if i == 0:
+                issues.append("%s 配了 link=%s，但它是第一镜，没有上一镜可接" % (sid, link))
+                link_run = 0
+                continue
+            prev = shots[i - 1]
+            if prev.get("reuse") or prev.get("recall"):
+                issues.append("%s 接 %s 的尾帧，但 %s 是回忆/复用片段，没有新视频尾帧可接"
+                              % (sid, prev.get("id"), prev.get("id")))
+            if not s.get("no_faces"):
+                link_run += 1
+                if link_run >= 3:
+                    issues.append(
+                        "%s 是有人物的镜，却连在第 %d 段尾帧接力链上 —— "
+                        "有人物的镜最多连传 2 段（ep04 脸漂移事故：脸会一镜一镜累积漂移）。"
+                        "改法：第 3 段起改成 tail_frame=next（两端锚首帧，漂不走），"
+                        "或者这段本来就是无脸特写的话加 no_faces=True"
+                        % (sid, link_run))
+            else:
+                link_run = 0
+        else:
+            link_run = 0
+        tf = s.get("tail_frame")
+        if tf:
+            key = str(tf).strip().lower()
+            if key == "next":
+                if i + 1 >= len(shots):
+                    issues.append("%s 配了 tail_frame=next，但它是最后一镜，没有下一镜首帧" % sid)
+            elif key not in ("", "false", "none") and paths:
+                tgt = os.path.join(paths["frames"], str(tf).strip() + ".jpg")
+                if not os.path.exists(tgt):
+                    warns.append("%s 尾帧指向 %s.jpg，但该首帧还没生成（先跑 frame）" % (sid, tf))
 
 
 def do_logic_check(cfg, paths):
@@ -6546,6 +7784,15 @@ def do_logic_check(cfg, paths):
         line = (s.get("line") or "").strip()
         if not _is_real_question(line):
             continue
+        # 🔴 v2.0.0：**同镜内问答也算闭环**。
+        #    对话喜剧里最自然的就是一问一答同框（A 问 B 答，剪在一个镜头里）。
+        #    旧逻辑只看 shot["line"]（第一句）和下一镜，会把这种正常写法判成「问句悬空」。
+        #    ep11 实测：31 镜里有 5 镜是一镜内问答，全被误报。
+        _inlines = s.get("lines") or []
+        if len(_inlines) > 1:
+            _qspk = (s.get("speaker") or "").strip().lower()
+            if any((_l.get("speaker") or "").strip().lower() != _qspk for _l in _inlines[1:]):
+                continue
         nxt = shots[i + 1]
         spk = (s.get("speaker") or "").strip().lower()
         nspk = (nxt.get("line") is not None) and (nxt.get("speaker") or "").strip().lower() or ""
@@ -6584,7 +7831,39 @@ def do_logic_check(cfg, paths):
     # 🔴 这三类是 ep05 实测出的真问题，用户原话「情节不顺畅」——
     #    逐镜看都通，连起来看「怎么突然就…」「问的和答的不是一回事」。
     #    之前的检查只看字段完整性（because 有没有填），看不出这种结构伤。
-    _check_structural_holes(shots, issues, warns)
+    _check_structural_holes(shots, issues, warns, paths)
+
+    # ---- 5.6.5 镜头覆盖体检（v2.0.0）----
+    # 🔴 ep11 实测：31 镜只有 1 种景别、0 个特写、30/31 镜没运动描述。
+    #    观众原话「对话的时候要有特写镜头」「镜头语言还是过于死板」
+    #    「角度一会儿又变了一会儿又变了」——这三条逐镜看都合理，连起来才出事。
+    #    对应 references/shot_coverage.md。
+    _check_camera_coverage(shots, issues, warns, paths)
+
+    # ---- 5.7 时长与台词字数是否匹配（v2.0.0）----
+    # 🔴 ep07 事故：29 个有台词镜头，台词开口集中在 3.5-6.8 秒，
+    #    前面全是无声动作，全片累计 100 多秒空等 —— 用户只说了两个字「冗长」。
+    #    病根是「duration 拍脑袋给 7-9 秒」，没有跟台词字数挂钩。
+    for s in shots:
+        sid = s.get("id")
+        line = (s.get("line") or "").strip()
+        if not line:
+            continue
+        try:
+            dur = float(s.get("duration") or 0)
+        except (TypeError, ValueError):
+            continue
+        need = estimate_narration_duration(line)
+        # 富余 = 起势 1.2 + 收尾 0.8 + 一拍 ≈ 3 秒
+        if dur > need + 3.0:
+            issues.append(
+                "%s 时长 %gs，但台词「%s」按 %.1f 字/秒约需 %gs —— 前后会空等约 %gs。"
+                "改成 %gs 左右（或用 ac.py retime 自动重算）"
+                % (sid, dur, line, NARRATION_CPS, need, dur - need - 1.5, need + 1.5))
+        elif dur < need:
+            warns.append(
+                "%s 时长 %gs 比台词「%s」需要的 %gs 还短，容易赶词或说不完"
+                % (sid, dur, line, need))
 
     # ---- 输出 ----
     print("")
@@ -6601,7 +7880,7 @@ def do_logic_check(cfg, paths):
         for x in warns:
             print("  · " + x)
     if not issues and not warns:
-        print("OK：因果链字段、情绪曲线、结尾高潮、台词长度、问答闭环、美食号专项、温度梯度均通过")
+        print("OK：因果链字段、情绪曲线、结尾高潮、台词长度、问答闭环、美食号专项、温度梯度、镜头覆盖均通过")
     print("")
     if issues:
         print("结论：%d 个必须改的问题" % len(issues))
@@ -7642,7 +8921,7 @@ def _ui_tts(data):
                "--text", text, "--write-media", tmp]
         if rate:
             cmd += ["--rate=%s" % rate]  # 同上：-10% 不能被当成选项
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
         if p.returncode != 0 or not os.path.exists(tmp):
             raise RuntimeError(p.stderr.decode("utf-8", "ignore")[-200:] or "合成失败")
         with open(tmp, "rb") as f:
@@ -7711,6 +8990,7 @@ def cmd_config_ui(args):
     import webbrowser
 
     cfg = load_global_cfg()
+    allowed_ports = {int(getattr(args, "port", 0) or 8765)}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -7749,6 +9029,12 @@ def cmd_config_ui(args):
                 self._send(404, "{}")
 
         def do_POST(self):
+            # 🔴 跨站写请求防护：/api/config 能改全局凭据（端点、key 指向哪），
+            #    只监听 127.0.0.1 不等于安全。见 web_guard.py。
+            if not web_guard.check_write_request(self.headers, allowed_ports):
+                self._send(403, json.dumps({"ok": False, "message": "跨站请求已拒绝"},
+                                           ensure_ascii=False))
+                return
             n = int(self.headers.get("Content-Length") or 0)
             try:
                 data = json.loads(self.rfile.read(n) or b"{}")
@@ -7830,6 +9116,7 @@ def cmd_music_ui(args):
     os.makedirs(music_dir, exist_ok=True)
     html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "music_ui.html")
     state = {"proc": None}
+    allowed_ports = {int(getattr(args, "port", 0) or 8788)}
 
     def tracks():
         names = []
@@ -7948,6 +9235,12 @@ def cmd_music_ui(args):
                 self._send(404, "{}")
 
         def do_POST(self):
+            # 🔴 跨站写请求防护：/api/upload 能往磁盘写文件，
+            #    只监听 127.0.0.1 不等于安全。见 web_guard.py。
+            if not web_guard.check_write_request(self.headers, allowed_ports):
+                self._send(403, json.dumps({"ok": False, "message": "跨站请求已拒绝"},
+                                           ensure_ascii=False))
+                return
             n = int(self.headers.get("Content-Length") or 0)
             path = self.path.split("?")[0]
             if path == "/api/upload":
@@ -8059,19 +9352,26 @@ def _flow_work_order():
 def cmd_flow(args):
     """分阶段跑流程。每阶段可单独重跑；需求改了用 --from 接着跑。"""
     flow, analysis = _flow_imports()
+
+    # --list 不需要项目：列阶段清单不该逼用户先建项目（2026-10-25 体验修正）
+    if args.list:
+        print("")
+        print("  可用阶段（按顺序）：")
+        for i, (k, label, arts, desc) in enumerate(flow.STAGES, 1):
+            print("    %d. %-10s %-14s %s" % (i, k, label, desc))
+            print("       %-10s %-14s 产物：%s" % ("", "", "、".join(arts)))
+        print("")
+        print("  用法：ac.py flow <项目dir>                  # 从当前进度接着跑")
+        print("        ac.py flow <项目dir> --from story     # 从编剧阶段开始跑")
+        print("        ac.py flow <项目dir> --stage brief    # 只跑需求分析这一个阶段")
+        print("        ac.py flow <项目dir> --stage brief --stage shots")
+        print("")
+        return
+
     cfg, paths = load_project(args.dir)
     paths = _flow_paths(paths)
     root = paths["root"]
     os.makedirs(os.path.join(root, "script"), exist_ok=True)
-
-    if args.list:
-        print("")
-        print("  可用阶段：")
-        for k, label, arts, desc in flow.STAGES:
-            print("    %-10s %-14s %s" % (k, label, desc))
-            print("    %-10s %-14s 产物：%s" % ("", "", "、".join(arts)))
-        print("")
-        return
 
     def mark(k, status, note):
         flow.mark(paths, k, status, note)
@@ -8137,7 +9437,7 @@ def cmd_flow(args):
         elif k == "check":
             p = subprocess.run([sys.executable, os.path.abspath(__file__), "check", root],
                                capture_output=True, text=True, encoding="utf-8",
-                               errors="ignore")
+                               errors="ignore", timeout=600)
             txt = (p.stdout or "") + (p.stderr or "")
             cp = os.path.join(paths["report"], "check.md")
             with io.open(cp, "w", encoding="utf-8") as f:
@@ -8378,6 +9678,32 @@ def main():
     p.add_argument("--window", type=float, default=0.4, help="取上一镜最后多少秒的帧")
     p.set_defaults(func=cmd_seam)
 
+    p = sub.add_parser("chain", help="自动配对首尾帧接力（特写连传 link=prev / 同场景人物镜 tail_frame=next），消灭分镜跳跃")
+    p.add_argument("dir")
+    p.add_argument("--apply", action="store_true", help="写回 shots.json（不加只预览）")
+    p.add_argument("--tail-run", type=int, default=3, help="同场景内最多连续桥接几镜（默认 3，超过就松一镜让画面呼吸）")
+    p.add_argument("--allow-faces", action="store_true",
+                   help="🔴 应急口子：允许给有人物的镜头配首尾帧。"
+                        "默认关闭（v2.0.0 铁律：首尾帧只给无人物镜用）。"
+                        "开了会让人物在两个首帧之间插值漂移，用前先用 seam 量过。")
+    p.set_defaults(func=cmd_chain)
+
+    p = sub.add_parser("retime", help="按台词字数重算每镜时长（治「每镜先静 5 秒才开口」的冗长）")
+    p.add_argument("dir")
+    p.add_argument("--apply", action="store_true", help="写回 shots.json（不加只预览）")
+    p.add_argument("--cps", type=float, default=None, help="口播字/秒（默认 %.1f；科普慢速可设 3.0）" % NARRATION_CPS)
+    p.add_argument("--pad", type=float, default=1.2, help="开口前留的起势秒数（默认 1.2）")
+    p.add_argument("--tail", type=float, default=0.6, help="说完后的收尾秒数（默认 0.6）")
+    p.add_argument("--rhythm", default=None,
+                   help="无台词镜的剪辑节奏：" + " / ".join(RHYTHM_PRESETS.keys()))
+    p.set_defaults(func=cmd_retime)
+
+    p = sub.add_parser("assemble-image", help="image_text 档：静图+推拉+配音+字幕（不跑视频模型，成本几十分之一）")
+    p.add_argument("dir")
+    p.add_argument("--out", default="final-image.mp4")
+    p.add_argument("--force", action="store_true", help="重生成配音")
+    p.set_defaults(func=cmd_assemble_image)
+
     p = sub.add_parser("recall", help="把旧剧集片段剪成回忆（不调 Agnes，不花额度）")
     p.add_argument("dir")
     p.add_argument("--only", default=None)
@@ -8485,7 +9811,7 @@ def main():
     # ── 流程化：分阶段执行 + 流程控制台 ──
     p = sub.add_parser("flow", help="分阶段跑流程（需求分析→编剧→分镜→角色→首帧→视频→成片），"
                                      "每阶段可单独重跑，需求改了从 --from 接着跑")
-    p.add_argument("dir")
+    p.add_argument("dir", nargs="?", default=None, help="项目目录（--list 时可省略）")
     p.add_argument("--stage", default=None,
                    help="只跑这一个阶段：init/brief/story/shots/check/cast/props/frame/video/assemble")
     p.add_argument("--from", dest="from_", default=None,

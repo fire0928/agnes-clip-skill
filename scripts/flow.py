@@ -62,7 +62,8 @@ STAGES = [
     ("frame",    "⑧ 首帧",       ["frames/"],
      "逐镜首帧图（这是画面的唯一真源）"),
     ("video",    "⑨ 视频",       ["clips/"],
-     "首帧 → Agnes 出片"),
+     "首帧 → Agnes 出片（先跑 `ac.py chain <项目> --apply` 配对首尾帧接力，"
+     "特写连传用 link=prev、同场景人物镜用 tail_frame=next，消灭分镜跳跃）"),
     ("assemble", "⑩ 合成成片",   ["out/"],
      "拼接 + 配乐 + 音效 + 字幕 + 混音"),
 ]

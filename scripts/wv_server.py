@@ -25,6 +25,27 @@ import webbrowser
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import wv_core  # noqa: E402
+import web_guard  # noqa: E402
+
+
+def _fix_console_encoding():
+    """🔴 控制台编码兜底。
+
+    Windows cmd.exe 默认 GBK，编不了 🔴 ✅ ❌ ⚠ ▸ 这些符号，
+    print 出来会抛 UnicodeEncodeError 让整个脚本崩掉。
+    统一切 UTF-8 + 降级替换，保证提示信息本身不会成为崩溃原因。
+    """
+    for name in ("stdout", "stderr"):
+        s = getattr(sys, name, None)
+        if s is None:
+            continue
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_fix_console_encoding()
 
 UI_PATH = os.path.join(HERE, "worldview_ui.html")
 # 项目里可能有多个 skill 各自的 UI 文件，优先找同目录的
@@ -49,8 +70,10 @@ def safe_join(root, *parts):
     return p
 
 
-def make_handler(default_root):
+def make_handler(default_root, port=None):
     default_root = os.path.abspath(default_root)
+    # 允许的本地端口：服务自己那个 + 上面可能手工指定的
+    allowed_ports = {port} if port else None
 
     def allowed_root(candidate):
         """只允许写「当前项目」或「同系列其它集」。
@@ -153,6 +176,11 @@ def make_handler(default_root):
         # ── POST ──
         def do_POST(self):
             u = urllib.parse.urlparse(self.path)
+            # 🔴 跨站写请求防护：只监听 127.0.0.1 不等于安全，
+            #    浏览器里任意网页都能 POST 过来改你的剧本。见 web_guard.py。
+            if not web_guard.check_write_request(self.headers, allowed_ports):
+                self._json({"ok": False, "message": "跨站请求已拒绝"}, 403)
+                return
             try:
                 n = int(self.headers.get("Content-Length") or 0)
             except ValueError:
@@ -197,7 +225,7 @@ def serve(root, port=8777, open_browser=True, stop_after=None):
     if not os.path.isdir(root):
         print("[停] 目录不存在: " + root)
         sys.exit(1)
-    handler = make_handler(root)
+    handler = make_handler(root, port)
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
     url = "http://127.0.0.1:%d/" % port
     print("世界观工作台已启动: " + url)

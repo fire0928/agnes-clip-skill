@@ -157,9 +157,19 @@ Agnes 单段最多 12 秒，长视频 = 多段拼接：
 - `faces`：**只喂「画面里真露脸」的角色参考图**，默认等于 `cast`。
   🔴 过肩/背身镜头必须收窄（例：`"faces": ["girl"]`）。前景那人背对镜头看不见脸，把他的 face_ref 一起喂进去，
   模型会在画面别处按参考图**再画一个完整的人** —— 同一镜出现两个同一个人（本 skill 实测事故：S06 窗边凭空多出一个男主）。
-- `link: "prev"`：首帧取上一镜视频的**最后一帧**。
-  适用：同场景、同机位、紧接的正反打/接话。管线会自动等上一镜出片再提交，不会并发抢跑。
-  不适用：跨场景、换机位、时间跳跃。
+- `link: "prev"`：首帧取上一镜视频的**最后一帧**（尾帧截图接力，动作真接续）。
+  适用：同场景、同机位、紧接的正反打/接话；**无脸特写连续镜组**（做菜六连、挖菜特写等）。
+  管线会自动等上一镜出片再提交，不会并发抢跑。
+  🔴 **有人物的镜最多连传 2 段**（ep04 脸漂移事故：尾帧接力一镜一镜往下传，脸会累积漂移）。
+  无脸特写镜（`no_faces: true`）没有脸可漂，连传多少段都行——这正是它最大的用途。
+  不适用：跨场景、换机位、时间跳跃、上一镜是回忆/复用片段。
+  接力帧抽到 `frames/_chain/<sid>_in.jpg`，**不覆盖** `frames/<sid>.jpg` 原首帧。
+- `tail_frame: "next"`：把**下一镜的首帧图**钉成本镜的尾帧（尾帧桥接）。
+  适用：同一场景的相邻人物镜——剪辑点上 A 的最后一帧 == B 的第一帧，零跳变。
+  比 `link` 安全：每镜两端都锚在已生成的首帧上，不会一镜一镜往下漂，人物脸被两端首帧夹住漂不走。
+  🔴 同场景内不要连挂超过 3 镜（每镜结尾都在向下一镜构图收敛，连挂多了中间几镜
+  会「人物没演完就往下一镜漂」）。`ac.py chain` 自动配对时已内置此上限（`--tail-run`）。
+  `tail_frame` 也可以写具体镜号（`"tail_frame": "S05"`），把落点钉在任意一镜的首帧上。
 - `no_plate: true`：极近景时不吃场景板参考（板是中景，模型会照抄它的构图）。代价是背景陈设要自己写进 prompt。
 - `no_faces: true`：**极近景不露脸**（只拍爪子/前臂/食材）。这一镜的人物脸不入画。
   🔴 不加这个标记，特写会被顶成站立人物镜（实测 ep05 S06）：
@@ -213,3 +223,27 @@ Agnes 单段最多 12 秒，长视频 = 多段拼接：
 
 ### 环视镜头
 `video_prompt` 里写 `the camera slowly arcs around the table/subject`，全片 1–2 次即可，别用在台词特写。
+
+### 道具形态锁定 shape_lock（v2.0.0）
+
+`props` 里的每个道具，除了 `assets/props/<name>.jpg` 参考图，
+还可以在 `assets/props/<name>.json` 里写 `shape_lock`：
+
+```json
+{
+  "name": "tianma",
+  "desc": "（生成参考图用的长描述）",
+  "shape_lock": "SHAPE LOCK for the tianma: an OVAL egg-shaped tuber about the size of a small potato, pale cream-yellow, its ENTIRE LENGTH densely circled by RING-SHAPED HORIZONTAL WRINKLES like a stack of rings, a small pointed reddish-brown hawk-beak bud at one tip. It is NOT a corn cob, NOT a white radish, NOT a carrot, NOT ginger, NOT a potato."
+}
+```
+
+`ac.py` 会把它**同时拼进首帧提示词和视频提示词**。
+
+🔴 **为什么必须有**：模型不认识地方食材，只写 `taking one tianma tuber` 时，
+它会把这个词替换成自己认识的物体——ep06 同一批天麻被画成玉米棒（S05）、
+小土豆（S03）、小萝卜（S01），三镜三个样，观众直接跳戏。
+参考图给的是"长什么样"，`shape_lock` 给的是"不许变成什么"，两者都要。
+
+写法三条：① 先给**尺寸锚**（`about the size of a small potato`）；
+② **正向**写死轮廓和表面特征；③ 再补**排他清单**。
+物体形态写 NOT 是有效的（和地域锚相反——地域锚写 NOT 反而会激活那个概念）。

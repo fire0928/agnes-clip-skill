@@ -30,6 +30,27 @@ import urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import analysis as analysis_mod  # noqa: E402
 import flow as flow_mod  # noqa: E402
+import web_guard  # noqa: E402
+
+
+def _fix_console_encoding():
+    """🔴 控制台编码兜底。
+
+    Windows cmd.exe 默认 GBK，编不了 🔴 ✅ ❌ ⚠ ▸ 这些符号，
+    print 出来会抛 UnicodeEncodeError 让整个脚本崩掉。
+    统一切 UTF-8 + 降级替换，保证提示信息本身不会成为崩溃原因。
+    """
+    for name in ("stdout", "stderr"):
+        s = getattr(sys, name, None)
+        if s is None:
+            continue
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_fix_console_encoding()
 
 AC = os.path.abspath(__file__)
 SKILL_DIR = os.path.dirname(AC)
@@ -366,6 +387,7 @@ def _last_check_output(base, ep):
 def serve(base, port=8770):
     import http.server
     import webbrowser
+    allowed_ports = {port}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -470,6 +492,12 @@ def serve(base, port=8770):
         # ---------------- POST ----------------
         def do_POST(self):
             u = urllib.parse.urlparse(self.path)
+            # 🔴 跨站写请求防护：这个接口会直接往项目目录写文件，
+            #    只监听 127.0.0.1 不等于安全。见 web_guard.py。
+            if not web_guard.check_write_request(self.headers, allowed_ports):
+                self._send(403, json.dumps({"ok": False, "message": "跨站请求已拒绝"},
+                                           ensure_ascii=False), "application/json")
+                return
             q = urllib.parse.parse_qs(u.query)
             ep = (q.get("ep") or [""])[0]
             n = int(self.headers.get("Content-Length") or 0)

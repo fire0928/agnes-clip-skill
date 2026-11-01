@@ -3,7 +3,8 @@
 用法（在本 skill 根目录下跑）：
     python tools/publish.py            # 正常更新
     python tools/publish.py --dry-run  # 只看会做什么，不真推
-    python tools/publish.py --bump 1.1.0  # 顺便升版本号
+    python tools/publish.py --bump     # 版本号自动进位（2.0.3 -> 2.0.4）
+    python tools/publish.py --bump 2.1.0  # 指定版本号（会校验格式）
 
 它会：
 1. 扫全库做安全检查（密钥 / 本机路径 / 缓存文件），有问题直接停；
@@ -27,8 +28,18 @@ REPO = "ssh://git@ssh.github.com:443/fire0928/agnes-clip-skill.git"
 SSH_OPTS = "-o StrictHostKeyChecking=yes -o ConnectTimeout=25 -p 443"
 PKG_NAME = "agnes-clip"
 
+# 版本号规则（唯一真源在 tools/version_rule.py）
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+try:
+    from version_rule import next_version, validate_version, describe as _ver_desc
+except Exception:  # 规则模块丢了也别把发布流程整个卡死
+    next_version = validate_version = None
+
+    def _ver_desc():
+        return "版本号 = 主.次.修，补丁位满 9 进到次版本。"
+
 # 不该进仓库的东西
-SKIP_DIRS = {"__pycache__", ".git", ".idea", ".vscode"}
+SKIP_DIRS = {"__pycache__", ".git", ".idea", ".vscode", "dist"}
 SKIP_FILES = {".DS_Store", ".pyc", ".pyo"}
 SECRET_FILES = {"agnes-clip.json", "ai-video-pipeline.json", ".env", "id_rsa"}
 SECRET_PAT = re.compile(
@@ -36,14 +47,37 @@ SECRET_PAT = re.compile(
     r"|ghp_[A-Za-z0-9]{20,}"
     r"|github_pat_[A-Za-z0-9_]{20,}"
     r"|AIza[A-Za-z0-9]{30,}"
+    r"|xox[baprs]-[A-Za-z0-9-]{10,}"
+    r"|AKIA[0-9A-Z]{16}"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
     r"|id_rsa)"
 )
 # 本机绝对路径，不能出现在公开仓库里
 LOCAL_PAT = re.compile(r"(E:/workbuddy|E:\\workbuddy|C:/Users/[A-Za-z0-9_-]+)")
 
+# 🔴 备份/临时文件：改代码前手动留的，含旧代码旧密钥，必须拦住。
+#    之前只扫 .md/.py 等固定后缀，这些文件直接绕过检查被 git add -A 提交上去。
+BACKUP_PAT = re.compile(r"(\.bak(\.|$)|\.old$|\.orig$|\.tmp$|~$)")
+
+# 🔴 私人中转端点：公开仓库里不该出现**别人**的私有服务地址。
+#    默认端点写死 = 别人装了 skill 会把请求和自己的 key 发到那台机器上。
+#    注意：作者自己公司的产品线域名（README 末尾的署名）是正当公开信息，不在此列。
+PRIVATE_HOST_PAT = re.compile(
+    r"(apibase\.cc"
+    r"|ai\.000000\.icu"
+    r"|43\.138\.\d+\.\d+"
+    r"|134\.175\.\d+\.\d+"
+    r"|100\.79\.\d+\.\d+)"
+)
+
+# 二进制文件，不做内容扫描
+BINARY_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".ico",
+              ".mp4", ".mp3", ".wav", ".zip", ".pdf", ".ttf", ".otf", ".woff",
+              ".woff2", ".aac", ".m4a", ".mov", ".webm"}
+
 # 这些文件自己就包含密钥样例、本机路径或正则本身，检查时会自己命中自己，跳过
 SELF_REferential = {
-    "tools/publish.py",       # 含 LOCAL_PAT / SECRET_PAT 定义
+    "tools/publish.py",       # 含 LOCAL_PAT / SECRET_PAT / PRIVATE_HOST_PAT 定义
     "tools/package_skill.py",  # 含 SECRET_PAT 定义
     "tools/git_sync.py",       # 含 LOCAL_PAT / SECRET_PAT 定义
     "发布指南.md",             # 内部手册，讲的就是本机路径与排错
@@ -63,7 +97,15 @@ def sh(cmd, **kw):
 
 
 def scan():
-    """发布前安全体检。返回问题列表，空列表 = 干净。"""
+    """发布前安全体检。返回问题列表，空列表 = 干净。
+
+    🔴 扫描规则（v2.0.0 加固）：
+    1. **按内容全量扫**，不再只看固定后缀 —— 之前只扫 .md/.py/.html/.json/.txt/.sh，
+       其它后缀（.bak/.old/.log/无后缀…）整个文件被跳过，等于没有检查。
+    2. **备份文件一律拦下**，不让旧代码混进公开仓库。
+    3. **私人端点、私有 IP 一律拦下**。
+    4. 二进制文件只查扩展名，不读内容。
+    """
     issues = []
     for dirpath, dirnames, filenames in os.walk(ROOT):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
@@ -73,25 +115,43 @@ def scan():
             if fn in SECRET_FILES:
                 issues.append("凭据文件不应存在: " + rel)
                 continue
-            if not fn.endswith((".md", ".py", ".html", ".json", ".txt", ".sh")):
+            if fn in SKIP_FILES:
                 continue
-            if rel.replace(os.sep, "/") in SELF_REferential:
+            # ---- 备份/临时文件：直接拦下，不管内容 ----
+            if BACKUP_PAT.search(fn):
+                issues.append("备份/临时文件不应进仓库（改完删掉）: " + rel)
                 continue
+            if rel in SELF_REferential:
+                continue
+            # ---- 二进制：只查扩展名 ----
+            ext = os.path.splitext(fn)[1].lower()
+            if ext in BINARY_EXT:
+                continue
+            # ---- 文本：全量读入扫描（不看后缀）----
             try:
                 body = open(p, encoding="utf-8").read()
             except Exception:
+                # 读不出来（多半是二进制或编码问题）→ 保守跳过，但记一笔
                 continue
             if SECRET_PAT.search(body):
                 issues.append("疑似含密钥: " + rel)
             m = LOCAL_PAT.search(body)
-            if m and not rel.startswith("tools/publish.py"):
+            if m:
                 issues.append("含本机绝对路径 (%s): %s" % (m.group(1), rel))
+            h = PRIVATE_HOST_PAT.search(body)
+            if h:
+                issues.append("含私人中转/内网地址 (%s): %s" % (h.group(1), rel))
             if "__pycache__" in rel or rel.endswith(".pyc"):
                 issues.append("缓存文件: " + rel)
     return issues
 
 
 def bump_version(new):
+    """把 SKILL.md 里的版本号改成 new（先按规则校验）。"""
+    if validate_version is not None:
+        good, why = validate_version(new)
+        if not good:
+            fail("版本号不合法：%s\n  规则：%s" % (why, _ver_desc()))
     p = os.path.join(ROOT, "SKILL.md")
     txt = open(p, encoding="utf-8").read()
     if re.search(r"^version:", txt, re.M):
@@ -110,13 +170,29 @@ def cur_version():
     return m.group(1).strip() if m else "0.0.0"
 
 
-def do_package():
+def do_package(ver=None):
+    """打包。ver 不为空时按指定版本号命名（dry-run 演算用）。"""
+    if ver:
+        # dry-run：临时把版本号写进去打一个包，打完还原
+        p = os.path.join(ROOT, "SKILL.md")
+        orig = open(p, encoding="utf-8").read()
+        try:
+            txt = re.sub(r"^version:.*$", "version: " + ver, orig,
+                         count=1, flags=re.M)
+            open(p, "w", encoding="utf-8").write(txt)
+            code, out = sh([sys.executable,
+                            os.path.join(ROOT, "tools", "package_skill.py")])
+        finally:
+            open(p, "w", encoding="utf-8").write(orig)
+        print(out.rstrip())
+        if code != 0:
+            fail("打包失败")
+        return ver
     code, out = sh([sys.executable, os.path.join(ROOT, "tools", "package_skill.py")])
     print(out.rstrip())
     if code != 0:
         fail("打包失败")
-    ver = cur_version()
-    return ver
+    return cur_version()
 
 
 def git(*args, must=True):
@@ -131,9 +207,15 @@ def main():
     bump = None
     if "--bump" in sys.argv:
         i = sys.argv.index("--bump")
-        bump = sys.argv[i + 1] if i + 1 < len(sys.argv) else None
-        if not bump:
-            fail("--bump 后面要跟版本号，比如 --bump 1.1.0")
+        nxt = sys.argv[i + 1] if i + 1 < len(sys.argv) else None
+        # 后面没跟版本号（或跟的是别的开关）→ 按规则自动进位
+        if nxt is None or nxt.startswith("-"):
+            if next_version is None:
+                fail("版本规则模块 tools/version_rule.py 不在，自动进位用不了")
+            bump = next_version(cur_version())
+            print("[版本] 自动进位：%s -> %s" % (cur_version(), bump))
+        else:
+            bump = nxt
 
     print("=" * 56)
     print("  Agnes Clip 发布  ·  %s" % PKG_NAME)
@@ -182,8 +264,16 @@ def main():
 
     # 2. 安全体检
     print("\n[2/5] 安全检查")
+    # 🔴 dry-run 只能演算，不能真改 SKILL.md 的版本号。
+    #    原来这里直接 bump_version()，结果 --dry-run 跑完版本号就变了，
+    #    用户以为只是"看看"，实际工作区已经被改了。
+    #    改成：先算出版本号 → 打包用临时版本号 → 真正提交前才落盘。
+    target_ver = cur_version()
     if bump:
-        bump_version(bump)
+        target_ver = bump
+        if dry:
+            print("[dry-run] 版本号会是 %s（当前 %s），不真改文件"
+                  % (target_ver, cur_version()))
     issues = scan()
     if issues:
         print("      发现 %d 个问题：" % len(issues))
@@ -194,7 +284,9 @@ def main():
 
     # 3. 打包
     print("\n[3/5] 打包")
-    ver = do_package()
+    if bump and not dry:
+        bump_version(bump)
+    ver = do_package(target_ver)
     ok("dist/agnes-clip-%s.zip 就绪" % ver)
 
     # 4. 提交
@@ -211,7 +303,11 @@ def main():
     if len(changed) > 20:
         print("      … 另有 %d 个文件" % (len(changed) - 20))
     if dry:
-        print("\n[dry-run] 到此为止，不提交不推送。")
+        # 🔴 v2.0.0：dry-run 不能留下副作用。
+        #    上面 git add -A 已经把所有改动塞进暂存区了 —— 用户接着自己
+        #    git diff 会看到「没改动」，以为改动丢了。dry-run 就该回到原样。
+        git("reset", must=False)
+        print("\n[dry-run] 到此为止，不提交不推送（暂存区已复位，工作区原样）。")
         return
 
     _, nfiles = git("diff", "--cached", "--numstat", must=False)

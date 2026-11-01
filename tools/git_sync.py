@@ -5,7 +5,8 @@
 用法（在本 skill 根目录下跑）：
 
     python tools/git_sync.py push            # 安全体检 → 打包 → 提交 → 打tag → 推 GitHub
-    python tools/git_sync.py push --bump 1.6.0
+    python tools/git_sync.py push --bump     # 版本号自动进位（2.0.3 → 2.0.4）
+    python tools/git_sync.py push --bump 2.1.0   # 指定版本号（会校验格式）
     python tools/git_sync.py push --dry-run
     python tools/git_sync.py pull            # 从 GitHub 拉最新（对方更新了自动同步到本机）
     python tools/git_sync.py pull --force    # 丢弃本地未提交改动，强制对齐远端
@@ -14,6 +15,10 @@
 
 推送走 SSH 443 端口（ssh.github.com:443），因为本机代理会把 github.com 主站掐断。
 密钥用 ~/.ssh/id_ed25519。
+
+**版本号规则**：主.次.修，三段各 0-9。补丁位满 9 自动进到次版本
+（2.0.9 → 2.1.0），次版本满 9 进到主版本（2.9.9 → 3.0.0）。
+规则实现在 `tools/version_rule.py`。
 
 **凭据安全**：push 前会全库扫一遍密钥 / 本机绝对路径 / 缓存文件，有问题直接中止不推。
 **本机配置不进仓库**：~ 下的凭据文件永远被 .gitignore 排除。
@@ -28,6 +33,16 @@ import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIST = os.path.join(ROOT, "dist")
+
+# 版本号规则（唯一真源在 tools/version_rule.py）
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+try:
+    from version_rule import next_version, validate_version, describe as _ver_desc
+except Exception:  # 规则模块丢了也别把发布流程整个卡死
+    next_version = validate_version = None
+
+    def _ver_desc():
+        return "版本号 = 主.次.修，补丁位满 9 进到次版本。"
 
 # 仓库地址在各自 skill 的 .git-sync.json 里配（这样工具本身可复用）
 CONF_PATH = os.path.join(ROOT, ".git-sync.json")
@@ -105,6 +120,11 @@ def cur_version():
 
 
 def bump_version(new):
+    """把 SKILL.md 里的版本号改成 new（先按规则校验）。"""
+    if validate_version is not None:
+        good, why = validate_version(new)
+        if not good:
+            fail("版本号不合法：%s\n  规则：%s" % (why, _ver_desc()))
     p = os.path.join(ROOT, "SKILL.md")
     txt = open(p, encoding="utf-8").read()
     if re.search(r"^version:", txt, re.M):
@@ -191,19 +211,34 @@ def ahead_behind():
     return 0, 0
 
 
-def do_package():
-    """调用 skill 自带的打包脚本（如果有）。"""
+def do_package(ver=None):
+    """调用 skill 自带的打包脚本（如果有）。
+
+    ver 不为空时按指定版本号命名（dry-run 演算用），
+    打完立刻把 SKILL.md 还原，dry-run 不留痕迹。
+    """
     script = CONF.get("package_script")
     if not script:
         return None
     p = os.path.join(ROOT, script)
     if not os.path.exists(p):
         return None
-    code, out = sh([sys.executable, p])
+    skill_md = os.path.join(ROOT, "SKILL.md")
+    orig = None
+    if ver and os.path.exists(skill_md):
+        orig = open(skill_md, encoding="utf-8").read()
+        txt = re.sub(r"^version:.*$", "version: " + ver, orig,
+                     count=1, flags=re.M)
+        open(skill_md, "w", encoding="utf-8").write(txt)
+    try:
+        code, out = sh([sys.executable, p])
+    finally:
+        if orig is not None:
+            open(skill_md, "w", encoding="utf-8").write(orig)
     print(out.rstrip())
     if code != 0:
         fail("打包失败")
-    return cur_version()
+    return ver or cur_version()
 
 
 # ═══════════════ push ═══════════════
@@ -242,8 +277,26 @@ def cmd_push(args):
 
     # 2. 安全体检
     print("\n[2/5] 安全检查")
+    # 🔴 dry-run 只能演算，不能真改 SKILL.md 的版本号。
+    target_ver = None
     if args.bump:
-        bump_version(args.bump)
+        # --bump 不带值 → 按规则自动进位
+        target = args.bump
+        if target == "auto":
+            if next_version is None:
+                fail("版本规则模块 tools/version_rule.py 不在，自动进位用不了")
+            target = next_version(cur_version())
+            print("[版本] 自动进位：%s -> %s" % (cur_version(), target))
+        if validate_version is not None:
+            good, why = validate_version(target)
+            if not good:
+                fail("版本号不合法：%s\n  规则：%s" % (why, _ver_desc()))
+        target_ver = target
+        if getattr(args, "dry_run", False):
+            print("[dry-run] 版本号会是 %s（当前 %s），不真改文件"
+                  % (target_ver, cur_version()))
+        else:
+            bump_version(target_ver)
     issues = scan()
     if issues:
         print("      发现 %d 个问题：" % len(issues))
@@ -254,7 +307,7 @@ def cmd_push(args):
 
     # 3. 打包
     print("\n[3/5] 打包")
-    ver = do_package() or cur_version()
+    ver = do_package(target_ver) or cur_version()
     ok("dist/…-%s.zip 就绪" % ver)
 
     # 4. 提交
@@ -502,7 +555,8 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("push", help="发布到 GitHub")
-    p.add_argument("--bump", help="顺便升版本号，如 1.6.0")
+    p.add_argument("--bump", nargs="?", const="auto", default=None,
+                   help="顺便升版本号：不给值就按规则自动进位，也可指定如 2.1.0")
     p.add_argument("--dry-run", action="store_true", help="只做体检和打包，不提交不推送")
     p.set_defaults(func=cmd_push)
 

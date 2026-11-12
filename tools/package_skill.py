@@ -34,7 +34,9 @@ SECRET_PAT = re.compile(
     r"|api[_-]?key\s*[:=]\s*['\"][A-Za-z0-9]{20,})"
 )
 # 🔴 备份/临时文件：改代码前留的旧版本，含旧密钥，绝不能进包。
-BACKUP_PAT = re.compile(r"(\.bak(\.|$)|\.old$|\.orig$|\.tmp$|~$)")
+# 🔴 2026-11-12：同 publish.py —— 分隔符要一并覆盖（.bak_ / .bak- / .bak. / .bak），
+#    否则 ac.py.bak_20261112_1637 这种命名两道防线同时漏过去。
+BACKUP_PAT = re.compile(r"(\.(bak|old|orig|tmp)(?=[._-]|$)|~)")
 # 🔴 私人中转/内网地址：公开分发包里不该有别人的私有服务器地址。
 #    注意：作者自己公司的产品线域名是正当公开信息，不在此列。
 PRIVATE_HOST_PAT = re.compile(

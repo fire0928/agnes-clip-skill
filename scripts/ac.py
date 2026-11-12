@@ -325,6 +325,7 @@ def character_type_clause(cfg, paths=None):
     默认（没配 character_type）= EAST_ASIAN，人类项目行为完全不变。
     配了 "anthropomorphic_animal" = 动物句，防止人被拉成猫/猫被拉成人。
     """
+    cfg = cfg or {}
     ct = (cfg.get("character_type") or "human").strip().lower()
     root = (paths or {}).get("root") or (paths or {}).get("proj") or "."
     pconf_path = os.path.join(root, "project.json")
@@ -339,6 +340,7 @@ def character_type_clause(cfg, paths=None):
 
 def is_animal_project(cfg, paths=None):
     """是否是拟人动物项目（决定用哪套渲染风格锚）。"""
+    cfg = cfg or {}
     root = (paths or {}).get("root") or (paths or {}).get("proj") or "."
     pconf_path = os.path.join(root, "project.json")
     ct = (cfg.get("character_type") or "human").strip().lower()
@@ -384,6 +386,21 @@ def scene_anchor(cfg, paths=None, shot=None):
 # 判定室内的关键词
 
 
+
+
+# 🔴 2026-11-12 补定义：这两个常量以前**只被使用、从未定义**。
+#    触发条件很隐蔽 —— 镜头表里每个场景都写了 scene.set 就永远碰不到，
+#    只要有一个场景漏写，scene-gen 和 story 就会直接 NameError 崩掉。
+#    （老版本一路带着这个雷没被发现，因为大家的镜头表都写全了 set。）
+#    scene.set 用中文写，和项目里的写法一致（会被拼成「这间屋子里有……」的提示词）。
+DEFAULT_SCENE_SET = []
+NOODLE_SCENE_SET = [
+    "红纸灯笼",
+    "墙上手写菜单牌",
+    "不锈钢灶台与一口大汤锅",
+    "长条木柜台与几张方木桌木凳",
+    "一摞白瓷面碗",
+]
 
 
 def scene_set_for(place, slug=""):
@@ -2139,7 +2156,7 @@ STORY_SYSTEM = """你是资深竖屏短剧编剧兼分镜师。你的任务不�
 - 结尾镜不能只是站着说话，必须有明确肢体动作。"""
 
 
-def generate_story(cfg, idea, n_shots, seconds, title=None):
+def generate_story(cfg, paths, idea, n_shots, seconds, title=None):
     require_agnes_creds(cfg)
     total = int(n_shots * float(seconds))
     user = ("创意：%s\n镜头数：%d\n每镜时长：约 %s 秒（总时长约 %d 秒）\n%s"
@@ -2159,7 +2176,7 @@ def generate_story(cfg, idea, n_shots, seconds, title=None):
         data = parse_json_block(content2)
         if not isinstance(data, dict) or "shots" not in data:
             die("剧本模型没有返回合法 JSON。原始输出前 800 字：\n" + content[:800])
-    return normalize_story(data, n_shots, seconds, title)
+    return normalize_story(data, n_shots, seconds, title, cfg, paths)
 
 
 def parse_json_block(text):
@@ -2280,7 +2297,14 @@ def _merge_scene_ids(ids):
     return [mapping[x] for x in ids]
 
 
-def normalize_story(data, n_shots, seconds, title=None):
+def normalize_story(data, n_shots, seconds, title=None, cfg=None, paths=None):
+    """把模型返回的剧本补齐成规范镜头表。
+
+    🔴 2026-11-12 补 cfg / paths 两个参数：函数里要用
+    `character_type_clause(cfg, paths)` 给每个镜的 video_prompt 加角色外观约束，
+    但这两个值一直没传进来 → 一跑到那儿就 NameError 崩。
+    （老版本一路带着这个雷，因为 story 生成要走云端 key，很少真跑。）
+    """
     chars = data.get("characters") or []
     if not isinstance(chars, list) or not chars:
         chars = [{"name": "hero", "desc": "主角", "desc_en": "the main character"}]
@@ -2475,7 +2499,10 @@ def normalize_story(data, n_shots, seconds, title=None):
             cur["angles"].setdefault(a, d)
     for s in out:
         k = s["scene"]["id"]
-        s["scene"]["set"] = byscene[k]["set"] or list(DEFAULT_SCENE_SET)
+        # 🔴 兜底走 scene_set_for：面馆场景给面馆清单，其它场景留空。
+        #    （原来直接 list(DEFAULT_SCENE_SET)，面馆也拿到空清单）
+        s["scene"]["set"] = byscene[k]["set"] or list(
+            scene_set_for(s["scene"].get("place"), k))
         angles = byscene[k]["angles"] or {}
         for a in {s.get("angle") or "wide"}:
             if not angles.get(a):
@@ -2583,7 +2610,10 @@ def write_story_files(paths, story):
         meta = " / ".join([x for x in (sc.get("time"), sc.get("place"), sc.get("weather"), sc.get("light")) if x])
         if meta:
             lines.append("- **场景**：" + meta)
-        if s.get("link") in ("prev", "tail", "prev-tail", "prev_tail"):
+        _link = (s.get("link") or "").strip().lower()
+        if _link == LINK_REF_WORD:
+            lines.append("- **接力**：多图接力 —— 上一镜尾帧 + 角色脸 + 场景板重新生成本镜首帧")
+        elif _link in ("prev", "tail", "prev-tail", "prev_tail"):
             lines.append("- **接力**：首帧取上一镜尾帧（场景/站位直接接上）")
         lines.append("- **机位**：" + (s.get("angle") or "wide"))
         if s.get("intensity") is not None:
@@ -2674,7 +2704,7 @@ def do_story(cfg, paths, idea, n_shots, seconds, title=None):
         die("推理当前设为 WorkBuddy 默认：剧本应由当前会话模型按 script/story_prompt.md 直接写入 "
             "script/shots.json（无需外部 key）。写好后再运行 auto。")
     info("生成剧本与镜头表（%d 镜，按内容自动算时长）..." % n_shots)
-    story = generate_story(cfg, idea, n_shots, seconds, title)
+    story = generate_story(cfg, paths, idea, n_shots, seconds, title)
     write_story_files(paths, story)
     info("剧本 -> script/story.md，镜头表 -> script/shots.json（%d 镜）" % len(story["shots"]))
     return story
@@ -3405,9 +3435,33 @@ def angle_key(shot):
     return scene_key(shot) + "__" + ang
 
 
-def plate_for(paths, shot):
-    """本镜该用哪张场景板：优先本机位板，缺了退到广角板，再退到场景名老文件。"""
-    for name in (angle_key(shot), scene_key(shot) + "__wide", scene_key(shot)):
+def plate_for(paths, shot, ignore_skip=False):
+    """本镜该用哪张场景板。
+
+    🔴 2026-11-09：新增 plate_mode 中间档，解决 `no_plate` 二选一的困境。
+      给整板 = 把凳子/面碗/门口街景一起递给模型（模型照抄 → 坐下、面条、户外）；
+      不给板 = 连「还是同一家店」这个锚也丢了（背景变成另一间店、只剩一只猫）。
+      plate_mode="crop" 给的是只保留墙面 / 灯笼 / 菜单牌的上半幅裁板，
+      由 `ac.py scene-crop` 生成，文件名 `<场景>__<机位>__crop.jpg`。
+
+    - "none"（或 shot.no_plate=True）→ 不给板
+    - "crop"  → 优先裁板；缺了退回整板并告警，不会静默降级
+    - 其它 / 不写 → 原有行为（本机位板 → __wide → 场景名老文件）
+
+    ignore_skip=True：忽略 no_plate / plate_mode，只回答「这个机位有没有板」。
+    给 frame.mode=plate（空镜）和 audit 资产清单用，避免它们误报缺板。
+    """
+    mode = (shot.get("plate_mode") or "").strip().lower()
+    if not ignore_skip and (shot.get("no_plate") or mode == "none"):
+        return None
+    key = angle_key(shot)
+    if mode == "crop":
+        p = os.path.join(paths["scenes"], key + "__crop.jpg")
+        if os.path.exists(p):
+            return p
+        warn("%s 要裁板但 %s__crop.jpg 不存在，退回整板（先跑 ac.py scene-crop）"
+             % (shot.get("id", ""), key))
+    for name in (key, scene_key(shot) + "__wide", scene_key(shot)):
         p = os.path.join(paths["scenes"], name + ".jpg")
         if os.path.exists(p):
             return p
@@ -3433,6 +3487,7 @@ def do_scenes(cfg, paths, force=False):
             g["scene"] = s.get("scene") or {}
 
     made = 0
+    todo = []
     # 场景风格锚：项目 project.json 的 scene_anchor 优先，其次全局配置，最后按室内/室外自动选
     for key, g in groups.items():
         anchor = scene_anchor(cfg, paths, {"scene": g.get("scene") or {}})
@@ -3476,11 +3531,40 @@ def do_scenes(cfg, paths, force=False):
                 prompt += (" This is a DIFFERENT camera position of the same shop described above: "
                            "keep every set-dressing item on the list, but do not repeat the entrance "
                            "establishing viewpoint — reframe from the position stated in Camera.")
-            info("生成场景板 %s/%s（%d 镜：%s）..." % (key, ang, len(g["angles"][ang]),
-                                              "、".join(g["angles"][ang])))
-            raw, _ = agnes_image_generate(cfg, prompt, ref_paths=refs, project_paths=paths)
+            todo.append((key, ang, dst, prompt, list(g["angles"][ang])))
+
+    # 🔴 并发出图（2026-11-12）：串行实测 **10 分钟一张**，13 张板要两个多小时，
+    #    20 张首帧又是三个多小时——当晚就是卡在这儿。Agnes 出图接口没有硬并发限制，
+    #    3 路稳定。并发数走 `project.json` 的 `agnes.image_jobs`（默认 3），
+    #    不要和视频的 `video.tier_slots`（账号并发）混为一谈。
+    if todo:
+        jobs = int((cfg.get("agnes") or {}).get("image_jobs") or 3)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _one(t):
+            k, ang, dst, prompt, ids = t
+            info("生成场景板 %s/%s（%d 镜：%s）..." % (k, ang, len(ids), "、".join(ids)))
+            raw, _ = agnes_image_generate(cfg, prompt, ref_paths=[], project_paths=paths)
             save_image_bytes(raw, dst, exe)
-            made += 1
+            return "%s/%s" % (k, ang)
+
+        if jobs <= 1:
+            for t in todo:
+                try:
+                    info("场景板完成 %s" % _one(t))
+                    made += 1
+                except BaseException as e:
+                    warn("场景板 %s/%s 失败：%s" % (t[0], t[1], e))
+        else:
+            with ThreadPoolExecutor(max_workers=jobs) as pool:
+                futs = {pool.submit(_one, t): t for t in todo}
+                for f in as_completed(futs):
+                    t = futs[f]
+                    try:
+                        info("场景板完成 %s" % f.result())
+                        made += 1
+                    except BaseException as e:
+                        warn("场景板 %s/%s 失败：%s" % (t[0], t[1], e))
     n_plates = sum(len(g["angles"]) for g in groups.values())
     info("场景板 %d/%d 张 -> assets/scenes/（%d 个场景）" % (made, n_plates, len(groups)))
 
@@ -3488,6 +3572,49 @@ def do_scenes(cfg, paths, force=False):
 def cmd_scene_gen(args):
     cfg, paths = load_project(args.dir)
     do_scenes(cfg, paths, force=args.force)
+
+
+def do_scene_crop(paths, out_dir=None, keep=0.46, side=0.08, force=False):
+    """把场景板裁成「只留墙面 / 灯笼 / 菜单牌」的上半幅。
+
+    🔴 2026-11-09：场景板是整间店的照片，画面里全是方桌、木凳、面碗、
+       敞开的门口街景；`ac.py` 给板时又写死「furniture / set dressing / props
+       全部照抄」，模型就照着把凳子和碗搬进首帧，双人镜必然坐下、面馆必然出面条。
+       裁掉下半幅后，板仍能提供「还是同一家店」的墙、灯、菜单牌，但不再递家具。
+
+    用法：shot.plate_mode = "crop"，plate_for() 会优先找 `<场景>__<机位>__crop.jpg`。
+    """
+    from PIL import Image
+    src = paths["scenes"]
+    dst = os.path.abspath(out_dir) if out_dir else src
+    os.makedirs(dst, exist_ok=True)
+    keep = max(0.30, min(0.90, float(keep)))
+    side = max(0.0, min(0.30, float(side)))
+    made = []
+    for name in sorted(os.listdir(src)):
+        if not name.lower().endswith((".jpg", ".jpeg", ".png")):
+            continue
+        out = os.path.join(dst, os.path.splitext(name)[0] + "__crop.jpg")
+        if name.endswith("__crop.jpg"):
+            continue
+        if os.path.exists(out) and not force:
+            continue
+        im = Image.open(os.path.join(src, name)).convert("RGB")
+        w, h = im.size
+        box = (int(w * side), 0, int(w * (1 - side)), int(h * keep))
+        im.crop(box).save(out, quality=92)
+        made.append(os.path.basename(out))
+    return made
+
+
+def cmd_scene_crop(args):
+    cfg, paths = load_project(args.dir)
+    made = do_scene_crop(paths, out_dir=args.out, keep=args.keep,
+                         side=args.side, force=args.force)
+    info("场景裁板生成 %d 张%s" % (
+        len(made),
+        ("：" + "、".join(made[:6]) + ("…" if len(made) > 6 else "")) if made
+        else "（已存在，加 --force 覆盖）"))
 
 
 # ----------------------------------------------------------------------------- frames
@@ -3511,6 +3638,17 @@ def cmd_scene_gen(args):
 #    科普口播慢速 → 3.0-3.5 字/秒
 #    （PRINTFILM 文档里「5 字/秒」是估算用，「3 字/秒」是提示模型放慢用，别混）
 NARRATION_CPS = 4.2
+
+# 🔴 台词字数阈值 —— 全 skill 唯一真源（2026-11-12 从 do_logic_check 提上来）。
+#    35 字是舒适区，45 字是红线，一镜总共最多 60 字。
+#    「不是角色对白」的台词（VO / 新闻播报 / 画外音）可以更长：
+#    有字幕兜底，观众读得到，不受「一口气说不完」的限制。
+#    🔴 以前这两套阈值散在两处（do_logic_check 一套、check_pacing 一套），
+#       两边的口径和豁免规则都不一样 —— 于是「45 字红线」在 lines 格式下
+#       一条都报不出来，VO 旁白又在两个地方得出相反结论。
+LINE_IDEAL = 35
+LINE_RED = 45
+LONG_LINE_OK = ("anchor", "VO", "news", "announcer", "reporter")
 
 # 剪辑节奏六式（借鉴 PRINTFILM 的 dramaEditRhythm）：
 # 给「无台词镜」按情绪段落分配时长，而不是一律 3/4/6 秒。
@@ -3549,12 +3687,147 @@ def estimate_visual_duration(text, lo=2, hi=8):
     return min(hi, 6)
 
 
+def shot_line_items(shot):
+    """这一镜的**每一句**台词 + 说话人，返回 [(台词, speaker), ...]。
+
+    🔴 2026-11-12：真实项目的镜头表主流写法是
+       `"lines": [{"speaker": ..., "line": ...}]`
+       （实测 huangjing 25/29 镜、maoge ep13 35/36 镜是这个格式），
+       说话人在**每条台词里**，不在镜头顶层。
+       以前长台词检查只读镜头顶层的 `line`，于是 lines 格式的镜头
+       一条都检查不到 —— 45 字红线形同虚设，VO/旁白豁免也失效。
+    """
+    items = []
+    for x in (shot.get("lines") or []):
+        if isinstance(x, dict):
+            v = str(x.get("line") or x.get("text") or "").strip()
+            spk = str(x.get("speaker") or "").strip()
+        else:
+            v = str(x or "").strip()
+            spk = ""
+        if v:
+            items.append((v, spk))
+    one = str(shot.get("line") or "").strip()
+    if one and one not in [v for v, _ in items]:
+        items.append((one, str(shot.get("speaker") or "").strip()))
+    return items
+
+
+def shot_lines(shot):
+    """这一镜的全部台词：兼容 line 字符串与 lines 数组（2026-11-12）。
+
+    🔴 以前 retime / 台词检查只读 `line`，而镜头表写的是
+    `"lines": [{"speaker":..., "line":...}]` —— 于是「一句 12 字给 6.5 秒」
+    这种问题一条都报不出来，成片被用户说「节奏普遍太慢」。
+    """
+    return [v for v, _ in shot_line_items(shot)]
+
+
+def shot_words(shot):
+    """这一镜台词的汉字数（不含标点）。"""
+    return sum(len(re.sub(r"[^\u4e00-\u9fff]", "", x)) for x in shot_lines(shot))
+
+
+def check_pacing(shots, issues, warns):
+    """节奏体检：台词密度 / 空等 / 空镜连排 / 十秒静默 / 首镜钩子（2026-11-12）。
+
+    对应 ai-video-pipeline/references/pacing_and_continuity.md。
+    用户原话：「对话慢条斯理的没有感觉」「节奏普遍太慢」——
+    根因是镜头时长比台词长太多，逐镜看着都合理，连起来就拖。
+    """
+    timeline = []
+    t = 0.0
+    prev_silent = False
+    for s in shots:
+        sid = s.get("id") or "?"
+        words = shot_words(s)
+        try:
+            dur = float(s.get("duration") or 0)
+        except (TypeError, ValueError):
+            dur = 0.0
+        timeline.append((sid, t, t + dur, words))
+        t += dur
+        need = int(math.ceil(words / float(NARRATION_CPS))) + 1 if words else 0
+
+        top_spk = (s.get("speaker") or "").strip()
+        for l, spk in shot_line_items(s):
+            n = len(re.sub(r"[^\u4e00-\u9fff]", "", l))
+            # 🔴 豁免跟 do_logic_check 一致：VO / 新闻播报 / 画外音可以长
+            #    （有字幕兜底）。以前两处口径不同，同一句台词在两个检查里
+            #    得出相反结论。
+            if (spk or top_spk) in LONG_LINE_OK:
+                continue
+            if n > LINE_RED:
+                issues.append("%s 台词「%s」%d 字，超过 %d 字上限；拆句"
+                              % (sid, l, n, LINE_RED))
+            elif n > LINE_IDEAL:
+                warns.append("%s 台词「%s」%d 字，偏长，配音容易赶" % (sid, l, n))
+        if words > 60:
+            issues.append("%s 一镜说了 %d 字，超过 60 字；必须拆镜" % (sid, words))
+
+        if words:
+            if dur > need + 1.0:
+                issues.append(
+                    "%s 时长 %gs，台词 %d 字按 %.1f 字/秒只需 %gs —— 多出 %gs 是空等，"
+                    "模型还会自己加戏。改成 %gs（ac.py retime 可自动算）"
+                    % (sid, dur, words, NARRATION_CPS, need, dur - need, need))
+            elif dur < need - 0.3:
+                warns.append("%s 时长 %gs 比台词需要的 %gs 还短，容易赶词" % (sid, dur, need))
+            prev_silent = False
+        else:
+            # 🔴 末镜例外（2026-11-12）：收尾镜常是「无声的动作 + 留白」（把匾架上、退后半步、
+            #    镜头后拉），3 秒根本演不完。用户当时的话是「末尾的结果往往也很突然」——
+            #    掐到 3 秒只会更突然。末镜上限放到 8 秒，中间的空镜仍是 3 秒。
+            cap = 8.0 if s is shots[-1] else 3.0
+            if dur > cap:
+                issues.append("%s 是空镜但给了 %gs（上限 %.0f 秒），压到 2-3 秒或补一句台词"
+                              % (sid, dur, cap))
+            if prev_silent:
+                issues.append("%s 和上一镜连续两个空镜，会被当成过场；补台词或删一镜" % sid)
+            prev_silent = True
+
+    for sid, st, en, _w in timeline:
+        mid = (st + en) / 2.0
+        window = [x for x in timeline if x[1] < mid + 5.0 and x[2] > mid - 5.0]
+        if window and not any(x[3] for x in window):
+            issues.append("第 %.0f-%.0f 秒有 10 秒没人说话，观众会划走；至少塞一句" % (mid - 5, mid + 5))
+            break
+
+    total = timeline[-1][2] if timeline else 0.0
+    total_words = sum(x[3] for x in timeline)
+    if total > 0:
+        dens = total_words / total
+        if dens < 2.2:
+            warns.append("全片 %d 字 / %.0f 秒 = %.2f 字/秒，低于 2.2；每 10 秒该有 25-30 个字"
+                         % (total_words, total, dens))
+
+    if shots:
+        d0 = float(shots[0].get("duration") or 0)
+        # 🔴 首镜该多长，看的是「第一句话什么时候出口」，不是总时长。
+        #    有台词的钩子镜，台词本身就是钩子，5-6 秒（16-20 字）是正常的；
+        #    真正该报的是「没台词还硬拖」和「超过 7 秒还没说完」。
+        if shot_lines(shots[0]):
+            if d0 > 7.0:
+                issues.append("首镜 %gs，第一句话之后还有大段空白；压到「台词长度+1」以内" % d0)
+        elif d0 > 4.0:
+            issues.append("首镜 %gs 没有台词，钩子要在 2 秒内出现；压到 3 秒" % d0)
+        if not shot_lines(shots[0]):
+            act = (shots[0].get("action") or "") + (shots[0].get("video_prompt") or "")
+            if not any(w in act for w in ("摔", "推", "抓", "塞", "递", "抬眼", "转身", "拔", "掰", "按", "掀")):
+                warns.append("首镜没有台词也没有强动作，开场容易滑走")
+
+
 def suggest_shot_duration(shot):
-    """建议时长：有台词 = 起势 1.2s + 台词 + 收尾 0.6s；无台词按画面信息量。"""
-    line = str(shot.get("line") or "").strip()
-    if line:
-        return round(1.2 + estimate_narration_duration(line) + 0.6, 1)
-    return float(estimate_visual_duration(shot.get("action") or ""))
+    """建议时长：有台词 = ceil(字数/4.2)+1；无台词 ≤3 秒（见 pacing_and_continuity.md）。
+
+    🔴 2026-11-12 改口径：原来是「起势 1.2 + 台词 + 收尾 0.6」≈ 台词+1.8，
+       但 estimate 本身已含 +1 的呼吸，两者叠加又给多 1 秒，正是「慢」的来源。
+       现在直接 = ceil(字数/4.2) + 1，容差 -0.3~+1.0，检查端按这个卡。
+    """
+    words = shot_words(shot)
+    if words:
+        return float(int(math.ceil(words / float(NARRATION_CPS))) + 1)
+    return min(3.0, float(estimate_visual_duration(shot.get("action") or "")))
 
 
 def shot_kind(shot):
@@ -3617,6 +3890,28 @@ def _voice_clause(shot):
 FACE_LOCK = (" Keep the face, identity, hairstyle and body proportions exactly as in the reference image; "
              "same person, no morphing, no identity drift.")
 
+# ---------------------------------------------------------------- 尾帧 + 角色 + 场景：多图接力
+# link="prev-ref" 用的词。和旧的 link="prev" 有本质区别：
+#   prev      = 把上一镜视频尾帧**直接拷贝**成本镜首帧，一次生图接口都不调（无脸特写专用）
+#   prev-ref  = 把上一镜视频尾帧当成**一张参考图**，与角色脸、场景板一起送进生图接口，
+#              重新生成本镜首帧。动作/物件位置/光线接续上一镜，脸和房间由参考图锁住，不会漂。
+LINK_REF_WORD = "prev-ref"
+
+# 追加在提示词末尾、并在 refs 末尾追加尾帧之后使用。
+# 编号动态算：refs 里已有人脸图、道具图、场景板，尾帧是最后一张。
+# 纯正向，避免否定句把被排除的东西召出来。
+CHAIN_CONTINUITY = (
+    " Reference photo %d is the final frame of the shot immediately before this one. "
+    "This new shot continues from that exact moment in the same room: the same people stand or sit "
+    "in the same places, the same objects rest on the same surfaces, the same light falls from the "
+    "same direction, and every hand keeps the position it had at the end of that frame. "
+    "The action described above begins from that held position and moves forward. "
+    "Each person's face, hair and clothing come from their own character reference photos above, "
+    "and the walls, furniture and lighting come from the location plate. "
+    "Those identity and location references stay authoritative for the whole shot. "
+    "This is one continuous static frame, a single moment, with a clean image."
+)
+
 
 def _paws_clause(shot, chars):
     """按角色分别声明「手是爪子还是人手」。
@@ -3647,6 +3942,12 @@ def _paws_clause(shot, chars):
                 "up and must not be blended together."
                 % (" and ".join(animals), " and ".join(animals),
                    " and ".join(humans), " and ".join(humans)))
+    if humans and not animals:
+        # 🔴 全真人镜（本镜没有动物角色）：不写 "never paws, never fur"——
+        #    这类否定词会把 paws/fur 的概念引进提示词，真人片反而容易被顶成兽形。
+        #    纯正向描述人手的特征即可。
+        return (" Every character's visible hands are human hands with human fingers, "
+                "true-to-life human skin and natural knuckles.")
     if humans:
         return (" Every character's visible hands are human hands with human fingers and "
                 "human skin, never paws, never fur, never animal fingers.")
@@ -3685,11 +3986,18 @@ def _paws_only_clause(shot, chars):
     else:
         hand_rule = ("Every visible hand is a furry animal paw with the same fur colour as the "
                      "rest of that character, never human fingers or human skin.")
-    return (" Extreme close-up on the ground: the frame contains ONLY furry paws, forearms, "
-            "freshly dug plants, dark soil and grass. No faces, no heads, no full bodies, "
-            "no torsos and no background people are visible in this frame — the camera is "
-            "close to the ground and the subjects are cropped at the wrist and the elbow. "
-            + hand_rule)
+    # 🔴 坑（2026-11-08 ep19 实测）：这里原来把「刚挖出的植物、泥土和草」写死进
+    #    通用函数，任何 no_faces 镜（做菜、端盘、修表…）都会被带成户外挖土画面。
+    #    改成：默认中性句 + 允许镜头表用 shot.paws_context 指定本镜该出现什么。
+    #    纯正向描述，不写「不要泥土」这类否定词（否定反而会激活概念）。
+    ctx = (shot.get("paws_context") or "").strip()
+    if not ctx:
+        ctx = ("the frame contains ONLY furry paws, forearms, the immediate work surface "
+               "and the objects named above")
+    # 🔴 同上：不再写「no faces / no heads」这类否定句，纯正向说明画框被爪子填满
+    return (" Extreme close-up on the hands: " + ctx +
+            ". The camera stays tight on the work surface, with the paws and forearms "
+            "cropped at the wrist and the elbow so they fill the whole frame. " + hand_rule)
 
 
 def _position_clause(shot):
@@ -3705,6 +4013,11 @@ def _position_clause(shot):
     """
     prompt = (shot.get("frame") or {}).get("prompt") or ""
     low = prompt.lower()
+    # 🔴 坑（2026-11-08 ep19 实测）：这套兜底句写死「两人等距、面对面交谈」，
+    #    会把「顾客坐方凳 / 老板站着」压成两个等高等距的站立半身（凳子全空）。
+    #    镜头表若已用 Staging 写死左右 + 坐站，给 position_lock=True 关掉兜底。
+    if shot.get("position_lock"):
+        return ""
     has_staging = any(k in low for k in ("left third", "right third", "on the left", "on the right",
                                          "left side of frame", "right side of frame",
                                          "in the left", "in the right", "left third of", "right third of"))
@@ -3776,10 +4089,14 @@ def _cast_clause(shot, chars):
         extra_count += n
         extra_parts.append("%d) %s" % (len(parts) + i, desc))
     allbodies = parts + extra_parts
+    # 🔴 户外/非线性场景（山谷、溪边）：默认那句 "The rest of the room keeps … furnishings"
+    #    会把模型往室内带（没有墙也要造一面墙）。shot.set_clause 可整句替换。
+    _set_clause = (shot.get("set_clause") or "").strip() or (
+        "The rest of the room keeps exactly the same furnishings and lighting as the location plate.")
     return (" Headcount in this frame is exactly %d, and these are the only bodies visible: %s. "
-            "Every other seat, the aisle behind them and the rest of the room is empty space. "
+            "%s "
             "Their outfits are fixed for the whole film and match the character reference exactly."
-            % (len(parts) + extra_count, " ".join(allbodies)))
+            % (len(parts) + extra_count, " ".join(allbodies), _set_clause))
 
 def _human_cast_clause(shot, chars):
     """真人角色的**定性句**：明确「这些是人，不是兽」。
@@ -3802,6 +4119,20 @@ def _human_cast_clause(shot, chars):
     parts = []
     for name, d in humans:
         parts.append("%s (%s)" % (name, d))
+    # 🔴 全真人项目（本片所有角色都是人类）：不要再套「部分角色是拟人动物」那套措辞。
+    #    那套句子里有 "animal inhabitants of this world"、"NO fur / NO muzzle" 这类
+    #    大量否定词——真人项目里它们只会把「动物」这个概念引进画面，反而招兽化
+    #    （道医全真人片实测：每镜都被顶成兽形）。改用纯正向的人类定性。
+    _all_names = [n for n in (shot.get("cast") or [shot.get("char")]) if n]
+    _proj_all_human = bool(chars) and all(
+        _is_human_character(((c or {}).get("desc_en") or (c or {}).get("desc") or ""))
+        for c in chars.values() if c)
+    if _proj_all_human and _all_names and len(humans) == len(_all_names):
+        return (" Cast separation for this frame: %s. Every one of them is a real human being: "
+                "a human face with human eyes, human nose and human lips, true-to-life human skin "
+                "with natural pores and fine wrinkles, human hair, human ears, and human hands with "
+                "human fingers. Photographed as real people in a live-action film."
+                % "; ".join(parts))
     return (" Cast separation for this frame: %s. Each of them is a REAL HUMAN PERSON: "
             "a human face with human eyes, human nose and human lips, human skin with no fur "
             "anywhere on the head or body, human hair or a human headscarf, human ears, "
@@ -3814,7 +4145,13 @@ def _human_cast_clause(shot, chars):
             % "; ".join(parts))
 
 
-def _frame_for_shot(cfg, paths, shot, exe, chars=None, dry=False):
+def _frame_for_shot(cfg, paths, shot, exe, chars=None, dry=False, chain_in=None):
+    """生成一镜首帧。
+
+    chain_in：上一镜视频的尾帧截图路径（link="prev-ref" 专用）。
+    它会被当成**最后一张参考图**，和已经收好的人脸图、道具图、场景板一起送进生图接口，
+    重新生成本镜首帧——而不是像旧 link="prev" 那样把尾帧直接拷贝成首帧。
+    """
     sid = shot["id"]
     out = os.path.join(paths["frames"], sid + ".jpg")
     fmode = (shot.get("frame") or {}).get("mode", "source")
@@ -3825,7 +4162,7 @@ def _frame_for_shot(cfg, paths, shot, exe, chars=None, dry=False):
 
     if fmode == "plate":
         # 空镜（无人物）：直接用场景板裁切当首帧
-        plate = plate_for(paths, shot)
+        plate = plate_for(paths, shot, ignore_skip=True)
         if not plate:
             die("%s 的 frame.mode=plate 但没有场景板（先跑 scene-gen）" % sid)
         w, h = RATIO_SIZE.get(cfg["agnes"].get("aspect_ratio", "9:16"), (720, 1280))
@@ -3860,7 +4197,11 @@ def _frame_for_shot(cfg, paths, shot, exe, chars=None, dry=False):
     # 空镜生成模式（gen）：没有人物，不需要锁脸、不需要人物白名单，
     # 但可以喂场景板当参考，用来生成「空镜 + 特定道具」的定制画面。
     is_empty_gen = (fmode == "gen")
-    if not is_empty_gen:
+    # 🔴 无脸极近景（no_faces）也不能加「锁脸 / 人物定性」句：写了
+    #    「Keep the face … exactly as in the reference image」却又不喂人脸图，
+    #    ep19 S07-S10 实测被顶成「猫半身站在厨房里」，特写全废。
+    no_faces = bool(shot.get("no_faces"))
+    if not is_empty_gen and not no_faces:
         if "identity drift" not in prompt.lower():
             prompt += FACE_LOCK
         # 🔴 旧守卫：提示词里已经写了 anthropomorphic animal / east asian 就别再叠加，
@@ -3873,7 +4214,18 @@ def _frame_for_shot(cfg, paths, shot, exe, chars=None, dry=False):
         #    注意：不能用 is_animal_project() 判断——不少项目（如 ep05）没在 project.json
         #    里写 character_type，但它确实是拟人动物项目；这里改用「这一镜有没有真人」
         #    来决定，且只在**确实缺这句**时才补，避免重复。
+        # 🔴 2026-11-11 修：全真人镜不该再套「大部分角色是拟人动物」的世界观句。
+        #    旧版只要 _human_cast_clause 非空就追加 ANTHROPOMORPHIC，于是全真人项目
+        #    的提示词里同时出现「All characters are East Asian Chinese（人类）」和
+        #    「Most characters are anthropomorphic animals（兽）」——两句直接打架。
+        #    这句本来只为「人兽混居」的镜服务，全真人时用不上。
+        _cast_here = shot.get("cast") or ([shot.get("char")] if shot.get("char") else [])
+        _all_human = bool(_cast_here) and all(
+            _is_human_character(str(((chars or {}).get(n) or {}).get("desc_en")
+                                    or ((chars or {}).get(n) or {}).get("desc") or ""))
+            for n in _cast_here)
         if (not is_empty_gen and chars and _human_cast_clause(shot, chars)
+                and not _all_human
                 and "keep the two kinds of character visually distinct" not in prompt.lower()):
             prompt += ANTHROPOMORPHIC
     # 参考图收集（**必须在人物白名单之前**——白名单那段的绑定声明要用到 ref_bind）
@@ -3913,11 +4265,20 @@ def _frame_for_shot(cfg, paths, shot, exe, chars=None, dry=False):
         #    修法：显式绑定 + 重复每个角色的辨识特征 + 强调互不相同的配色。
         if len(ref_bind) >= 2:
             names = [n for n, _ in ref_bind]
+            # 🔴 全真人项目里不能写 "fur colouring"：这个词会把画面往兽形带
+            #    （道医全真人片实测）。真人版只说五官与肤色不混。
+            _binding_all_human = bool(chars) and all(
+                _is_human_character(((c or {}).get("desc_en") or (c or {}).get("desc") or ""))
+                for c in chars.values() if c)
+            _keeps = ("each character keeps its own exact face, its own skin tone and its own "
+                      "eye colour, with no shared features between them."
+                      if _binding_all_human else
+                      "each character keeps its own exact face, its own fur colouring and its own "
+                      "eye colour, with no shared markings between them.")
             prompt += (" Reference photo %d is the face of %s; reference photo %d is the face of %s. "
                        "Do not blend the two faces together and do not average their colouring — "
-                       "each character keeps its own exact face, its own fur colouring and its own "
-                       "eye colour, with no shared markings between them."
-                       % (1, names[0], 2, names[1]))
+                       "%s"
+                       % (1, names[0], 2, names[1], _keeps))
             for i, (n, _) in enumerate(ref_bind, 1):
                 c = (chars or {}).get(n) or {}
                 desc = (c.get("desc_en") or "").strip()
@@ -3942,11 +4303,18 @@ def _frame_for_shot(cfg, paths, shot, exe, chars=None, dry=False):
         where = (sc.get("place") or "").strip() or "this interior"
         detail = ""
         st = sc.get("set") or []
-        if st:
+        # 🔴 2026-11-09：首帧已经带 Staging 的 PLACE / DRESSING 锁时，不再把
+        #    scene.set 整份清单拼成 "Visible in this interior …"。两份陈设清单
+        #    会打架，而且 set 里的「木凳 / 面碗」会被模型当成必须有、照着画
+        #    （ep19 双人镜坐下、店里冒面条的元凶之一）。
+        has_staging = "Staging is fixed for the whole film" in prompt
+        if st and not has_staging:
             detail = (" Visible in this interior, from the location's own furnishings: "
                       + "; ".join(str(x).rstrip(".") for x in st[:8]) + ".")
-        prompt += (" This frame is set entirely inside %s. Everything visible in frame belongs to this "
-                   "same location — no other room, no street outside, no different venue.%s"
+        # 🔴 纯正向：写「no street outside」等于把「街道」喂给模型，反而招来外景
+        #    （ep19 S04 实测跑到户外花园）。只说「这间屋子里有什么」。
+        prompt += (" This frame is set entirely inside %s. Every visible wall, furnishing, prop "
+                   "and light source belongs to this one room and stays the same throughout.%s"
                    % (where, detail))
 
     # 🔴 声画契约（v2.0.0）：明确这一镜是「静音画面 / 对白 / 旁白」。
@@ -3994,31 +4362,73 @@ def _frame_for_shot(cfg, paths, shot, exe, chars=None, dry=False):
         if lock:
             prompt += " " + lock
 
-    # shot.no_plate=true：极近景时不给场景板。板是中景，模型会照抄它的构图，压不住景别。
-    plate = None if shot.get("no_plate") else plate_for(paths, shot)
+    # 🔴 微表情进首帧（2026-11-12）：
+    #    micro 以前只写进剧本 md（`**微表情**：...`），**从来没进过任何提示词**，
+    #    模型收到的只有 action + 台词。这就是「人物没有微表情、一眼 AI」的根因：
+    #    首帧的脸永远是「标准皱眉/标准微笑」，视频只能在这个标准表情上演。
+    #    优先读 shot.micro_en（手写英文，最准），没有就把中文 micro 直接附上兜底。
+    _me = (shot.get("micro_en") or "").strip()
+    if _me:
+        prompt += (" At this exact frame the face and body carry this micro-expression: " + _me)
+    elif (shot.get("micro") or "").strip():
+        prompt += (" Micro-expression at this frame (keep it subtle and physical, never a posed "
+                   "expression): " + (shot.get("micro") or "").strip())
+
+    # shot.no_plate / plate_mode="none"：极近景不给场景板。
+    # plate_mode="crop"：只给裁掉家具的上半幅板（见 plate_for / scene-crop）。
+    plate = plate_for(paths, shot)
     if plate:
         refs.append(plate)
-        if is_empty_gen:
-            prompt += (" The location is identical to the reference location plate: same walls, "
-                       "counter, furniture, set dressing, props and lighting; only the camera "
-                       "position and framing change. The plate is empty of people — this frame "
-                       "is also empty of people, but the specific objects named above are "
-                       "now present.")
+        mode = (shot.get("plate_mode") or "").strip().lower()
+        if mode == "crop":
+            # 🔴 裁板只提供「还是同一家店」的墙、灯笼、菜单牌和光。
+            #    绝不能再说「furniture / set dressing / props 全部照抄」——
+            #    那正是模型把凳子、面碗、门口街景搬进首帧的指令（ep19 实证）。
+            prompt += (" The reference location plate shows this same room's walls, ceiling "
+                       "lanterns, wall hangings and warm lighting. Keep those walls, lanterns "
+                       "and light exactly as in the plate. The furniture, table top and props "
+                       "in this frame come only from the description above. "
+                       "Keep every character exactly as in the character references.")
+        elif is_empty_gen:
+            _plate_clause_gen = (shot.get("plate_clause") or "").strip() or (
+                "The location is identical to the reference location plate: same walls, counter, "
+                "furniture, set dressing, props and lighting; only the camera position and framing "
+                "change.")
+            prompt += (" " + _plate_clause_gen +
+                       " The plate shows the empty location, and the specific objects named above "
+                       "are now present in it.")
         else:
-            prompt += (" The location is identical to the reference location plate: same walls, counter, "
-                       "furniture, set dressing, props and lighting; only the camera position and framing "
-                       "change. Keep every character exactly as in the character references.")
+            # 🔴 户外场景（山谷/溪边/田野）：默认那句 "same walls, counter, furniture"
+            #    会让模型在空地上造出墙和柜台。shot.plate_clause 可整句替换成地形/植被版。
+            _plate_clause = (shot.get("plate_clause") or "").strip() or (
+                "The location is identical to the reference location plate: same walls, counter, "
+                "furniture, set dressing, props and lighting; only the camera position and framing "
+                "change.")
+            prompt += (" " + _plate_clause +
+                       " Keep every character exactly as in the character references.")
     else:
-        if shot.get("no_plate"):
-            info("%s 按 no_plate 跳过场景板（极近景，避免照抄中景构图）" % sid)
+        if shot.get("no_plate") or (shot.get("plate_mode") or "").strip().lower() == "none":
+            info("%s 按 no_plate/plate_mode=none 跳过场景板（极近景，避免照抄中景构图）" % sid)
         else:
             warn("%s 没有场景板（先跑 scene-gen），首帧只锁人物" % sid)
+
+    # 🔴 link="prev-ref"：尾帧作为最后一张参考图，与角色脸 / 道具 / 场景板一起重新出图。
+    #    放在 refs 末尾有两个好处：① 前面「Reference photo 1/2 是谁」的绑定编号不用改；
+    #    ② 身份与场景锚排在前面、权重更稳，尾帧只负责接续动作和物件位置。
+    #    绝不能把尾帧插到第 1 位——那会让人脸绑定和道具编号全部错位（ep04 事故同类）。
+    if chain_in and os.path.exists(chain_in):
+        refs.append(chain_in)
+        prompt += CHAIN_CONTINUITY % len(refs)
+        info("%s 多图接力：尾帧 + 人脸 + 场景板，共 %d 张参考图" % (sid, len(refs)))
+    elif chain_in:
+        warn("%s 的尾帧参考图不存在（%s），退回普通多参考图出首帧" % (sid, chain_in))
+
     if dry:
         print("\n===== %s 首帧最终提示词（%d 字）=====" % (sid, len(prompt)))
         print(prompt)
         print("----- 参考图 %d 张 -----" % len(refs))
-        for r in refs:
-            print("  " + r)
+        for i, r in enumerate(refs, 1):
+            print("  %d. %s" % (i, r))
         return None
 
     require_agnes_creds(cfg)
@@ -4050,6 +4460,7 @@ def do_frames(cfg, paths, only=None, force=False, dry=False):
         die("script/shots.json 里没有镜头")
     chars = {c.get("name"): c for c in (story.get("characters") or [])}
     only_set = set(only.split(",")) if only else None
+    queue = []
     for shot in shots:
         if only_set and shot["id"] not in only_set:
             continue
@@ -4069,7 +4480,44 @@ def do_frames(cfg, paths, only=None, force=False, dry=False):
                 continue
             info("%s 接力镜头：上一镜还没出片，等视频阶段自动取尾帧" % shot["id"])
             continue
-        _frame_for_shot(cfg, paths, shot, exe, chars, dry=dry)
+        if (shot.get("link") or "").strip().lower() == LINK_REF_WORD:
+            # 先按常规多参考图出一张「官方首帧」（也是 tail_frame 的落点、接力失败时的兜底）。
+            # 视频提交前会用上一镜尾帧再叠一张参考图重出一次，见 _regen_frame_from_tail。
+            info("%s 先出常规首帧；视频阶段会用上一镜尾帧 + 角色脸 + 场景板重新接力出图"
+                 % shot["id"])
+        queue.append(shot)
+
+    # 🔴 并发首帧（2026-11-12）：串行实测 10 分钟一张，20 张首帧要三个多小时。
+    #    首帧出图是纯函数（读参考图 → 出一张 → 落盘），没有跨镜状态，可以直接并发。
+    #    并发数同样走 `agnes.image_jobs`（默认 3）。
+    if not queue:
+        return
+    if dry:
+        for sh in queue:
+            _frame_for_shot(cfg, paths, sh, exe, chars, dry=True)
+        return
+    jobs = int((cfg.get("agnes") or {}).get("image_jobs") or 3)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _one(sh):
+        _frame_for_shot(cfg, paths, sh, exe, chars)
+        return sh["id"]
+
+    if jobs <= 1:
+        for sh in queue:
+            try:
+                info("首帧完成 %s" % _one(sh))
+            except BaseException as e:
+                warn("%s 首帧失败：%s" % (sh["id"], e))
+    else:
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            futs = {pool.submit(_one, sh): sh for sh in queue}
+            for f in as_completed(futs):
+                sh = futs[f]
+                try:
+                    info("首帧完成 %s" % f.result())
+                except BaseException as e:
+                    warn("%s 首帧失败：%s" % (sh["id"], e))
 
 
 def cmd_frame(args):
@@ -4093,6 +4541,38 @@ def extract_tail_frame(clip, dst, exe, back=0.4):
                  "-frames:v", "1", "-q:v", "2", dst])
 
 
+def _regen_frame_from_tail(cfg, task, chain_in, exe):
+    """link="prev-ref"：用「上一镜尾帧 + 角色脸 + 场景板」重新生成本镜首帧。
+
+    在视频提交前调用（此时上一镜的 clip 已存在，尾帧抽得出来）。
+    生成的图直接写回 frames/<sid>.jpg，成为这一镜正式的首帧/视频入点；
+    接力前的那张普通首帧备份到 frames/_chain/<sid>_base.jpg，方便对照和回退。
+    """
+    root = task.get("proj_dir")
+    if not root:
+        warn("%s 缺少 proj_dir，无法做多图接力，退回普通首帧" % task["shot"])
+        return False
+    try:
+        cfg2, paths2 = load_project(root)
+        story2 = load_json(paths2["shots"]) or {}
+        shot2 = next((s for s in (story2.get("shots") or [])
+                      if s.get("id") == task["shot"]), None)
+        if not shot2:
+            warn("%s 在镜头表里找不到，退回普通首帧" % task["shot"])
+            return False
+        chars2 = {c.get("name"): c for c in (story2.get("characters") or [])}
+        chain_dir = os.path.join(paths2["frames"], "_chain")
+        os.makedirs(chain_dir, exist_ok=True)
+        base = task["frame"]
+        if os.path.exists(base):
+            shutil.copy2(base, os.path.join(chain_dir, task["shot"] + "_base.jpg"))
+        _frame_for_shot(cfg2, paths2, shot2, exe, chars2, chain_in=chain_in)
+        return os.path.exists(base)
+    except Exception as e:
+        warn("%s 多图接力出首帧失败（%s），退回普通首帧" % (task["shot"], e))
+        return False
+
+
 def _submit_one(cfg, task, force_tier=None, force_max_attempts=None):
     a = cfg["agnes"]
     sid = task["shot"]
@@ -4111,9 +4591,16 @@ def _submit_one(cfg, task, force_tier=None, force_max_attempts=None):
             os.makedirs(chain_dir, exist_ok=True)
             chain_in = os.path.join(chain_dir, sid + "_in.jpg")
             extract_tail_frame(prev, chain_in, exe)
-            first = frame_source(cfg, chain_in)
-            info("%s 首帧 = %s 的尾帧（接力，不重新构图；原首帧保留在 frames/%s.jpg）"
-                 % (sid, os.path.basename(prev), sid))
+            if task.get("chain_ref") and _regen_frame_from_tail(cfg, task, chain_in, exe):
+                # 多图接力：新首帧已写回 frames/<sid>.jpg，视频直接用它。
+                # 身份锚（face_ref）和场景锚（场景板）在这一次出图里始终在场，
+                # 所以不像裸尾帧接力那样一镜一镜往下漂。
+                first = frame_source(cfg, task["frame"])
+                info("%s 多图接力完成：尾帧 + 角色脸 + 场景板重新生成首帧" % sid)
+            else:
+                first = frame_source(cfg, chain_in)
+                info("%s 首帧 = %s 的尾帧（接力，不重新构图；原首帧保留在 frames/%s.jpg）"
+                     % (sid, os.path.basename(prev), sid))
     if first is None:
         first = frame_source(cfg, task["frame"])
     last = None
@@ -4168,6 +4655,16 @@ def do_videos(cfg, paths, only=None, force=False, wait=False, allow_partial=Fals
         prompt = (shot.get("video_prompt") or "").strip()
         if not prompt:
             die("%s 缺 video_prompt" % sid)
+        # 🔴 微表情进视频提示词（2026-11-12）：同首帧，micro 以前从没到过模型手里。
+        #    视频链是另一条独立生成链，光首帧有表情不够——运动中它会退回「标准表情」。
+        #    追加一句「按这个顺序演」，把微表情写成时间序列而不是形容词。
+        _me = (shot.get("micro_en") or "").strip()
+        if _me:
+            prompt += (" Throughout the shot the performance follows this order of small movements, "
+                       "subtle and physical: " + _me)
+        elif (shot.get("micro") or "").strip():
+            prompt += (" Subtle micro-expression process during the shot: "
+                       + (shot.get("micro") or "").strip())
         # 🔴 视频提示词也要锁真人（ep05 S18 事故）：
         #    首帧画对了不代表视频里不会被兽化——视频模型是另一条独立生成链，
         #    它只看到首帧图 + 文字，文字不写「这是人」，它就按世界观里的动物套。
@@ -4205,8 +4702,10 @@ def do_videos(cfg, paths, only=None, force=False, wait=False, allow_partial=Fals
             if lock:
                 prompt += " " + lock
         link = (shot.get("link") or "").strip().lower()
+        chain_ref = (link == LINK_REF_WORD)
         prev_clip = None
-        if link in ("prev", "tail", "prev-tail", "prev_tail") and idx > 0:
+        # prev-ref 也要串行等上一镜出片：尾帧是它的第一张输入图。
+        if (link in ("prev", "tail", "prev-tail", "prev_tail") or chain_ref) and idx > 0:
             prev_clip = os.path.join(paths["clips"], shots[idx - 1]["id"] + ".mp4")
 
         # 尾帧桥接：把"下一镜的首帧"钉成本镜的落点。
@@ -4235,6 +4734,10 @@ def do_videos(cfg, paths, only=None, force=False, wait=False, allow_partial=Fals
             "prompt": prompt,
             "seconds": _clamp_seconds(shot.get("duration") or a.get("seconds", 8)),
             "seed": shot.get("seed"),
+            # 多图接力：提交前用上一镜尾帧 + 角色脸 + 场景板重新出本镜首帧。
+            # 只有字符/布尔值，可以安全落进 _pending.json。
+            "chain_ref": chain_ref,
+            "proj_dir": paths["root"] if chain_ref else "",
         })
 
     if not tasks:
@@ -4244,28 +4747,39 @@ def do_videos(cfg, paths, only=None, force=False, wait=False, allow_partial=Fals
         slots = video_jobs(cfg)
         jobs = []
         runnable = [t for t in tasks if not t.get("link_prev") or os.path.exists(t["link_prev"])]
+
+        def _persist():
+            # 注意：这里必须跟已有的 _pending.json 合并。分几批 --only 提交时如果直接覆盖，
+            # 前一批「待补位」的镜头就永久丢了（fetch 只会跑最后一批，然后清空文件）。
+            done_ids = {j["shot"] for j in jobs}
+            pend_path = os.path.join(paths["clips"], "_pending.json")
+            old = load_json(pend_path, {}) or {}
+            keep_jobs = [j for j in (old.get("jobs") or [])
+                         if j.get("status") != "completed" and j.get("shot") not in done_ids]
+            keep_queue = [t for t in (old.get("queue") or [])
+                          if t["shot"] not in done_ids
+                          and t["shot"] not in {j["shot"] for j in keep_jobs}]
+            save_json(pend_path,
+                      {"jobs": keep_jobs + jobs,
+                       "queue": keep_queue + [t for t in tasks if t["shot"] not in done_ids]})
+            return len(jobs)
+
         try:
             for t in runnable[:slots]:
                 jobs.append(_submit_one(cfg, t))
         except PaidTierNeedsConfirm as e:
+            # 🔴 部分提交成功时必须先把已入队的 video_id 落盘再退出，
+            #    否则服务器上任务照跑，本地却永远下载不到（ep21 实测丢 3 镜）。
+            n = _persist()
+            info("部分提交成功 %d 个，已写入 _pending.json，可用 fetch 续查" % n)
             die(str(e))
         except SubmitError as e:
+            n = _persist()
+            info("部分提交成功 %d 个，已写入 _pending.json，可用 fetch 续查" % n)
             die("Agnes 队列已满，提交失败：%s。稍后重跑，或用 --wait 让脚本排队等待" % str(e)[:200])
-        done_ids = {j["shot"] for j in jobs}
-        # 注意：这里必须跟已有的 _pending.json 合并。分几批 --only 提交时如果直接覆盖，
-        # 前一批「待补位」的镜头就永久丢了（fetch 只会跑最后一批，然后清空文件）。
-        pend_path = os.path.join(paths["clips"], "_pending.json")
-        old = load_json(pend_path, {}) or {}
-        keep_jobs = [j for j in (old.get("jobs") or [])
-                     if j.get("status") != "completed" and j.get("shot") not in done_ids]
-        keep_queue = [t for t in (old.get("queue") or [])
-                      if t["shot"] not in done_ids
-                      and t["shot"] not in {j["shot"] for j in keep_jobs}]
-        save_json(pend_path,
-                  {"jobs": keep_jobs + jobs,
-                   "queue": keep_queue + [t for t in tasks if t["shot"] not in done_ids]})
+        n = _persist()
         info("已提交 %d 个任务（并发上限 %d），其余 %d 个待补位。用 fetch 继续"
-             % (len(jobs), slots, len(tasks) - len(jobs)))
+             % (n, slots, len(tasks) - n))
         return jobs
 
     solved = _run_scheduler(cfg, paths, [], tasks)
@@ -5951,7 +6465,16 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
 
     sub_path = None
     subs_override = os.path.join(paths["out"], "_subs_override.ass")
-    if use_subs and native_voice:
+    # 🔴 外部字幕必须最高优先级。VAD 逐镜只取「最长的一段」人声，
+    #    一镜多句会漏句、时间轴还会串到相邻镜（ep19 实测：15 句只出 9 条，
+    #    S18/S22 整镜没字幕，S23 的台词落在 S22 的时间段）。
+    #    按全片真实人声逐句排好的 _subs_override.ass 优先于所有自动对齐。
+    if use_subs and os.path.exists(subs_override):
+        sub_path = subs_override
+        info("字幕使用外部文件 _subs_override.ass（%d 行）"
+             % sum(1 for l in open(subs_override, encoding="utf-8")
+                   if l.startswith("Dialogue:")))
+    elif use_subs and native_voice:
         # 🔴 原声模式：字幕必须对齐**模型原声**的人声位置，跟 TTS 时间轴没关系。
         #     镜头表里的 subs.t 是按 TTS 排的，直接用会整体错位。
         #     做法：VAD 逐镜测原声人声区间 → 字幕贴上去；
@@ -5993,11 +6516,6 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
         if sub_path:
             n = sum(1 for l in open(sub_path, encoding="utf-8") if l.startswith("Dialogue:"))
             info("字幕：按镜头表逐句生成 %d 条（时间轴已跟转场重排）" % n)
-    elif use_subs and os.path.exists(subs_override):
-        # 外部字幕优先（逐句手写时间轴，VAD 漏检轻声台词时用它补）
-        sub_path = subs_override
-        info("字幕使用外部文件 _subs_override.ass（%d 行）"
-             % sum(1 for l in open(subs_override, encoding="utf-8") if l.startswith("Dialogue:")))
     elif use_subs:
         timed = []
         for e in entries:
@@ -6316,11 +6834,12 @@ def cmd_retime(args):
             old = float(s.get("duration") or 0)
         except (TypeError, ValueError):
             old = 0.0
-        line = (s.get("line") or "").strip()
-        if line:
-            need = estimate_narration_duration(line, cps)
-            new = round(args.pad + need + args.tail, 1)
-            n_chars = len(re.sub(r"\s+", "", line))
+        lines = shot_lines(s)
+        if lines:
+            n_chars = shot_words(s)
+            need = int(math.ceil(n_chars / float(cps))) + 1
+            # 口径：镜头时长贴着台词走，pad/tail 只微调，不再叠加 1.8 秒
+            new = round(max(2.0, need + (args.pad - 1.2) + (args.tail - 0.6)), 1)
             why = "台词 %d 字 → 口播 %gs" % (n_chars, need)
         elif rhythm_w:
             w = rhythm_w[v_idx % len(rhythm_w)]
@@ -6502,8 +7021,68 @@ def cmd_assemble_image(args):
         die("合成失败：%s" % (r.stderr or "")[-300:])
 
 
+def do_chain_prev_ref(cfg, paths, apply=False, max_link_run=2):
+    """同场景连续镜 → link="prev-ref"：上一镜尾帧 + 角色脸 + 场景板重新生成下一镜首帧。
+
+    与旧 link="prev" 的本质区别：
+      prev      = 尾帧**硬拷贝**成首帧，一次出图都不调 → 没有身份/场景锚，
+                  只能用在 no_faces 的无脸特写，人物镜一接就漂。
+      prev-ref  = 尾帧当成**一张参考图**，与 face_ref（按机位挑角度）、道具图、
+                  场景板一起送进出图接口重新生成首帧 → 动作接续、脸和房间都有锚。
+
+    配对规则：同 scene.id 的相邻镜才配；跨场景、回忆/复用镜断开；
+    同一组内连传不超过 max_link_run 段（默认 2，即最多三镜一组），
+    组尾留一镜自然呼吸，避免逐镜累积误差。
+    """
+    data = load_json(paths["shots"])
+    shots = data["shots"]
+    plan = []
+    run = 0
+    for i, s in enumerate(shots):
+        if i == 0 or s.get("reuse") or s.get("recall"):
+            run = 0
+            continue
+        a = shots[i - 1]
+        cur_link = (s.get("link") or "").strip().lower()
+        same_scene = ((a.get("scene") or {}).get("id") or "") == ((s.get("scene") or {}).get("id") or "")
+        ok = (same_scene and not a.get("reuse") and not a.get("recall")
+              and run < max_link_run
+              and cur_link in ("", LINK_REF_WORD))
+        if not ok:
+            run = 0
+            continue
+        plan.append((s["id"], a["id"], (s.get("scene") or {}).get("id") or ""))
+        run += 1
+
+    if not plan:
+        info("没有可配 prev-ref 的同场景连续镜")
+        return []
+    print("")
+    print("── 多图接力配对方案 · link=prev-ref（%d 处）──" % len(plan))
+    print("%-6s %-8s %-14s %s" % ("本镜", "接上一镜", "场景", "说明"))
+    for sid, prev_id, scene_id in plan:
+        print("%-6s %-8s %-14s %s" % (sid, prev_id, scene_id,
+              "尾帧 + 角色脸 + 场景板 → 重新生成首帧"))
+    if not apply:
+        info("预览模式（加 --apply 写回 shots.json）")
+        return plan
+    ids = {p[0] for p in plan}
+    for s in shots:
+        if s["id"] in ids:
+            s["link"] = LINK_REF_WORD
+    save_json(paths["shots"], data)
+    info("已写入 %d 处 link=%s；之后按 frame → video 顺序跑即可（video 会自动等上一镜出片）"
+         % (len(plan), LINK_REF_WORD))
+    return plan
+
+
 def cmd_chain(args):
     cfg, paths = load_project(args.dir)
+    mode = (getattr(args, "mode", "") or "auto").strip().lower()
+    if mode == "prev-ref":
+        do_chain_prev_ref(cfg, paths, apply=args.apply,
+                          max_link_run=getattr(args, "link_run", 2))
+        return
     do_chain(cfg, paths, apply=args.apply, max_tail_run=args.tail_run,
              allow_faces=getattr(args, "allow_faces", False))
 
@@ -6590,7 +7169,7 @@ def do_audit(cfg, paths):
         planned = int(s.get("duration") or 0)
         total_planned += planned
         frame = os.path.join(paths["frames"], sid + ".jpg")
-        scene = plate_for(paths, s) or os.path.join(paths["scenes"], scene_key(s) + ".jpg")
+        scene = plate_for(paths, s, ignore_skip=True) or os.path.join(paths["scenes"], scene_key(s) + ".jpg")
         clip = os.path.join(paths["clips"], sid + ".mp4")
         rec = {
             "id": sid, "planned": planned,
@@ -7373,7 +7952,7 @@ def _check_structural_holes(shots, issues, warns, paths=None):
     # 回忆/复用片段（那种不是本集新生成的视频，没有可接的尾帧）。
     # 🔴 有人物的镜不许连传超过 2 段（ep04 脸漂移事故：尾帧接力一镜一镜往下传，
     #    脸会累积漂移）。无脸特写镜（no_faces）没有脸可漂，连传正是它的用途。
-    LINK_WORDS = ("prev", "tail", "prev-tail", "prev_tail")
+    LINK_WORDS = ("prev", "tail", "prev-tail", "prev_tail", LINK_REF_WORD)
     link_run = 0
     for i, s in enumerate(shots):
         sid = s.get("id")
@@ -7728,33 +8307,40 @@ def do_logic_check(cfg, paths):
 
     # ---- 5. 台词与新信息 ----
     # 新闻播报/旁白这类「不是角色对白」的台词可以长（有字幕兜底，观众读得到）。
-    LONG_LINE_OK = ("anchor", "VO", "news", "announcer", "reporter")
+    # 阈值 LINE_IDEAL / LINE_RED / LONG_LINE_OK 是模块级常量（与 check_pacing 共用），
+    # 这里只说明它们的来历：
     # 🔴 台词长度分三级（参考 short-drama-writer 的短剧铁律，但按本系列调过）：
-    #    ≤10 字 = 理想（短剧标准：删、短、狠）
-    #    11-14 字 = 红线（还能用，但偏长）
-    #    >14 字 = 必改（解释性台词，观众会走神）
-    #    原来只有 18 字一道门槛，等于没有门槛。
-    LINE_IDEAL = 10
-    LINE_RED = 14
+    #    ≤35 字 = 舒适区（15-20 字是爽剧短打，寓言/文化题材一句话要能立住道理）
+    #    36-45 字 = 偏长（还能用，配音会赶）
+    #    >45 字 = 必改（一口气说不完）
+    # 🔴 2026-11-12 放宽到 35/45：用户反馈「台词太低智、不够深刻、字数太少」，
+    #    14 字装不下任何一句有分量的话。字数不是节奏工具，时长与台词的比值才是。
+    #    35 字是舒适区，45 字是红线；一镜最多 60 字。镜头时长跟着字数涨。
     long_lines = []
+    long_shots = set()
     for s in shots:
-        line = (s.get("line") or "").strip()
-        spk = (s.get("speaker") or "").strip()
-        n = len(_cn_bare(line))
-        if n > LINE_RED and spk not in LONG_LINE_OK:
-            long_lines.append((s, n))
-            issues.append("%s 台词 %d 字，超过红线 %d 字（短剧铁律：删、短、狠；"
-                          "台词靠动作承载，不靠解释）"
-                          % (s.get("id"), n, LINE_RED))
-        elif n > LINE_IDEAL and spk not in LONG_LINE_OK:
-            warns.append("%s 台词 %d 字，偏长（短剧理想 ≤%d 字：删、短、狠）"
-                         % (s.get("id"), n, LINE_IDEAL))
+        top_spk = (s.get("speaker") or "").strip()
+        # 🔴 2026-11-12：按**句**查，而不是按镜查。
+        #    lines 数组格式里说话人在每条台词里；VO/旁白豁免要按句判，
+        #    否则「一条旁白 + 一句对白」的镜头会被整镜当成对白来卡。
+        for line, spk in shot_line_items(s):
+            who = spk or top_spk
+            n = len(_cn_bare(line))
+            if n > LINE_RED and who not in LONG_LINE_OK:
+                long_lines.append((s, n))
+                long_shots.add(s.get("id"))
+                issues.append("%s 台词 %d 字，超过红线 %d 字（短剧铁律：删、短、狠；"
+                              "台词靠动作承载，不靠解释）"
+                              % (s.get("id"), n, LINE_RED))
+            elif n > LINE_IDEAL and who not in LONG_LINE_OK:
+                warns.append("%s 台词 %d 字，偏长（短剧理想 ≤%d 字：删、短、狠）"
+                             % (s.get("id"), n, LINE_IDEAL))
     # 超长台词占比：说明整集都在念台词
-    if len(long_lines) >= 3 and len(shots) and len(long_lines) / float(len(shots)) > 0.25:
+    if len(long_shots) >= 3 and len(shots) and len(long_shots) / float(len(shots)) > 0.6:
         issues.append("超长台词（>%d 字）有 %d 镜，占比 %d%% —— "
                       "台词要砍，冲突要用动作演"
-                      % (LINE_RED, len(long_lines),
-                         int(100 * len(long_lines) / len(shots))))
+                      % (LINE_RED, len(long_shots),
+                         int(100 * len(long_shots) / len(shots))))
     for s in shots:
         # 🔴 同框人数：默认上限 2 人（多人同框模型容易串脸/丢人）。
         #    但**群戏镜**是另一种需求（用户明确要求「野炊来的动物要多」），
@@ -7844,26 +8430,7 @@ def do_logic_check(cfg, paths):
     # 🔴 ep07 事故：29 个有台词镜头，台词开口集中在 3.5-6.8 秒，
     #    前面全是无声动作，全片累计 100 多秒空等 —— 用户只说了两个字「冗长」。
     #    病根是「duration 拍脑袋给 7-9 秒」，没有跟台词字数挂钩。
-    for s in shots:
-        sid = s.get("id")
-        line = (s.get("line") or "").strip()
-        if not line:
-            continue
-        try:
-            dur = float(s.get("duration") or 0)
-        except (TypeError, ValueError):
-            continue
-        need = estimate_narration_duration(line)
-        # 富余 = 起势 1.2 + 收尾 0.8 + 一拍 ≈ 3 秒
-        if dur > need + 3.0:
-            issues.append(
-                "%s 时长 %gs，但台词「%s」按 %.1f 字/秒约需 %gs —— 前后会空等约 %gs。"
-                "改成 %gs 左右（或用 ac.py retime 自动重算）"
-                % (sid, dur, line, NARRATION_CPS, need, dur - need - 1.5, need + 1.5))
-        elif dur < need:
-            warns.append(
-                "%s 时长 %gs 比台词「%s」需要的 %gs 还短，容易赶词或说不完"
-                % (sid, dur, line, need))
+    check_pacing(shots, issues, warns)
 
     # ---- 输出 ----
     print("")
@@ -7888,9 +8455,101 @@ def do_logic_check(cfg, paths):
     print("结论：通过（%d 条待确认）" % len(warns))
 
 
+def do_staging_check(paths):
+    """机位设计自检（2026-11-09 新增）。
+
+    ep19 代码审计查出来的坑，原来 `check` 一个都查不到：
+    - `scene.angles` 只查「有没有写」，不查是不是整段照抄、是不是死配置；
+    - 同一镜里出现两句不同的空间锁，模型各取一半就跑偏；
+    - 两个机位名对应同一句取景描述，等于一个机位起了两个名字。
+
+    只告警、不阻断流程（老项目大量存量镜头会命中）。
+    """
+    story = load_json(paths["shots"], {"shots": []})
+    shots = story.get("shots") or []
+    if not shots:
+        return
+    issues = []
+    by_scene = {}
+    for sh in shots:
+        sc = sh.get("scene") or {}
+        sid = sc.get("id") or ""
+        a = sc.get("angles") or {}
+        if not a:
+            continue
+        if sid not in by_scene:
+            by_scene[sid] = a
+            sig = json.dumps(a, sort_keys=True, ensure_ascii=False)
+            for other, oa in list(by_scene.items()):
+                if other != sid and json.dumps(oa, sort_keys=True, ensure_ascii=False) == sig:
+                    issues.append("%s 场景「%s」的机位描述整段照抄「%s」，换 id 没换机位"
+                                  % (sh["id"], sid, other))
+                    break
+        # 同一场景里两个机位描述完全相同 = 机位退化
+        sig2 = {}
+        for ang, desc in a.items():
+            s = " ".join(str(desc).split()).lower()
+            if s in sig2:
+                issues.append("场景「%s」机位 %s 和 %s 的取景描述完全相同"
+                              % (sid, sig2[s], ang))
+            sig2[s] = ang
+
+    # 机位描述没进首帧提示词 = 死配置（板是复制来的、没重跑 scene-gen 时必然命中）
+    dead = {}
+    for sh in shots:
+        sc = sh.get("scene") or {}
+        ang = sh.get("angle") or "wide"
+        desc = (sc.get("angles") or {}).get(ang) or ""
+        prompt = (sh.get("frame") or {}).get("prompt") or ""
+        if desc and " ".join(desc.split())[:45] not in prompt:
+            dead.setdefault(ang, []).append(sh["id"])
+    for ang, ids in sorted(dead.items()):
+        issues.append("机位 %s 的英文描述没进任何首帧提示词（只在 scene-gen 用，%d 镜受影响）"
+                      % (ang, len(ids)))
+
+    # 同一镜两套空间锁打架
+    for sh in shots:
+        prompt = (sh.get("frame") or {}).get("prompt") or ""
+        for key in ("Staging is fixed for the whole film",
+                    "Set dressing on the table is fixed too"):
+            vals, pos = [], 0
+            while True:
+                i = prompt.find(key, pos)
+                if i < 0:
+                    break
+                tail = prompt[i + len(key):]
+                j = tail.find(".")
+                vals.append(tail[:j + 1].strip() if j >= 0 else tail.strip())
+                pos = i + len(key)
+            if len(set(vals)) > 1:
+                issues.append("%s 同一镜有 %d 句不同的「%s」，两套空间锁打架"
+                              % (sh["id"], len(set(vals)), key[:20]))
+
+    # 家具词提醒：scene.anchor / scene.set 里写死的「木凳 / 面碗」会跟着
+    # frame.prompt 进首帧，模型把它当必备家具照抄（ep19 双人镜坐下、店里出面条）。
+    # skill 不能替项目改 anchor，但要把这件事在自检里点出来。
+    furniture = {}
+    for sh in shots:
+        prompt = ((sh.get("frame") or {}).get("prompt") or "").lower()
+        for kw in ("wooden stool", "matching wooden stools", "noodle bowl", "empty space"):
+            if kw in prompt:
+                furniture.setdefault(kw, []).append(sh["id"])
+    for kw, ids in sorted(furniture.items()):
+        issues.append("提示词里出现「%s」（%d 镜），会被模型当成必备家具照抄；"
+                      "建议从 scene.anchor / scene.set 删掉" % (kw, len(ids)))
+
+    if issues:
+        warn("机位设计自检：发现 %d 处" % len(issues))
+        for x in issues:
+            warn("  ✗ " + x)
+    else:
+        info("机位设计自检：通过（无照抄 / 无死配置 / 无同镜冲突锁 / 无机位退化）")
+
+
 def cmd_check(args):
     cfg, paths = load_project(args.dir)
     do_logic_check(cfg, paths)
+    do_staging_check(paths)
 
 
 # ----------------------------------------------------------------------------- auto
@@ -9653,6 +10312,16 @@ def main():
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_scene_gen)
 
+    p = sub.add_parser("scene-crop",
+                       help="把场景板裁成只含墙面/灯笼的上半幅（去掉凳子、桌沿、门口街景）")
+    p.add_argument("dir")
+    p.add_argument("--out", default=None, help="输出目录，默认写回 assets/scenes")
+    p.add_argument("--keep", type=float, default=0.46,
+                   help="保留原图上方比例，默认 0.46（再高会留下桌沿和凳子）")
+    p.add_argument("--side", type=float, default=0.08, help="左右各裁掉的比例，默认 0.08")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_scene_crop)
+
     p = sub.add_parser("frame", help="逐镜生成首帧图（--dry-run 只打印最终提示词与参考图）")
     p.add_argument("dir")
     p.add_argument("--only", default=None)
@@ -9678,9 +10347,14 @@ def main():
     p.add_argument("--window", type=float, default=0.4, help="取上一镜最后多少秒的帧")
     p.set_defaults(func=cmd_seam)
 
-    p = sub.add_parser("chain", help="自动配对首尾帧接力（特写连传 link=prev / 同场景人物镜 tail_frame=next），消灭分镜跳跃")
+    p = sub.add_parser("chain", help="自动配对首尾帧接力（默认 auto / --mode prev-ref 多图接力），消灭分镜跳跃")
     p.add_argument("dir")
     p.add_argument("--apply", action="store_true", help="写回 shots.json（不加只预览）")
+    p.add_argument("--mode", default="auto", choices=["auto", "prev-ref"],
+                   help="auto = 旧规则（无脸特写 link=prev / 可选人物镜 tail_frame）；"
+                        "prev-ref = 同场景连续镜改用「尾帧+角色脸+场景板」重新出首帧")
+    p.add_argument("--link-run", type=int, default=2,
+                   help="prev-ref 模式：同场景内最多连传几段（默认 2，即三镜一组后断开一次）")
     p.add_argument("--tail-run", type=int, default=3, help="同场景内最多连续桥接几镜（默认 3，超过就松一镜让画面呼吸）")
     p.add_argument("--allow-faces", action="store_true",
                    help="🔴 应急口子：允许给有人物的镜头配首尾帧。"

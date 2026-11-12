@@ -6,7 +6,7 @@ description: 用 Agnes 云端算力全自动做竖屏短剧/长视频——一�
 description_zh: 一句话创意自动做成有对白、会说话的竖屏短剧。全流程 15 步：写剧本、分镜、角色定妆、场景板、逐镜首帧、批量出视频、配乐音效字幕、合成成片，人脸全程锁死不怕换脸。视频走云端算力，不占本地显卡。适合做催泪短剧、漫剧、系列连续剧，也支持同系列多集复用同一张脸。
 description_en: Turn a one-line idea into a vertical short drama with real dialogue. A 15-stage pipeline handles scripting, storyboarding, character sheets, scene boards, first frames, batch video generation, music, sound effects, subtitles and final cut — with character faces locked across every shot so nobody switches faces mid-story. Video runs on cloud GPUs, so no local hardware needed. Great for tearjerkers, anime shorts and serialized episodes that reuse the same face across episodes.
 agent_created: true
-version: 2.0.0
+version: 2.1.0
 ---
 
 # Agnes Clip · 一句话成片
@@ -200,6 +200,7 @@ python scripts/ac.py studio "<系列目录>"     # 例如 .../maoge-series
 |---|---|
 | `references/screenwriting_playbook.md` | **编剧固定流程**（六行工单 → 三张表 → 逐镜四空 → 结构自查） |
 | `references/short_drama_craft.md` | **短剧节奏工艺**（五节点秒级结构 / 1-3-10-16 / 首钩尾钩 / 台词铁律 / 去 AI 味） |
+| `references/pacing_and_continuity.md` | **节奏与连贯总口径**（字数档位 16–35 / 时长公式 / 微表情落地 / 拆镜与尾帧接力 / 转场分档 / 结尾三层收）——改节奏规则请改这一份 |
 | `references/logic_check.md` | 逻辑自检清单（含结构级硬伤） |
 
 
@@ -311,9 +312,10 @@ python scripts/ac.py cast "<dir>" list                  # 看哪些角色是本�
 |---|---|---|
 | `scene` | 场景四要素：时间 / 地点 / 天气 / 光源 | 深夜 / 面馆内 / 无雨 / 暖黄吊灯 |
 | `action` | 这一镜唯一的主要动作 | 老板娘把一碗面放在女孩对面 |
-| `micro` | 微表情**过程**（肌肉与眼神的顺序） | 嘴角先提了一下，笑意才慢慢漫到眼底 |
+| `micro` | 微表情**过程**（中文，进剧本 md，人读） | 嘴角先提了一下，笑意才慢慢漫到眼底 |
+| `micro_en` | 同一段微表情的**英文版（进提示词）**，不写就退回中文兜底 | `a faint smile begins at one corner of his mouth, then reaches his eyes` |
 | `speaker` | 谁在说（角色名，或 `VO` 旁白） | boss |
-| `line` | 真正说出口的台词，≤18 字 | 还是不要葱对吧？ |
+| `line` | 真正说出口的台词，16–35 字（红线 45） | 还是不要葱对吧？ |
 | `frame.prompt` | 英文首帧提示词（场景/服装/光线/构图） | … |
 | `video_prompt` | 英文视频提示词，含**台词原句 + 口型同步指令** + 微表情 + 2–3 段运镜 + 环境声 | … |
 
@@ -323,7 +325,9 @@ python scripts/ac.py cast "<dir>" list                  # 看哪些角色是本�
 2. 有台词的镜头用 **waist-up medium shot / medium close-up**，嘴部必须可见；不要远景说话。
 3. 口型指令固定写法：`The character speaks in Mandarin Chinese with precise lip-sync: "…" — mouth shapes each syllable clearly, jaw and lips move naturally.`
 4. 台词前后各留 0.5 秒不说话，口型才有呼吸感。
-5. 微表情只在腰以上景别写，一镜最多 2 个。
+5. 微表情只在腰以上景别写，一镜最多 2–3 个，且**必须写 `micro_en`**：
+   `micro` 只进剧本 md，**不写英文版，模型一个字都收不到**（2026-11-12 修的静默缺陷）。
+   写法见 `references/micro_expression.md`（写肌肉不写情绪 / 写序列不写形容词 / 必带一个无意识动作 / 半拍延迟）。
 6. 台词口语化、有潜台词，不要念说明书。
 
 产出两份文件：
@@ -580,30 +584,81 @@ S31 猫哥突然从右跳到左。这三条逐镜看每条都合理，连起来�
 - 转场按情绪走：同场景 dissolve、穿越/闪回 fadewhite；
 - BGM 推成背景音（`--bgm-volume 1.35 --bgm-lowpass 3200`），不要盖过环境。
 
-## 对白节奏：别让一句台词撑 7 秒
+## 对白节奏：慢不是念得慢，是镜头比台词长
 
 **症状**：一镜只有一句台词，却给了 7 秒；前 6 秒干站着，最后一秒才开口，拼起来又拖又假。
+
+> 🔴 **2026-11-12 走过一次弯路，别再走**：为了治"慢"，把台词砍到 14 字以内，
+> 用户当场说「台词太低智了，不够深刻，字数太少」，接着又说
+> 「把那个放宽，放到 35 字甚至于更多，我前面还说语速太慢呢！你完全可以把镜头放开字数放多啊」。
+> **砍字数换不来节奏，只换来"短而浅"。** 节奏的工具是「时长 ÷ 字数」这个比值，不是字数。
 
 **根因有三层**，三层都要治：
 
 | 层 | 问题 | 修法（已内置） |
 |---|---|---|
-| 时长 | 按"动作 + 空间"算时长，一句 13 字的台词也能撑到 7–10 秒 | 有台词的镜头改为**以台词为锚**：`字数/4.2 + 0.9`，封顶 8 秒；无台词镜头才按动作算 |
+| 时长 | 按"动作 + 空间"算时长，一句 13 字的台词也能撑到 7–10 秒 | 有台词的镜头**以台词为锚**：`max(3, ceil(字数/4.2) + 1)`；24 字 → 7 秒是正常的 |
 | 提示词 | 只写"说话 + 口型"，模型自然把台词拖到镜头末尾 | 写死**开口窗口**：`starts speaking at about 0.5s and finishes by 2.8s; after that only a silent reaction — never delay the line to the end` |
 | 合成 | 整段拼接，开播前的静音全留着 | `assemble` 默认按**真实人声**收紧：砍掉开口前的死等，尾部留 0.9 秒反应；`--no-tighten` 可关 |
 
-**Agnes 的硬下限**：`seconds` 只能是字符串 `"4"`–`"12"`（默认 `"5"`，`size` 只能是 `"720P"`）。
-所以**一镜最短 4 秒**，规划时不要出现 2–3 秒的镜头；`calc_duration` 已经钳在 4–8 秒。
+**字数口径（2026-11-12 定）**：舒适区 **16–35 字**，35–45 告警，**>45 必改**，单镜 ≤60 字。
+14 字装不下任何一句有分量的话——「药性不在火里，在时辰里」已经 12 字，加半句解释就超了。
+台词上限只防「一口气说不完」，**不负责控节奏**。
 
-**短句不单独成镜**（这是关键）：≤6 个汉字的回应（「陈屿。」「我知道。」「嗯。」）由管线自动并进上一镜，
+**一句太长怎么办：拆成两镜（同机位接力），不要砍字。**
+
+```
+原来（一镜 8 秒，24 字，模型容易走神）：
+  S06 师父：「炖不掉的。药性不在火里，在时辰里。火只煮得软，煮不出甜。」
+
+拆成（两镜，同一机位，接力，共 10 秒）：
+  S06 师父：「炖不掉的。药性不在火里，在时辰里。」  5 秒（新首帧）
+  S07 师父：「火只煮得软，煮不出甜。」              4 秒（接 S06 尾帧）
+```
+
+**Agnes 的硬下限**：`seconds` 只能是字符串 `"4"`–`"12"`（默认 `"5"`，`size` 只能是 `"720P"`）。
+所以**一镜最短 4 秒**；镜头表里写 3 秒的空镜，实际按 4 秒生成、拼接时取 3 秒。
+`calc_duration` 已经钳在 4–8 秒。
+
+**短句不单独成镜**：≤6 个汉字的回应（「陈屿。」「我知道。」「嗯。」）由管线自动并进上一镜，
 变成双人对话镜头——接话的人会被补进 `cast`、提示词改写成 two-shot。合并条件：同场景、上一镜还没并过、
 合并后不超过 2 人、两句合起来装得进 8 秒。装不下就老实单独成镜（4 秒起）。
 
-一句话：**长台词一镜一句，短回应并进上一镜；宁可少一镜，不要多两秒空等。**
-
 **验收标准**：每镜台词起点应落在镜头前 45%，`audit` 会把超过的逐条标出来（"台词到 4.2s 才开口（占 58%），前段空等"）。
 
-**节奏建议**：对话正反打不要一个镜头塞两句。一句一个镜头，说话人 2.5–4 秒，听话人反应镜 1.5–2.5 秒，交替；这样既有停顿又不拖。
+**节奏建议**：对话正反打不要一个镜头塞两句。一句一个镜头，说话人 3–6 秒，听话人反应镜 2–3 秒，交替；这样既有停顿又不拖。
+
+**完整口径见 `references/pacing_and_continuity.md`**（字数档位 / 微表情落地 / 拆镜与尾帧接力 /
+转场分档 / 结尾三层收，都在里面，改规则请改那一份）。
+
+## 拆镜与尾帧接力：接力只在"机位段"内做
+
+用户要"同场景用上一镜尾帧当下一镜首帧"时，**不是所有相邻镜都接**，而是按机位段分组：
+
+- **一个机位段 = 一个固定机位 + 一个固定景别**，段内 2–3 镜；
+- 段内第 1 镜正常出首帧，第 2、3 镜 `"link": "prev"`（直接取上一镜最后一帧当首帧，**不重新出图**）；
+- **换景别 = 换机位段 = 重新出首帧**。拿 wide 的尾帧当近景首帧，构图对不上，脸会被拉变形。
+
+两条硬限制（`check` 会拦，别硬试）：
+
+| 限制 | 原因 |
+|---|---|
+| **有人物的镜最多连传 2 段**（即一个机位段最多 3 镜） | 尾帧接力一镜一镜累积漂移，第 3 段开始脸就变形（ep04 实测） |
+| **同一机位、同一景别不许连 3 镜** | 剪在一起观众读到的是"跳切"，不是"换镜头" |
+
+想要更碎的节奏，就在段与段之间**真换机位**：wide 交代 → 中近景对话 → 手部 insert → 过肩。
+
+## 转场：分两档，不要一刀切全叠化
+
+| 位置 | 接法 | 写法 |
+|---|---|---|
+| 同一机位段内 | **硬接**（尾帧当首帧） | 不写 `x` |
+| 换场景 / 换空间 | **叠化 0.6 秒** | `"x": {"kind": "fade", "dur": 0.6}` |
+| 时间跳跃（隔天、多年后） | 白闪 0.4 / 黑场 0.6 | `fadewhite:0.4` / `fadeblack:0.6` |
+
+`assemble` 会按每个镜头的 `shot["x"]` 逐段套用。**不要**用全局
+`--transition dissolve:0.7` 一把梭——同机位的硬接会被软化，画面糊成一片，30 镜还白丢 20 秒。
+
 
 ## 首帧提示词的四个硬保证（可自检）
 
@@ -883,6 +938,71 @@ python scripts/ac.py assemble "<dir>" --subs     # 只在合成阶段加字幕�
 | `tts` | `true` = 这一镜只混 TTS（模型念糊时用） |
 
 完整字段表与每个字段的取值规则见 `references/full_pipeline.md` 阶段 2。
+
+## 空间锁：多角色对话戏别让房间里的人乱换位置（`scripts/staging.py`）
+
+### 为什么需要它
+
+对话戏最容易出的不是「谁在说」，是**谁站在哪、桌上摆了什么**。
+镜头表里分开写每一镜的 prompt，到了模型那儿就各画各的：上一镜老板在左、
+下一镜老板在右；写着「顾客坐方凳」，出来两人都站着。
+
+根源是 `angle` 这个字段**只用来挑场景板**，不描述怎么拍。
+ep19 审计发现，三个不同机位名背后写的是同一句取景 ——
+换个机位名等于换张背景照片，镜头语言一个字没变。
+
+### 怎么用
+
+它是给**项目侧生成器**用的 Python 库（不是 ac.py 的子命令）。
+把机位和空间一次性登记好，以后每镜只填「谁在哪侧」：
+
+```python
+import sys
+sys.path.insert(0, "<skill目录>/scripts")
+from staging import Staging, verify, verify_angles
+
+HALL = Staging(
+    place=("the dark square table stays fixed in the middle of the room, "
+           "the grey wolf stands at the LEFT side of the table, "
+           "the cat in the apron stands at the RIGHT side"),
+    dressing="exactly four things always sit on the table: two bowls, one jar of vinegar, one rag",
+    angles={
+        "table":      "Medium shot across one dark square table from the counter side",
+        "counter-two": "Medium two-shot from behind the long counter, waist-up",
+        "pass":       "Medium shot from the dining room toward the serving pass",
+    },
+)
+
+framing = HALL.at("counter-two", "the grey wolf at the left, the cat at the right")
+shot["frame"]["prompt"] = framing + " " + shot["frame"]["prompt"]
+
+# 生成器 main() 里自检，有问题就打印出来
+for shot_id, problem in verify(SHOTS) + verify_angles(SHOTS):
+    print(shot_id, problem)
+```
+
+`HALL.at(机位, 谁在哪)` 是推荐写法：**同一个机位名写两次直接报错**，
+所以你不可能写出「三个机位其实是一句话」。旧的 `HALL.two(who)` / `HALL.close(who)`
+仍然能用。
+
+`verify()` 查两件事：
+- 同一场景里，**谁在哪侧**这句话必须一字不差（陈设句可以缺席，特写镜本来就不该有）；
+- 同一镜里出现两句不同的空间锁 = 两套锁打架，模型会各取一半。
+
+### 它跟 ac.py 的两处联动（这两个开关必须一起设）
+
+| 镜头表里写 | ac.py 的反应 |
+|---|---|
+| `shot.position_lock = true` | 不再追加「两人等距面对面交谈」的兜底句。你已经写死了左右和坐站，兜底句会把你压回两个等高等距的站立半身。 |
+| prompt 里有 `Staging is fixed for the whole film` | ac.py **不再**把 `scene.set` 整份陈设清单拼进提示词。两份清单会打架，而清单里的「木凳 / 面碗」会被模型当成必备家具照着画。 |
+
+不设 `position_lock` 时，ac.py 会补一句兜底；用了空间锁就必须设，
+否则「谁在哪侧」会被兜底句覆盖回去。
+
+### 什么时候不用
+
+- 单人镜、空镜、回忆镜：没有「谁在哪侧」的问题，用普通 prompt 就行。
+- 一个场景只有两三个镜：手工在 prompt 里写清楚更快。
 
 ## 配音与字幕
 
@@ -1598,6 +1718,99 @@ python scripts/ac.py chain "<dir>" --apply --tail-run 3   # 同场景连挂上�
 最后 `seam` 量接缝验收。规矩：有人物的镜 `link` 连传 ≤2 段（ep04 脸漂移事故）；
 `tail_frame` 同场景连挂 ≤3 镜。接力帧落 `frames/_chain/`，不覆盖原首帧。
 `check` 会校验错配（第一镜接尾帧、接回忆镜、人物镜连传超限、末镜桥接）。
+
+## 🔴🔴 有首帧时再加角色 / 场景参考图：`link="prev-ref"`（v2.1.0）
+
+### 先回答「到底能不能加」
+
+**能，而且本 skill 一直就是多参考图出首帧**，不是「先出一张首帧再往上贴」。
+三条出图通道都是**遍历一个列表**，没有张数上限：
+
+| 通道 | 参考图怎么传 | 代码 |
+|---|---|---|
+| `agnes` | `extra_body.image = [data_uri, ...]` | `_generate_via()` |
+| `gpt-image` | `input = [{type:input_image,...}, ...]` | `gpt_image_generate()` |
+| `banana` | `contents[0].parts[].inlineData` | `banana_image_generate()` |
+
+首帧那一次请求里实际带的 `refs` 顺序是：
+
+```
+[角色1 face_ref, 角色2 face_ref?, 道具图?, 场景板?]
+单人 2 张 / 双人 3 张（2 脸 + 1 板）
+```
+
+提示词里用 `Reference photo N` **逐张点名**：双人镜会写
+「photo 1 是 A 的脸、photo 2 是 B 的脸、两张脸不许平均」，道具和场景板接着往后编号。
+所以「同一张脸、同一个房间」不是靠把话重复写 15 遍，是靠这 2–3 张图每镜都在场。
+
+### 旧 `link="prev"` 为什么用不上这套能力
+
+旧接力是 **把上一镜视频尾帧直接拷贝成本镜首帧**（`do_frames()` 里 `extract_tail_frame()`
+之后 `continue`），**一次生图接口都不调**。既然不生成，就没有机会带角色脸和场景板。
+所以它只能给 `no_faces` 的无脸特写用——没有脸可漂，也没有脸可锁。
+
+### 新模式做了什么
+
+`link="prev-ref"`：把上一镜尾帧当成**最后一张参考图**，和角色脸、道具图、场景板一起
+送进出图接口，**重新生成**本镜首帧。
+
+```json
+{"id": "S02", "link": "prev-ref"}
+```
+
+执行链（全自动，用户不用手工排顺序）：
+
+1. `frame`：所有镜先按常规多参考图各出一张首帧（接力失败时兜底，也是 `tail_frame` 的落点）。
+2. `video`：调度器看到 `prev-ref` 会**等上一镜的 clip 出片**才提交本镜。
+3. 提交前抽上一镜尾帧 → 存 `frames/_chain/S02_in.jpg`（不覆盖任何正式首帧）。
+4. 调 `_regen_frame_from_tail()`：以 `[角色脸, 场景板, 尾帧]` 重新出图，写回 `frames/S02.jpg`；
+   接力前那张备份到 `frames/_chain/S02_base.jpg`。
+5. 视频用这张新首帧作 `first_frame` 提交。
+
+尾帧放在**列表末尾**是刻意的：前面「photo 1/2 是谁」的绑定编号不用改，
+身份锚和场景锚权重在前，尾帧只负责接续动作、物件位置和光线。
+提示词里追加 `CHAIN_CONTINUITY`，明确「每个人的脸来自自己的角色参考图、
+墙和家具来自场景板，这两者全程有效」，纯正向、不写排除句。
+
+### 为什么这样人物镜也不漂
+
+| | 裸尾帧接力 | tail_frame 桥接 | **prev-ref 多图接力** |
+|---|---|---|---|
+| 身份锚 | 无 | 两端是已生成首帧 | 每镜都带 `face_ref` |
+| 场景锚 | 无 | 靠首帧间接带 | 每镜都带场景板 |
+| 误差 | 逐镜累积 | 不累积 | 不累积（锚每镜重建） |
+| 剪辑点 | 硬拷贝，接得住 | 数学上零跳 | 动作/位置/光线接续 |
+
+### 命令与边界
+
+```bash
+ac.py chain <dir> --mode prev-ref                  # 预览配对
+ac.py chain <dir> --mode prev-ref --apply         # 写回 shots.json
+ac.py chain <dir> --mode prev-ref --apply --link-run 2   # 同场景连传上限，默认 2
+ac.py frame <dir> --only S02 --dry-run --force   # 看这张图到底喂了几张、编号对不对
+ac.py check <dir>                                # prev-ref 已纳入连传校验
+ac.py seam <dir>                                 # 出片后量接缝灰度差验收
+```
+
+配对规则：只配**同 `scene.id` 的相邻镜**；跨场景、回忆/复用镜自动断开；
+一组连传默认 ≤2 段（三镜后松一镜让画面呼吸）。仍然别跨场景、别跳时间。
+`check` 会把 `prev-ref` 算进接力链，超 3 段照样报警。
+
+### 同批修掉的两个老毛病（2026-11-11 dry-run 实证）
+
+1. **地域锚**：`scene.interior` 现在**显式优先**，写了 `true` 就直接取纯正向室内锚，
+   不再猜关键词。旧版把「商超后场退货区」判成室外，把整段街景锚（红路灯/电动车/人行道）
+   拼在室内前缀后面，模型照街景画。`CN_SHOP_ANCHOR`、室内前缀和三个 preset 里
+   所有 `NOT a Japanese izakaya` / `no paper lanterns` / `no rising sun motif` 之类的
+   否定句**全部改成纯正向**——SKILL.md 早写了「地域锚不能有负面词」，代码一直没跟上。
+   两份 `scripts/region_lock.py`（agnes-clip 与 ai-video-pipeline）已同步为同一份。
+2. **世界观打架**：全真人镜不再追加「Most characters are anthropomorphic animals」，
+   之前它会和「All characters are East Asian Chinese」同时出现在提示词里。
+   只有人兽混居的镜才补这句。
+
+验证（不调 API、不花钱）：`frame --dry-run` 输出里应是
+`参考图 3 张：1 人脸 / 2 场景板 / 3 尾帧`，且 `Most characters are anthropomorphic animals` 为 0 次、
+街景词为 0 次。
 
 ## 转场：别一路硬切，也别逢切必叠
 

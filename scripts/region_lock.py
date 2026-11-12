@@ -31,21 +31,31 @@ CN_STREET_ANCHOR = (
     "Photorealistic contemporary Chinese city, cool blue dusk sky with warm orange lamp glow."
 )
 
-# 室内锚：室内场景的默认先验是日式居酒屋/咖啡馆，用排除项是安全的（模型不容易误读室内）
+# 室内锚：🔴 纯正向，一个负面词都不写。
+# 旧版写了 "NOT a Japanese izakaya, no noren curtains, no paper lanterns, no rising sun motif,
+# no calligraphy banners" —— 这些词本身把居酒屋、暖帘、纸灯笼、旭日纹、书法挂轴
+# 全部激活了，实测首帧里满屏幡旗挂轴就是这么来的。SKILL.md 早写明「地域锚必须全正向」，
+# 代码一直没跟上，2026-11-11 一并修掉。
+# 只说这间屋子里**有什么**：中国当代的实用空间、灰墙、水泥地、日光灯、普通金属与木家具。
 CN_SHOP_ANCHOR = (
-    "Authentic contemporary Chinese setting with real, lived-in Chinese details. "
-    "NOT a Japanese izakaya, NOT a sushi bar, NOT a western restaurant, NOT a generic hotel lobby. "
-    "No noren curtains, no tatami, no sushi counter, no English-only signage. "
-    "No paper lanterns, no round chochin lanterns, no rising sun motif, no calligraphy banners."
+    "Setting: an ordinary working interior in contemporary mainland China. "
+    "Plain gray concrete or plaster walls, a practical ceiling with exposed white fluorescent "
+    "tubes, a smooth gray cement or terrazzo floor, plain metal shelving and simple wooden "
+    "furniture, ordinary Chinese signage in simplified Chinese characters, everyday working "
+    "Chinese objects, even functional overhead light. "
+    "Photorealistic contemporary Chinese interior, cool neutral daylight-white lighting, "
+    "documentary film still, natural colour."
 )
 
 SCENE_ANCHOR_PRESETS = {
     "cn_street": CN_STREET_ANCHOR,
     "cn_shop": CN_SHOP_ANCHOR,
     "cn_noodle_shop": (
-        "A tiny old Chinese street noodle shop (中式老街面馆) in a southern Chinese city at night. "
-        "Authentic Chinese details only — NOT a Japanese izakaya, NOT a sushi bar, NOT a café, "
-        "NOT a western restaurant. No noren curtains, no tatami, no sushi counter."
+        "A tiny old Chinese street noodle shop in a southern Chinese city at night. "
+        "Pale plaster walls, dark wooden tables and stools worn smooth by years of use, "
+        "a stainless steel noodle counter with a tall stock pot, Chinese characters on a "
+        "hand-painted menu board, warm tungsten bulbs under a low ceiling, steam rising, "
+        "a cement floor. Photorealistic contemporary Chinese family restaurant."
     ),
     "cn_old_street": (
         "An old residential street in a Chinese city, mid-20th-century Chinese brick housing "
@@ -61,14 +71,16 @@ SCENE_ANCHOR_PRESETS = {
         "Photorealistic contemporary Chinese city at night."
     ),
     "cn_apartment": (
-        "A small lived-in Chinese urban apartment, ordinary rented flat with simple modern furniture, "
-        "warm household clutter, real Chinese domestic details. NOT a showroom, NOT a hotel room, "
-        "NOT a western loft."
+        "A small lived-in Chinese urban apartment, an ordinary rented flat with simple modern "
+        "furniture, a thermos and teacups on the table, clothes drying on a balcony rack, "
+        "a wall calendar in simplified Chinese, warm household clutter and soft afternoon light "
+        "through a plain aluminum window frame. Photorealistic Chinese home."
     ),
     "cn_cafe": (
-        "A small independent Chinese neighbourhood coffee shop, wooden tables, warm pendant lights, "
-        "plants by the window, handwritten menu board. NOT a Japanese kissaten, NOT a chain store, "
-        "NOT a European bistro."
+        "A small independent Chinese neighbourhood coffee shop, square wooden tables, "
+        "warm pendant lights with plain metal shades, potted green plants by the window, "
+        "a handwritten menu board in simplified Chinese, tiled floor, quiet afternoon light. "
+        "Photorealistic contemporary Chinese small business."
     ),
 }
 
@@ -80,8 +92,14 @@ _OUTDOOR_HINTS = ("街", "路口", "巷", "马路", "路边", "户外", "室外"
 _INDOOR_HINTS = ("室内", "屋里", "房间", "客厅", "卧室", "厨房", "店里", "馆内", "教室", "办公室", "车内",
                  "咖啡店", "面包店", "便利店", "书店", "理发店", "餐厅", "饭店", "面馆", "食堂", "医院",
                  "学校", "公司", "工厂", "仓库", "酒吧", "旅馆", "酒店", "民宿",
+                 # 🔴 2026-11-11：这些词以前没进表，「深圳某大型商超后场退货区」被判成室外，
+                 #    最前面被灌进整段街景锚（红路灯/电动车/人行道），室内镜整帧跑成街头。
+                 "后场", "退货", "超市", "卖场", "商超", "仓库", "库房", "作坊", "灶间", "堂屋",
+                 "车间", "后台", "冷库", "档口", "厂房", "包间", "清点区", "会议室", "店面", "铺子", "屋内", "仓间",
                  "indoor", "interior", "room", "living room", "bedroom", "kitchen", "shop",
-                 "restaurant", "cafe", "coffee shop", "office", "studio", "hotel")
+                 "restaurant", "cafe", "coffee shop", "office", "studio", "hotel",
+                 "supermarket", "warehouse", "store room", "stockroom", "workshop", "backroom",
+                 "clearance", "dispatch", "stock area", "loading bay")
 
 
 def _auto_anchor(shot):
@@ -119,15 +137,16 @@ def _is_interior_shot(shot):
 #   "A small neighbourhood Chinese noodle shop and the street outside it in a modern Chinese city"
 # 而这个 anchor 会被拼到提示词**最前面**（压先验），
 # 于是 "the street outside it" 反而把整帧推成室外街景 —— 实测室内镜整帧跑出街头。
+# 🔴 2026-11-11：改成纯正向。旧版里那四个 "not a Japanese izakaya / not a sushi bar /
+#    not a western diner / not a Japanese street with torii gates or shrine lanterns"
+#    就是「越禁越来」的元凶；SKILL.md 写了必须全正向，代码这里一直留着否定句。
+#    只说这间屋子是什么，不提任何不想要的东西。
 _INTERIOR_SCENE_PREFIX = (
-    # 🔴 只做地域约束，**不带任何具体陈设**。
-    #    之前这里硬写了「白墙 / 木家具 / 刷金属吊灯 / 一摞碗」——那是某一间店堂的样子，
-    #    套到菜市场、后厨、灶间上就成了串味（ep04 菜市场首帧里冒出来米面馆的吊灯和纸条）。
-    #    陈设一律由各场景自己的 anchor + scene.set 负责。
     "Authentic contemporary Chinese setting. "
-    "Everything visible in frame belongs to this same location. "
-    "Contemporary Chinese, not a Japanese izakaya, not a sushi bar, not a western diner, "
-    "not a Japanese street with torii gates or shrine lanterns. "
+    "Everything visible in frame belongs to this same one enclosed room. "
+    "Plain walls, a ceiling with exposed white fluorescent tubes, a smooth cement floor, "
+    "ordinary Chinese working furniture and even functional overhead light. "
+    "Photorealistic contemporary Chinese interior, documentary film still."
 )
 
 
@@ -178,8 +197,29 @@ def scene_anchor(cfg, paths=None, shot=None):
         anchor = _auto_anchor(shot)
     if isinstance(anchor, str):
         anchor = SCENE_ANCHOR_PRESETS.get(anchor.strip(), anchor)
-    # 🔴 室内镜头：把 anchor 里的“街上”表述剥掉，并强制用内景正向锚。
-    #    anchor 会被拼在提示词最前面，"the street outside it" 会把整帧推成室外。
+
+    # 🔴🔴 2026-11-11：scene.interior 是**显式声明**，直接决定用哪套锚，不再猜关键词。
+    #    旧逻辑的 bug：_auto_anchor 把「商超后场退货区」判成室外 → 返回整段街景锚，
+    #    接着 _is_interior_shot 又认出 interior=True → 只是把「室内前缀」拼在街景锚前面，
+    #    _strip_outdoor_bits 那几条正则对街景锚一句都匹配不上 —— 结果室内镜的最前面
+    #    同时出现「这是室内」和「红路灯、电动车、人行道」，模型照街景画。
+    sc = (shot or {}).get("scene") or {}
+    if not isinstance(sc, dict):
+        sc = {}
+    explicit = sc.get("interior", None)
+    if explicit is True:
+        # 室内镜绝不沾街景锚；项目若写了自己的正向场景长句，保留它。
+        base = anchor or ""
+        if not base or base == CN_STREET_ANCHOR:
+            base = CN_SHOP_ANCHOR
+        return _INTERIOR_SCENE_PREFIX + " " + base
+    if explicit is False:
+        base = anchor or ""
+        if not base or base == CN_SHOP_ANCHOR:
+            base = CN_STREET_ANCHOR
+        return base
+
+    # 没写 interior 才走老的关键词推断（保持旧项目行为不变）
     if _is_interior_shot(shot):
         anchor = _INTERIOR_SCENE_PREFIX + " " + _strip_outdoor_bits(anchor)
     return anchor

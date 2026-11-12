@@ -1,5 +1,26 @@
 # 微表情库
 
+> 🔴 **2026-11-12 修掉的一个静默缺陷**：`shot["micro"]` 以前只写进剧本 md
+> （`**微表情**：...`），**从来没有进过任何出图/出片提示词**。
+> 模型收到的只有 `action` + 台词，首帧的脸永远是「标准皱眉/标准微笑」，
+> 视频只能在这个标准表情上往下演——这就是用户说的「人物没有微表情、一眼 AI」。
+>
+> 现在每镜写**两个**字段，`ac.py` 会自动拼进两条独立的链（首帧 + 视频）：
+>
+> ```json
+> "micro":    "他捏住根的两指先用力一掐，皮都没掐破；眉头往中间挤，嘴角往下撇半分；说完抬眼，眼睛先看根，再看师父",
+> "micro_en": "he pinches the root until his fingertips whiten, his brows pulling together and one
+>              corner of his mouth dropping, then flicks his eyes from the root up to the old man's face"
+> ```
+>
+> - `micro`：中文，给人看，进剧本 md；
+> - `micro_en`：**英文，给模型看**，进首帧提示词（`At this exact frame the face and body carry
+>   this micro-expression: ...`）和视频提示词（`Throughout the shot the performance follows this
+>   order of small movements, subtle and physical: ...`）。
+>
+> 只写 `micro` 不写 `micro_en` 也能用（代码会退回中文兜底），但英文措辞更准，推荐都写。
+> **判断有没有生效**：`--dry-run` 里搜 `micro-expression`，每镜应出现 2 次。
+
 ## 为什么需要单独写
 
 模型默认给的"笑"是**定格的笑**——嘴角上扬、保持不动，像照片。真人不是这样的：笑意有起势、有到达、有收住，眼睛和嘴角不同步。
@@ -11,6 +32,32 @@
 1. **只在近景写**。中远景写微表情没用，看不见，反而占用了本应描述动作的篇幅。
 2. **一个镜头最多 2–3 个微表情**。写多了模型会混，表情变僵硬。
 3. **写成动作序列，不写成形容词**。`a faint smile begins at the corner of her mouth, then reaches her eyes` 优于 `she smiles warmly`。
+
+## 第四条：必须带一个"无意识动作"
+
+这是"活人感"和"塑料感"的分水岭。真人说话时身体一直在做没意义的小动作：
+
+| 类型 | 写法 |
+|---|---|
+| 吞咽 | `his throat moves once before he answers` |
+| 眨眼 | `he blinks, slowly, once, only after he finishes` |
+| 呼吸 | `he lets out a breath first, his shoulders dropping` |
+| 手指 | `two fingers tap the rim twice` |
+| 鼻翼 | `his nostrils flare as he takes the smell` |
+| 蹭 / 抹 | `he wipes his nose with the back of a wet hand` |
+
+**第四条比前三条更重要**：一个「皱眉 + 吞咽」的普通人，胜过十个「表情丰富」的模特脸。
+
+## 第五条：半拍延迟
+
+真实反应比台词慢 0.3–0.5 秒。先愣住，再开口；
+「他停了一下才说」永远比「他立刻说」自然。
+
+## 禁写词（一写就塑料）
+
+`smiling brightly` / `looking surprised` / `emotional expression` / `beautiful face` /
+`perfect skin` / `glamorous` / `model-like`——这些是美颜和表情包词汇，
+会把画面直接推向 AI 感。要写「哪块肌肉动了」，不要写「什么情绪」。
 
 ## 表情库（可直接抄）
 

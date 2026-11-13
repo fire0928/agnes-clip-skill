@@ -236,21 +236,35 @@ DEFAULT_TEXT = {
 }
 
 DEFAULT_VIDEO_CH = {
-    # 视频通道（可以独立于图片/文本）：Agnes 免费 / Agnes 付费 / 自定义 OpenAI Videos
+    # 视频通道（可以独立于图片/文本）：Agnes 免费 / Agnes 付费 / 火山引擎 Ark（Seedance）/ 自定义 OpenAI Videos
     "endpoint": "",
     "key": "",
     "model": "",
     "jobs": 3,
     "poll_interval": 30.0,
     # 多档通道：订阅额度 → 免费额度 → 按量付费，能白嫖就白嫖，排不上才花钱。
-    # [{"name":"档位名","endpoint":"...","key":"...","model":"..."}]
+    # 支持 Agnes 和 Ark（火山引擎 Seedance）两种 provider，档里写 provider:"ark"
+    # 或 model 以 ep-/cgt- 开头即自动识别。Ark 档 24h key 过期后全档 401。
+    # [{"name":"档位名","endpoint":"...","key":"...","model":"...","provider":"ark|agnes"}]
     "tiers": [],
     # 分档并行配额：{"0": 3, "2": 3} = 第1档3路 + 第3档3路同时跑
+    # 🔴 Ark（Seedance 2.5）单账号并发 = 1（平台硬约束，个人档 3 并发是账号维度）。
+    #    配 Ark 档时务必把该档 tier_slots 写 1，否则会撞 InflightBatchsizeExceeded。
     "tier_slots": {},
     # 换到付费档要不要先问一句（默认要，防止程序偷偷烧钱）
     "paid_requires_confirm": True,
     # 免费档最多试几轮就换下一档
     "free_tier_max_attempts": 1,
+    # Ark（火山引擎）默认参数，档里可覆盖
+    "ark": {
+        "endpoint": "https://ark.cn-beijing.volces.com/api/v3",
+        "key": "",
+        "model": "ep-20261106154430-877sp",   # Seedance 2.5
+        "ratio": "adaptive",                    # 带首帧必须 adaptive
+        "resolution": "720p",
+        "generate_audio": True,
+        "watermark": False,
+    },
 }
 
 DEFAULT_CFG = {
@@ -825,14 +839,21 @@ def video_tier_list(cfg):
     v = cfg.get("video") or {}
     raw = v.get("tiers") or cfg.get("video_tiers") or []
     out = []
-    for t in raw:
+    for i, t in enumerate(raw):
         if not str(t.get("key") or "").strip():
-            continue
+            # Ark 通道也允许 ak+sk 组合；只要有一个凭据就保留
+            if not (str(t.get("ak") or "").strip() and str(t.get("sk") or "").strip()):
+                continue
         out.append({
             "name": t.get("name") or t.get("model") or "tier",
             "endpoint": (t.get("endpoint") or "").rstrip("/"),
-            "key": str(t.get("key")).strip(),
+            "key": str(t.get("key") or t.get("api_key") or "").strip(),
             "model": t.get("model") or "agnes-video-2.5-flash",
+            "provider": str(t.get("provider") or "").strip().lower(),
+            "_idx": i,
+            # 保留 ak/sk 供 Ark 使用
+            "ak": t.get("ak") or "",
+            "sk": t.get("sk") or "",
         })
     return out
 
@@ -1334,6 +1355,20 @@ class SubmitError(Exception):
     pass
 
 
+class SubmitUncertain(SubmitError):
+    """POST /videos 超时/连接中断 —— 服务端**可能已经建好任务并扣了费**。
+
+    🔴 这类错误绝对不能自动重试。本集实测：第一次 1080P 出片时若干次提交
+    读到 `The read operation timed out`，脚本当失败重试，服务端因此多建了
+    一份任务、多扣一份钱，最后对账多出约 $11（见 2026-11-13 账单核对）。
+    漏一次补一次只多花一份钱，盲重试直接翻倍。
+
+    调用方拿到它应该：把镜头写进 clips/_uncertain.json 停下，
+    人工去后台确认那个 task 是否存在，而不是再提一遍。
+    """
+    pass
+
+
 class PaidTierNeedsConfirm(Exception):
     """免费通道都排不上，需要用付费档，但当前策略要求人工确认。
 
@@ -1344,9 +1379,20 @@ class PaidTierNeedsConfirm(Exception):
     pass
 
 
+def _vsz_label(a):
+    """日志里显示真实分辨率档位（1080P 只在国际版可用）。"""
+    v = str((a or {}).get("video_size") or "720P").strip().upper()
+    return v if v in ("720P", "1080P") else "720P"
+
+
 def _video_payload(cfg, model, prompt, seconds, aspect_ratio,
                    first_frame, last_frame, images, audios, seed):
-    payload = {"model": model, "prompt": prompt, "size": "720P", "n": 1}
+    # 2026-11-12：尺寸可配。国际版 apihub.agnes-ai.com 实测接受 "1080P"，
+    # 国内版只认 "720P"（写 1080P 会 400）。所以读配置，缺省仍是 720P。
+    _vsz = str((cfg.get("agnes") or {}).get("video_size") or "720P").strip().upper()
+    if _vsz not in ("720P", "1080P"):
+        _vsz = "720P"
+    payload = {"model": model, "prompt": prompt, "size": _vsz, "n": 1}
     if first_frame or last_frame:
         payload["mode"] = "keyframe"
         if first_frame:
@@ -1372,7 +1418,17 @@ def _submit_on_tier(cfg, tier, prompt, seconds, aspect_ratio,
                     first_frame=None, last_frame=None, images=None,
                     audios=None, seed=None, quick=False, max_attempts=None):
     """在指定档位上提交一次。quick=True 时少试几轮（用于试探下一档）。
-    max_attempts 显式指定时覆盖配置里的 submit_attempts（免费档省着用）。"""
+    max_attempts 显式指定时覆盖配置里的 submit_attempts（免费档省着用）。
+
+    🔴 v2.2.0：按 tier 里 provider/模型前缀自动路由——
+       provider=ark / 模型以 ep-/cgt- 开头 / 端点是 ark.cn-beijing.volces.com
+       一律走 `_ark_submit`，其余照旧走 Agnes。这样 tiers 里可以混排
+       火山引擎与 Agnes 通道，调度器和 _pending.json 复用同一套结构。
+    """
+    if _tier_is_ark(tier):
+        return _ark_submit(cfg, tier, prompt, seconds, aspect_ratio,
+                           first_frame, last_frame, images, audios, seed,
+                           quick=quick, max_attempts=max_attempts)
     a = cfg["agnes"]
     payload = _video_payload(cfg, _tier_model(cfg, tier), prompt, seconds, aspect_ratio,
                              first_frame, last_frame, images, audios, seed)
@@ -1414,10 +1470,229 @@ def _submit_on_tier(cfg, tier, prompt, seconds, aspect_ratio,
             time.sleep(wait)
         except Exception as e:
             last = str(e)
+            low = str(e).lower()
+            # 🔴 超时 = 服务端很可能已经建好任务并扣费。再 POST 一次就是双倍扣钱。
+            #    宁可当作「结果未知」停下来人工核对，也不盲重试（2026-11-13 实测教训）。
+            if any(k in low for k in ("timed out", "timeout", "connection reset",
+                                      "eof occurred", "connection aborted",
+                                      "remotedisconnected", "broken pipe")):
+                raise SubmitUncertain(
+                    "%s 提交结果未知（%s）——服务端可能已建任务并扣费，"
+                    "请先去后台确认，不要直接重提" % (payload.get("model"), str(e)[:120]))
             wait = min(60, 2 * (2 ** i))
             info("  提交异常（%s），%ds 后重试" % (str(e)[:120], wait))
             time.sleep(wait)
     raise SubmitError(last)
+
+
+# ----------------------------------------------------------------------------- ark / Seedance (火山引擎)
+# 第 8 档视频通道：火山方舟 Seedance 2.5（豆包）。
+# 与 Agnes 的关键差异（写代码前先看清楚，别照抄）：
+#   1. 端点：POST https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks
+#   2. 鉴权：Authorization: Bearer <ARK_API_KEY>；模型字段是「推理接入点 id」（ep-...），
+#      不是模型名。用户提供的 2.5 = ep-20261106154430-877sp，2.0 = ep-...bvdmq，
+#      mini = ep-...w2kzs，fast = ep-...5hls8。
+#   3. 请求体是 content[] 多模态数组（text + image_url/video_url/audio_url），
+#      与 Agnes 的 prompt/first_frame 完全不同。
+#   4. 首帧必须走 role=first_frame 的 image_url，URL 支持 http(s) 或 base64 data URI。
+#      🔴 Seedance 2.5 只要带首帧，ratio 必须写 "adaptive"（保持图片比例），写 9:16 会被拒。
+#   5. 时长 4–30s 整数；分辨率 480p/720p/1080p；generate_audio 默认 true。
+#   6. 🔴 不支持 seed 参数（2.5 明确禁了），传了直接 400 —— 复用现有 _submit_one 里的
+#      seed 字段时必须先丢掉。
+#   7. 轮询：GET .../contents/generations/tasks/{id}，状态 queued/running/succeeded/failed，
+#      结果在 content.video_url（24 小时有效，最多 100 次下载，下载不需要鉴权）。
+#   8. 🔴 并发：单账号 180 RPM / 个人 3 并发。用户明确说「这个平台是 1 并发」——
+#      在 tier_slots 里写 {"<该档 idx>": 1} 就是硬约束，调度器会强制只用 1 个槽。
+#   9. 🔴 24 小时 key 有效期（用户说明）—— 过期后所有档都 401，必须换 key 重跑。
+
+def _ark_cfg_from_tier(cfg, tier):
+    """把 tier 里带 provider='ark' 的字段读成一份 ark 配置；缺省值填全。
+    也允许在视频通道里写顶层 ark 块作为默认（tier 里字段优先）。"""
+    t = tier or {}
+    top = (cfg.get("video") or {}).get("ark") or {}
+    out = dict(top)
+    for k in ("endpoint", "ak", "sk", "key", "model", "ratio", "resolution",
+              "generate_audio", "watermark", "api_version"):
+        v = t.get(k)
+        if v not in (None, ""):
+            out[k] = v
+    out.setdefault("endpoint", "https://ark.cn-beijing.volces.com/api/v3")
+    out.setdefault("api_version", "2024-08-12")
+    out.setdefault("ratio", "adaptive")   # Seedance 2.5 带首帧必须 adaptive
+    out.setdefault("resolution", "720p")
+    out.setdefault("generate_audio", True)
+    out.setdefault("watermark", False)
+    return out
+
+
+def _ark_headers(vc):
+    key = str(vc.get("key") or vc.get("api_key") or "").strip()
+    if key:
+        return {"Authorization": "Bearer " + key,
+                "Content-Type": "application/json"}
+    ak = str(vc.get("ak") or "").strip()
+    sk = str(vc.get("sk") or "").strip()
+    if not (ak and sk):
+        die("Ark 视频通道缺凭据：请在该档 tiers 里填 key（推荐）或 ak+sk。"
+            "  24 小时 key 过期后所有档 401，换 key 重跑")
+    # 用户同时提供了 AK/SK 但没填 key：给个可执行的错误信息，
+    # 让 user 明白要生成 Bearer key（去方舟控制台 → API Key 管理）
+    die("Ark 通道当前只支持 Bearer key。"
+        " 去方舟控制台 API Key 管理新建一把，填到 tiers[i].key（或顶层 ark.key）")
+
+
+def _ark_endpoint_host(cfg, tier):
+    return ((tier or {}).get("endpoint") or "https://ark.cn-beijing.volces.com/api/v3").rstrip("/")
+
+
+def _ark_video_payload(cfg, tier, prompt, seconds, aspect_ratio,
+                       first_frame=None, last_frame=None, images=None,
+                       audios=None, seed=None):
+    vc = _ark_cfg_from_tier(cfg, tier)
+    content = [{"type": "text", "text": prompt}]
+    if first_frame:
+        content.append({"type": "image_url", "image_url": {"url": first_frame},
+                        "role": "first_frame"})
+    if last_frame:
+        content.append({"type": "image_url", "image_url": {"url": last_frame},
+                        "role": "last_frame"})
+    for img in (images or []):
+        content.append({"type": "image_url", "image_url": {"url": img},
+                        "role": "reference_image"})
+    for aud in (audios or []):
+        content.append({"type": "audio_url", "audio_url": {"url": aud},
+                        "role": "reference_audio"})
+    # 🔴 Seedance 2.5 不支持 seed；带 seed 的调用直接去掉，不要 400
+    ratio = vc.get("ratio") or "adaptive"
+    if first_frame or last_frame:
+        ratio = "adaptive"   # 带首帧强制 adaptive，写死 9:16 会被拒
+    payload = {
+        "model": vc.get("model") or "ep-20261106154430-877sp",
+        "content": content,
+        "duration": int(max(4, min(30, int(seconds)))),
+        "ratio": ratio,
+        "resolution": vc.get("resolution") or "720p",
+        "generate_audio": bool(vc.get("generate_audio", True)),
+        "watermark": bool(vc.get("watermark", False)),
+    }
+    return payload
+
+
+def _ark_submit(cfg, tier, prompt, seconds, aspect_ratio,
+                first_frame=None, last_frame=None, images=None,
+                audios=None, seed=None, quick=False, max_attempts=None):
+    """Ark 提交通道。返回结构与 Agnes 保持一致：{"id"/"video_id": task_id}。"""
+    a = cfg["agnes"]
+    vc = _ark_cfg_from_tier(cfg, tier)
+    headers = _ark_headers(vc)
+    base = _ark_endpoint_host(cfg, tier)
+    url = base + "/contents/generations/tasks"
+    payload = _ark_video_payload(cfg, tier, prompt, seconds, aspect_ratio,
+                                 first_frame, last_frame, images, audios, seed)
+    if max_attempts is not None:
+        attempts = max(1, int(max_attempts))
+    else:
+        attempts = 2 if quick else int(a.get("submit_attempts", 8))
+    last = ""
+    for i in range(attempts):
+        try:
+            d = http_json(url, payload, headers=headers, timeout=90)
+            vid = d.get("id") or d.get("task_id")
+            if vid:
+                # 🔴 关键：把 tier 索引塞进返回，调度器 / status 都靠这个路由
+                # 回 Ark 轮询，而不是 Agnes /agnesapi。
+                d["_tier"] = tier.get("_idx") if tier else None
+                return d
+            last = json.dumps(d, ensure_ascii=False)[:500]
+            break
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "ignore")
+            last = "HTTP %s: %s" % (e.code, body[:400])
+            if e.code in (400, 401, 403, 404):
+                break
+            if e.code == 429:
+                if attempts <= 1:
+                    break
+                wait = min(180, 30 * (2 ** i))
+                info("  [Ark] 限流（429），%ds 后重试（%d/%d）" % (wait, i + 1, attempts))
+                time.sleep(wait)
+                continue
+            wait = min(60, 2 * (2 ** i))
+            if attempts <= 1:
+                break
+            info("  [Ark] 排队中（HTTP %s），%ds 后重试（%d/%d）"
+                 % (e.code, wait, i + 1, attempts))
+            time.sleep(wait)
+        except Exception as e:
+            last = str(e)
+            low = str(e).lower()
+            # 与 Agnes 通道保持一致：超时 = 结果未知，服务端可能已经建任务并扣费
+            if any(k in low for k in ("timed out", "timeout", "connection reset",
+                                      "eof occurred", "connection aborted",
+                                      "remotedisconnected", "broken pipe")):
+                raise SubmitUncertain(
+                    "Ark(%s) 提交结果未知（%s）——服务端可能已建任务并扣费，"
+                    "请先去方舟后台确认，不要直接重提"
+                    % (payload.get("model"), str(e)[:120]))
+            wait = min(60, 2 * (2 ** i))
+            if attempts <= 1:
+                break
+            info("  [Ark] 提交异常（%s），%ds 后重试（%d/%d）"
+                 % (str(e)[:120], wait, i + 1, attempts))
+            time.sleep(wait)
+    _log_api_error("Ark-" + str((tier or {}).get("name") or "?"), last)
+    raise SubmitError(last)
+
+
+def ark_video_status(cfg, tier, task_id):
+    """轮询 Ark 任务。tier 必须带 _idx（_ark_submit 会塞）；也允许 tier 是 int。"""
+    if isinstance(tier, int):
+        tier = _tier_at(cfg, tier)
+    vc = _ark_cfg_from_tier(cfg, tier)
+    base = _ark_endpoint_host(cfg, tier)
+    url = base + "/contents/generations/tasks/" + task_id
+    _old_to = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(30)
+    try:
+        try:
+            d = http_json(url, headers=_ark_headers(vc), timeout=45)
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 405):
+                raise
+            raise
+    finally:
+        socket.setdefaulttimeout(_old_to)
+    # 归一化成 Agnes 的形状：status/progress/url/error
+    st = str(d.get("status") or d.get("state") or "").lower()
+    norm = {"queued": "queued", "running": "running",
+            "succeeded": "completed", "failed": "failed",
+            "cancelled": "failed"}.get(st, st or "pending")
+    content = d.get("content") or {}
+    out = {"status": norm, "video_id": task_id, "id": task_id}
+    if norm == "completed":
+        url_v = (content.get("video_url") or content.get("url")
+                 or (d.get("result") or {}).get("video_url"))
+        out["url"] = url_v
+    if norm == "failed":
+        err = (d.get("error") or {})
+        out["error"] = err.get("message") or err.get("code") or json.dumps(d, ensure_ascii=False)[:400]
+    if "progress" in d:
+        out["progress"] = d.get("progress")
+    return out
+
+
+def _tier_is_ark(tier):
+    if not tier:
+        return False
+    m = str(tier.get("model") or "").strip().lower()
+    prov = str(tier.get("provider") or "").strip().lower()
+    if prov in ("ark", "volcengine", "seedance", "ark-seedance"):
+        return True
+    # 模型字段是 ep- 开头的接入点 id 视为 Ark 档
+    if m.startswith("ep-") or m.startswith("cgt-"):
+        return True
+    base = str(tier.get("endpoint") or "").rstrip("/").lower()
+    return "ark.cn-beijing.volces.com" in base or "ark.ap-southeast.bytepluses.com" in base
 
 
 def agnes_video_submit(cfg, prompt, seconds, aspect_ratio, first_frame=None,
@@ -1515,6 +1790,9 @@ def agnes_video_submit(cfg, prompt, seconds, aspect_ratio, first_frame=None,
 
 def agnes_video_status(cfg, video_id, tier_idx=None):
     tier = _tier_at(cfg, tier_idx)
+    # 🔴 v2.2.0：Ark 通道走自己的轮询端点，返回归一化后的 status/url
+    if _tier_is_ark(tier):
+        return ark_video_status(cfg, tier, video_id)
     base = _tier_base(cfg, tier)
     host = base[:-3] if base.endswith("/v1") else base
     headers = _tier_headers(tier, cfg)
@@ -4610,9 +4888,17 @@ def _submit_one(cfg, task, force_tier=None, force_max_attempts=None):
     if force_tier is not None:
         tiers = video_tier_list(cfg)
         tn = tiers[force_tier]["name"] if 0 <= force_tier < len(tiers) else "?"
-        info("%s 提交 Agnes（%ss, %s, 720P）→ %s ..." % (sid, task["seconds"], a.get("aspect_ratio", "9:16"), tn))
+        is_ark = _tier_is_ark(tiers[force_tier]) if 0 <= force_tier < len(tiers) else False
+        # 🔴 Seedance 2.5 单次最长 30s；_clamp_seconds 目前把 12s 之上也压下来了，
+        # 走 Ark 时允许到 30s。
+        sec = task["seconds"]
+        if is_ark:
+            sec = max(4, min(30, int(sec)))
+        tag = "Ark" if is_ark else "Agnes"
+        info("%s 提交 %s（%ss, %s, %s）→ %s ..."
+             % (sid, tag, sec, a.get("aspect_ratio", "9:16"), _vsz_label(a), tn))
     else:
-        info("%s 提交 Agnes（%ss, %s, 720P）..." % (sid, task["seconds"], a.get("aspect_ratio", "9:16")))
+        info("%s 提交 Agnes（%ss, %s, %s）..." % (sid, task["seconds"], a.get("aspect_ratio", "9:16"), _vsz_label(a)))
     d = agnes_video_submit(cfg, task["prompt"], task["seconds"],
                            a.get("aspect_ratio", "9:16"),
                            first_frame=first, last_frame=last, seed=task.get("seed"),
@@ -4674,6 +4960,17 @@ def do_videos(cfg, paths, only=None, force=False, wait=False, allow_partial=Fals
         # 🔴 声画契约（v2.0.0）：视频是配音的载体，比首帧更需要这一句。
         #    空镜被念、该说话时不说，根因都是这里没写清。
         prompt += _voice_clause(shot)
+        # 🔴🔴 台词原文必须进视频提示词（2026-11-12《黄精》实测事故）：
+        #    以前这里只说「这一镜有对白、要对口型」，**一个字台词都没给**，
+        #    模型就自己按场景主题编词——整条片 30 镜，字幕一转录全是它瞎编的
+        #    「这根药根怎么这样皱」之类，和剧本完全对不上，而且镜头之间互不相干。
+        #    Agnes 是能念中文的，前提是台词原文就在 prompt 里。
+        _ls = shot_lines(shot)
+        if _ls:
+            _quoted = " / ".join('"%s"' % x.strip() for x in _ls)
+            prompt += (" The speaking character says this exact Mandarin line, word for word, with "
+                       "natural Mandarin mouth shapes and no improvised or additional words: "
+                       + _quoted)
         # 🔴 视频提示词也要锁爪子（ep06 S14/S16 事故）：
         #    首帧写了「furry animal paws」不代表视频里手还是爪子。
         #    视频链只吃「首帧图 + 文字」，文字不提手，模型在运动里就把毛爪画成
@@ -4749,23 +5046,46 @@ def do_videos(cfg, paths, only=None, force=False, wait=False, allow_partial=Fals
         runnable = [t for t in tasks if not t.get("link_prev") or os.path.exists(t["link_prev"])]
 
         def _persist():
-            # 注意：这里必须跟已有的 _pending.json 合并。分几批 --only 提交时如果直接覆盖，
-            # 前一批「待补位」的镜头就永久丢了（fetch 只会跑最后一批，然后清空文件）。
+            # 必须跟已有的 _pending.json 合并（分几批 --only 提交时直接覆盖会丢前一批）。
+            # 🔴 合并时必须按 shot 去重：旧代码把 tasks 全量塞进 queue，没跟已有的
+            #    keep_queue 比对，于是每跑一次 `video <dir>` 就整批追加一遍。
+            #    fetch/driver 反复补提 → 同一镜被提交多次、各扣一次钱。
+            #    本集实测队列被灌到 172 条，对账多烧 $11（2026-11-13）。
             done_ids = {j["shot"] for j in jobs}
             pend_path = os.path.join(paths["clips"], "_pending.json")
             old = load_json(pend_path, {}) or {}
-            keep_jobs = [j for j in (old.get("jobs") or [])
-                         if j.get("status") != "completed" and j.get("shot") not in done_ids]
-            keep_queue = [t for t in (old.get("queue") or [])
-                          if t["shot"] not in done_ids
-                          and t["shot"] not in {j["shot"] for j in keep_jobs}]
-            save_json(pend_path,
-                      {"jobs": keep_jobs + jobs,
-                       "queue": keep_queue + [t for t in tasks if t["shot"] not in done_ids]})
+
+            keep_jobs = []
+            seen = set(done_ids)
+            for j in (old.get("jobs") or []):
+                sid = j.get("shot")
+                if j.get("status") == "completed" or sid in seen:
+                    continue
+                seen.add(sid)
+                keep_jobs.append(j)
+
+            keep_queue = []
+            for t in (old.get("queue") or []):
+                sid = t.get("shot")
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                keep_queue.append(t)
+
+            for t in tasks:
+                sid = t.get("shot")
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                keep_queue.append(t)
+
+            save_json(pend_path, {"jobs": keep_jobs + jobs, "queue": keep_queue})
             return len(jobs)
 
+        cur = None
         try:
             for t in runnable[:slots]:
+                cur = t
                 jobs.append(_submit_one(cfg, t))
         except PaidTierNeedsConfirm as e:
             # 🔴 部分提交成功时必须先把已入队的 video_id 落盘再退出，
@@ -4773,6 +5093,14 @@ def do_videos(cfg, paths, only=None, force=False, wait=False, allow_partial=Fals
             n = _persist()
             info("部分提交成功 %d 个，已写入 _pending.json，可用 fetch 续查" % n)
             die(str(e))
+        except SubmitUncertain as e:
+            # 结果未知的镜头不写回 queue（否则下一次 fetch 又提一遍 = 双倍扣费）
+            n = _persist()
+            _mark_uncertain(paths, cur or {}, str(e))
+            info("部分提交成功 %d 个，已写入 _pending.json" % n)
+            die("提交结果未知：%s\n"
+                "  已记录到 clips/_uncertain.json。先去后台确认有没有这个任务，"
+                "**确认没有再补提**（直接重提会重复扣费）。" % str(e)[:300])
         except SubmitError as e:
             n = _persist()
             info("部分提交成功 %d 个，已写入 _pending.json，可用 fetch 续查" % n)
@@ -4789,6 +5117,20 @@ def do_videos(cfg, paths, only=None, force=False, wait=False, allow_partial=Fals
     if bad:
         warn("有 %d 个镜头没排上队，先合成已有片段（可之后单独补跑这些镜）" % len(bad))
     return solved
+
+
+def _mark_uncertain(paths, task, reason):
+    """把「提交超时、结果未知」的镜头记到 clips/_uncertain.json，等人工核对。
+
+    这里不做任何自动重提：POST 已经发出去了，服务端可能已经建了任务。
+    再提一次就是两份钱。留个记录，人看一眼后台就知道要不要补。
+    """
+    p = os.path.join(paths["clips"], "_uncertain.json")
+    old = load_json(p, {}) or {}
+    items = [x for x in (old.get("items") or []) if x.get("shot") != task.get("shot")]
+    items.append({"shot": task.get("shot"), "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                  "seconds": task.get("seconds"), "reason": reason})
+    save_json(p, {"items": items, "hint": "去后台确认这些镜头是否已有任务；确认没有再用 --only 单镜补提"})
 
 
 def _run_scheduler(cfg, paths, jobs, queue):
@@ -4889,6 +5231,13 @@ def _run_scheduler(cfg, paths, jobs, queue):
                                                         force_max_attempts=1))
                             tier_used[tidx] = tier_used.get(tidx, 0) + 1
                             tier_rr = tidx          # 记住这一档可用，下一轮先用它
+                        except SubmitUncertain as e:
+                            # 🔴 结果未知：服务端可能已经建任务并扣费。
+                            #    绝不能放回队列重试（那是双倍扣钱），写进 _uncertain.json 停下。
+                            _mark_uncertain(paths, task, str(e))
+                            info("  %s 提交结果未知，已记录到 clips/_uncertain.json，"
+                                 "确认后台无此任务再重提" % task.get("shot"))
+                            placed = True
                         except SubmitError as e:
                             # 这一档排不上：任务放回队列，交给下一档或下一轮
                             task["assigned_tier"] = None
@@ -8911,18 +9260,19 @@ CONFIG_UI_HTML = r"""<!DOCTYPE html>
   <!-- ============ 生视频 ============ -->
   <div class="pane" id="pane-video">
     <div class="card">
-      <h2>生视频 <span class="tag">agnes-video-2.5-flash</span></h2>
-      <div class="hint">视频可以单独选渠道、单独配 key。免费通道走 apihub，付费通道走 api。</div>
+      <h2>生视频 <span class="tag">Agnes / 火山 Ark（Seedance）</span></h2>
+      <div class="hint">视频可以单独选渠道、单独配 key。Agnes 走 apihub/api；火山 Ark（Seedance 2.5/2.0/mini/fast）走方舟端点，24h key 过期全档 401，单账号并发 1 路（tier_slots 强制 1）。</div>
       <div class="grid">
         <label>通道</label>
         <select id="video-preset">
           <option value="free">Agnes 免费通道（apihub）</option>
           <option value="paid">Agnes 付费通道（api）</option>
+          <option value="ark">火山 Ark · Seedance（方舟，1 并发）</option>
           <option value="custom">自定义</option>
         </select>
-        <label>端点</label><input id="video-endpoint" placeholder="https://api.agnes-ai.cn/v1">
-        <label>API Key</label><input id="video-key" type="password" placeholder="sk-...（只用于视频）">
-        <label>模型</label><input id="video-model" placeholder="agnes-video-2.5-flash">
+        <label>端点</label><input id="video-endpoint" placeholder="https://api.agnes-ai.cn/v1 或 https://ark.cn-beijing.volces.com/api/v3">
+        <label>API Key</label><input id="video-key" type="password" placeholder="sk-... / ark-...">
+        <label>模型</label><input id="video-model" placeholder="agnes-video-2.5-flash 或 ep-...">
         <label>并发 / 轮询</label>
         <div style="display:flex;gap:10px">
           <input id="video-jobs" type="number" min="1" max="10" style="max-width:90px"> <span class="muted">路并发</span>
@@ -8930,14 +9280,25 @@ CONFIG_UI_HTML = r"""<!DOCTYPE html>
         </div>
         <label>默认时长 / 画幅</label>
         <div style="display:flex;gap:10px">
-          <input id="video-seconds" type="number" min="4" max="12" style="max-width:90px"> <span class="muted">秒</span>
-          <select id="video-ratio" style="max-width:120px">
-            <option value="9:16">9:16 竖屏</option>
+          <input id="video-seconds" type="number" min="4" max="30" style="max-width:90px"> <span class="muted">秒（Ark 支持 4–30）</span>
+          <select id="video-ratio" style="max-width:140px">
+            <option value="9:16">9:16 竖屏（Ark 带首帧=adaptive）</option>
             <option value="16:9">16:9 横屏</option>
             <option value="1:1">1:1 方形</option>
             <option value="4:3">4:3</option>
             <option value="3:4">3:4</option>
           </select>
+        </div>
+        <label>Ark 分辨率</label>
+        <select id="video-ark-res" style="max-width:140px">
+          <option value="480p">480p（最便宜）</option>
+          <option value="720p">720p（默认）</option>
+          <option value="1080p">1080p（HEVC 10-bit，浏览器可能不播）</option>
+        </select>
+        <label>Ark 附带音频 / 水印</label>
+        <div style="display:flex;gap:10px">
+          <label style="display:flex;align-items:center;gap:6px;margin:0"><input id="video-ark-audio" type="checkbox" checked> 生成同步音频</label>
+          <label style="display:flex;align-items:center;gap:6px;margin:0"><input id="video-ark-wm" type="checkbox"> 水印</label>
         </div>
       </div>
       <div class="row"><button data-test="video">测试连接</button><span class="status" id="st-video"></span></div>
@@ -9142,6 +9503,10 @@ function fill(cfg){
   $('video-endpoint').value = v.endpoint || '';
   $('video-key').value = v.key || '';
   $('video-model').value = v.model || '';
+  const va = v.ark || {};
+  $('video-ark-res').value = va.resolution || '720p';
+  $('video-ark-audio').checked = (va.generate_audio !== false);
+  $('video-ark-wm').checked = (va.watermark === true);
   $('video-jobs').value = v.jobs || 3;
   $('video-poll').value = v.poll || 30;
   $('video-seconds').value = v.seconds || 8;
@@ -9192,7 +9557,10 @@ function collect(){
     video:{preset:$('video-preset').value, endpoint:$('video-endpoint').value.trim(), key:$('video-key').value.trim(), model:$('video-model').value.trim(),
            jobs:num('video-jobs',3), poll_interval:num('video-poll',30), seconds:num('video-seconds',8), ratio:$('video-ratio').value,
            timeout:num('video-timeout',7200), attempts:num('video-attempts',3), rounds:num('video-rounds',40),
-           frame_upload:$('video-frame-upload').value.trim()},
+           frame_upload:$('video-frame-upload').value.trim(),
+           ark:{resolution:$('video-ark-res').value,
+                generate_audio:($('video-ark-audio').checked?true:false),
+                watermark:($('video-ark-wm').checked?true:false)}},
     voices:{default:$('voice-default').value.trim(), VO:$('voice-vo').value.trim(), rate:$('voice-rate').value.trim(), volume:num('voice-volume',1.6)},
     music:{provider:$('music-provider').value, endpoint:$('music-endpoint').value.trim(), auth:$('music-auth').value.trim(), unet:$('music-unet').value.trim(), clip:$('music-clip').value.trim(), vae:$('music-vae').value.trim(),
            steps:num('music-steps',28), cfg:num('music-cfg',1.8), duration:num('music-duration',100), caption:$('music-caption').value.trim(),
@@ -9281,6 +9649,12 @@ $('video-preset').addEventListener('change', ()=>{
   const v=$('video-preset').value;
   if(v==='free'){ $('video-endpoint').value='https://apihub.agnes-ai.cn/v1'; }
   if(v==='paid'){ $('video-endpoint').value='https://api.agnes-ai.cn/v1'; }
+  if(v==='ark'){
+    $('video-endpoint').value='https://ark.cn-beijing.volces.com/api/v3';
+    $('video-model').value='ep-20261106154430-877sp';
+    // 并发强制 1 路（火山平台硬约束）
+    $('video-jobs').value = 1;
+  }
   if(v==='custom'){ $('video-endpoint').value=''; }
 });
 $('btn-tts').addEventListener('click', async ()=>{
@@ -9363,6 +9737,7 @@ def _ui_public(cfg):
             "rounds": v.get("rounds") or a.get("submit_rounds") or 40,
             "frame_upload": v.get("frame_upload") if v.get("frame_upload") is not None
                             else (a.get("frame_upload") or ""),
+            "ark": (v.get("ark") or {}),
         },
         "voices": {
             "default": vo.get("default") or DEFAULT_VOICES["default"],
@@ -9432,12 +9807,26 @@ def _ui_merge(cfg, data):
     out["video"]["model"] = (v.get("model") or "").strip()
     out["video"]["jobs"] = max(1, int(v.get("jobs") or 3))
     out["video"]["poll_interval"] = max(5.0, float(v.get("poll_interval") or 30))
-    out["video"]["seconds"] = max(4, min(12, float(v.get("seconds") or 8)))
+    # 🔴 v2.2.0：Ark 通道支持 30s，Agnes 保持 12s 上限
+    _is_ark = ("ark" in (out["video"].get("endpoint") or "").lower()
+               or out["video"].get("model","").startswith(("ep-", "cgt-")))
+    _sec_cap = 30 if _is_ark else 12
+    out["video"]["seconds"] = max(4, min(_sec_cap, float(v.get("seconds") or 8)))
     out["video"]["ratio"] = (v.get("ratio") or "9:16").strip()
     out["video"]["timeout"] = max(300, float(v.get("timeout") or 7200))
     out["video"]["attempts"] = max(1, int(v.get("attempts") or 3))
     out["video"]["rounds"] = max(1, int(v.get("rounds") or 40))
     out["video"]["frame_upload"] = (v.get("frame_upload") or "").strip()
+    # 🔴 v2.2.0：Ark 默认参数块（分辨率 / 音频 / 水印 / 并发）
+    va = v.get("ark") or {}
+    out.setdefault("video", {})["ark"] = {
+        "endpoint": out["video"]["endpoint"],
+        "key": out["video"]["key"],
+        "model": out["video"]["model"],
+        "resolution": str(va.get("resolution") or "720p").strip().lower(),
+        "generate_audio": bool(va.get("generate_audio", True)),
+        "watermark": bool(va.get("watermark", False)),
+    }
     # 同步到 agnes 老字段，保证脚本各处读到的是同一份
     if out["video"]["endpoint"]:
         out["agnes"]["video_endpoint"] = out["video"]["endpoint"]
@@ -9453,6 +9842,16 @@ def _ui_merge(cfg, data):
     out["agnes"]["submit_attempts"] = out["video"]["attempts"]
     out["agnes"]["submit_rounds"] = out["video"]["rounds"]
     out["agnes"]["frame_upload"] = out["video"]["frame_upload"]
+    # 🔴 自动给 Ark 档补 tier_slots：并发 = 1（平台硬约束）
+    # 只在 tier 里有 ep-/cgt-/ark.cn-beijing 的条目时追加，不覆盖用户显式设置
+    _ark_idxs = [i for i, t in enumerate(out["video"].get("tiers") or [])
+                 if _tier_is_ark(t)]
+    if _ark_idxs:
+        ts = out["video"].setdefault("tier_slots", {})
+        for i in _ark_idxs:
+            # 已有配置（哪怕用户写错）不动，只补 0 值或没配的
+            if i not in ts or ts.get(str(i)) in (0, None):
+                ts[str(i)] = 1
 
     vo = data.get("voices") or {}
     out["voices"].update({
@@ -9553,6 +9952,25 @@ def _ui_test(data):
         ep = ((cfg.get("video") or {}).get("endpoint") or "").strip()
         key = ((cfg.get("video") or {}).get("key") or "").strip()
         model = ((cfg.get("video") or {}).get("model") or "").strip()
+        # 🔴 v2.2.0：若该档走 Ark（Seedance），走 GET /api/v3/models（Bearer 鉴权即可），
+        # 不烧钱。视频通道里同时挂 Ark + Agnes 时，这里按 ep 端点识别。
+        low = ep.lower()
+        if ("ark.cn-beijing.volces.com" in low or "ark.ap-southeast.bytepluses.com" in low
+                or "ark.cn-shanghai.volces.com" in low):
+            try:
+                d = http_json(ep.rstrip("/") + "/models",
+                              headers={"Authorization": "Bearer " + key}, timeout=15)
+                ids = [m.get("id") for m in (d.get("data") or []) if m.get("id")]
+                # 推理接入点 id（ep-xxx）也算合法；模型名也要能匹配到
+                has = None
+                if model:
+                    low_m = model.strip().lower()
+                    has = any(str(x).lower() == low_m for x in ids) or \
+                          any(str(x).startswith(low_m[:8]) for x in ids)
+                return {"ok": True, "count": len(ids), "has_model": has,
+                        "note": "Ark（火山方舟）端点连通", "models": ids[:12]}
+            except Exception as e:
+                return {"ok": False, "message": "Ark 端点不通（24h key 可能已过期）：" + str(e)[:200]}
     if not ep:
         return {"ok": False, "message": "端点为空"}
     try:

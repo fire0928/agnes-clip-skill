@@ -2,11 +2,11 @@
 name: agnes-clip
 display_name: 一句话成片
 display_name_en: One-Line to Clip
-description: 用 Agnes 云端算力全自动做竖屏短剧/长视频——一句话创意 → 编剧（场景/动作/微表情/对白/口型）→ 分镜表 → 角色定妆图 → 道具图 → 场景板 → 逐镜首帧 → 批量提交 agnes-video-2.5-flash 出视频 → 质检 → 配乐/音效/转场/逐句字幕 → 拼成一条完整成片。含 15 阶段完整作业流程（references/full_pipeline.md）与多集共享角色库（同一系列第 2、3 集复用同一张脸，不重新生成）。当用户要用 Agnes 生成视频、要"从剧本到成片全自动"、要写有对白会说话的短剧、要锁住人物脸做多镜头连续剧/系列剧、要批量提交视频任务、问"这个 skill 怎么用/怎么配置/怎么启动/装完怎么跑"、要打开配置界面配出图或视频的端点和 Key、要给项目切换出图通道（Agnes / GPT Image / 自定义 OpenAI 兼容）时使用。模型：agnes-video-2.5-flash（视频）+ agnes-image-2.5-flash（图片）+ agnes-2.5-flash（编剧）。配乐两条通道可选：本地 ComfyUI（MiniMax Music3）或火山引擎 AI 音乐生成（豆包音乐模型，无显卡也能跑，0.002 元/秒）。
+description: 用 Agnes 云端算力全自动做竖屏短剧/长视频——一句话创意 → 编剧（场景/动作/微表情/对白/口型）→ 分镜表 → 角色定妆图 → 道具图 → 场景板 → 逐镜首帧 → 批量提交 agnes-video-2.5-flash 出视频 → 质检 → 配乐/音效/转场/逐句字幕 → 拼成一条完整成片。含 15 阶段完整作业流程（references/full_pipeline.md）与多集共享角色库（同一系列第 2、3 集复用同一张脸，不重新生成）。当用户要用 Agnes 生成视频、要"从剧本到成片全自动"、要写有对白会说话的短剧、要锁住人物脸做多镜头连续剧/系列剧、要批量提交视频任务、问"这个 skill 怎么用/怎么配置/怎么启动/装完怎么跑"、要打开配置界面配出图或视频的端点和 Key、要给项目切换出图通道（Agnes / GPT Image / 自定义 OpenAI 兼容）时使用。模型：agnes-video-2.5-flash（视频）+ agnes-image-2.5-flash（图片）+ agnes-2.5-flash（编剧）。v2.2.0 起视频通道支持双 provider：Agnes（多档并发 3/10/50）+ 火山引擎 Ark·Seedance 2.5/2.0/mini/fast（单账号 1 并发硬约束，支持 4–30s、带同步环境音、首帧强制 adaptive）。配乐两条通道可选：本地 ComfyUI（MiniMax Music3）或火山引擎 AI 音乐生成（豆包音乐模型，无显卡也能跑，0.002 元/秒）。
 description_zh: 一句话创意自动做成有对白、会说话的竖屏短剧。全流程 15 步：写剧本、分镜、角色定妆、场景板、逐镜首帧、批量出视频、配乐音效字幕、合成成片，人脸全程锁死不怕换脸。视频走云端算力，不占本地显卡。适合做催泪短剧、漫剧、系列连续剧，也支持同系列多集复用同一张脸。
 description_en: Turn a one-line idea into a vertical short drama with real dialogue. A 15-stage pipeline handles scripting, storyboarding, character sheets, scene boards, first frames, batch video generation, music, sound effects, subtitles and final cut — with character faces locked across every shot so nobody switches faces mid-story. Video runs on cloud GPUs, so no local hardware needed. Great for tearjerkers, anime shorts and serialized episodes that reuse the same face across episodes.
 agent_created: true
-version: 2.1.0
+version: 2.2.0
 ---
 
 # Agnes Clip · 一句话成片
@@ -63,6 +63,21 @@ python scripts/ac.py pick-image <项目目录> --channel agnes      # 或 gpt-im
 不写通道名 = 清除项目级设置、跟随全局。
 
 **Python 版本必须是 3.13**（3.14.3 环境已损坏，会报错）。
+
+**v2.2.0 起视频通道支持双 provider**（同一份 `video.tiers` 里混排）：
+
+| provider | 端点 | 模型 | 并发 | 说明 |
+|---|---|---|---|---|
+| Agnes | `apihub.agnes-ai.{cn,com}/v1` | `agnes-video-2.5` / `-flash` | 账号配额（3/10/50） | 默认；国内/国际版 |
+| **Ark·Seedance 2.5** | `ark.cn-beijing.volces.com/api/v3` | `ep-...`（推理接入点） | 🔴 **1**（平台硬约束） | 支持 4–30s、带同步环境音、首帧 ratio 必须 adaptive；key 24h 过期 |
+| Ark·Seedance 2.0 / mini / fast | 同上 | `ep-...` | 1 | 同 2.5 协议，能力边界小一档 |
+
+档里加 `"provider":"ark"`（或 `model` 以 `ep-`/`cgt-` 开头），调度器自动路由到
+Ark 分支。4 个 Ark 档的 `tier_slots` 全部写 1，调度器不会并发投喂。
+
+Ark 档实测：`GET /models` 探活（2026-11-13 20:30）返回 55 个模型，提交 4s 9:16
+text-only 0.6s 拿到 `cgt-...` 任务 id，8 次轮询（每次 8s）后出片，`content.video_url`
+是 TOS 签名（24h 有效）。完整文档见 `providers/ark_seedance.md`。
 
 ---
 
@@ -352,7 +367,8 @@ python scripts/ac.py cast "<dir>" list                  # 看哪些角色是本�
 | 约束 | 数值 | 说明 |
 |---|---|---|
 | 单段时长 | **4–12 秒**（字符串） | 超过 12 秒必须拆镜头；脚本自动 clamp |
-| 输出分辨率 | 固定 **720P** | 传别的值直接 400；尺寸由 `aspect_ratio` 决定 |
+| 输出分辨率 | `agnes.video_size`：`"720P"`（默认）/ `"1080P"` | **1080P 只在国际版 `apihub.agnes-ai.com` 可用**；国内版写 1080P 直接 400。竖屏 1080P 实测输出 **1088×1888**（64 对齐），720P 输出 704×1280 |
+| 1080P 代价 | 约 3–5 倍时长、约 10 倍码率 | 4 秒片实测 250 秒、882 KB→5 秒片 10 MB（15 Mbps）；只在要交 1080p 母版时开 |
 | 竖屏 | `aspect_ratio: "9:16"` → 704×1280 | 默认就是竖屏 |
 | 首帧图 | keyframe 模式传 `first_frame` | 本地图用 base64 data URI 直接传，无需图床 |
 | 并发 | **最多 3 路同时生成** | 3 槽位排队，完成一个补一个；**额度是账号级、不分模型** |
@@ -584,6 +600,106 @@ S31 猫哥突然从右跳到左。这三条逐镜看每条都合理，连起来�
 - 转场按情绪走：同场景 dissolve、穿越/闪回 fadewhite；
 - BGM 推成背景音（`--bgm-volume 1.35 --bgm-lowpass 3200`），不要盖过环境。
 
+## 🔴🔴 主产品必须先做成道具图，出图和出片都要挂上（黄精被画成人参的教训）
+
+**2026-11-13《黄精》ep02：全片一个道具图都没做，30 镜里手里举的"生黄精"被画成人参**
+（浅黄细长、须根又长又稀、根头分叉成人形），观众一眼出戏。文字写了三遍"黑褐色的黄精"
+也没用——模型对这个词压根没有准确先验，它自动回落到最常见的那张图：人参。
+
+同类高危题材：中药材（黄精/天麻/玉竹/三七）、地方菜（鲊广椒/折耳根/血豆腐）、
+器物（特定形制的坛、甑、竹匾）、成品（九蒸九晒、腊味、发酵物）。**凡是产品占画面主体的片子，
+一律先做道具图，不许靠文字描述。**
+
+### 六条铁律
+
+1. **开工第一步做道具，不是出首帧。** 顺序：找真实照片 → 生成道具图 → 用户确认 →
+   写 `props/{name}.json` → 挂镜头 → 才允许 `frame`。
+2. **道具图必须从真实照片反推。** 2–4 张真实照片（植物志/药材鉴定/药典图/产地实拍）当参考，
+   让 nano-banana 图生图，不要文字从零编。**没有真图参考的道具图 = 又一次赌模型先验。**
+   找图方向：高校药用植物园、中药鉴定学教材页、腾讯医典、地方志。
+3. **一个产品至少要两张**：`{name}_plant`（植株/整体）+ `{name}_root`（可食部位/原料）。
+   剧情从生到熟还要第三张 `{name}_dried`（成品）。ep02 就是缺植株图，导致 S10
+   "坡上一片黄精叶"里根本看不到黄精。
+4. **道具图要过用户眼。** ep02 第一版做成了"白萝卜串"（节太圆、太白、须根太少），
+   用户一眼否掉；第二版照用户给的标准照重做才过。**自己看着像不算数。**
+5. **形态锁定句只写正向。** 描述里一旦出现"人参/ginseng"，画面就是人参；
+   写"not ginseng"也一样。正确写法是把形态说死：珠串状、圆鼓结节、节间细腰、
+   圆盘茎痕、短须根、暖黄表皮。
+6. **首帧和视频两条链都要挂。** 首帧对了视频照样跑偏（运动中被"演化"）。
+   `ac.py` 已做：`do_frames` 喂参考图 + 拼锁定句，`do_videos` 只拼锁定句（不重复喂图）。
+
+### 怎么挂（关键：喂图还是只锁句）
+
+| 镜型 | 字段 | 效果 |
+|---|---|---|
+| 单人镜、无脸特写（手/器物/竹匾/断面） | `props` | 真喂道具图 + 锁定句 |
+| 双人镜、大景别 | `shape_props` | 只加锁定句，不喂图 |
+
+为什么双人镜不能喂：双人镜参考图上限 3 张（人脸 2 + 场景 1），再塞一张道具图，
+模型会把人画丢，或者凭空冒出真人、沙发、壁炉、户外。
+
+`props/{name}.json` 里写三样：`desc`（中文，给人看）、`desc_en`（英文，生图用）、
+`shape_lock`（英文正向形态句，进提示词）。
+
+### 验收：抽帧法（必做）
+
+```
+python tools/prop_audit.py <项目目录>            # 抽每个道具镜 3 帧拼联络图
+python tools/prop_audit.py <项目目录> --ids S11,S12
+```
+
+产出 `qa/prop_audit.jpg`（每行一个镜头，三帧 = 30%/50%/72% 时长），**逐镜比对外观**：
+形态对不上的镜必须重出首帧 + 视频，不能只在字幕或台词上补。产品占画面越大越致命——
+ep02 里远景竹匾（S01/S02）观众看不出，手里举着的（S11/S12）一眼穿。
+
+### 踩坑清单
+
+- 道具图太"商品图"（纯白底、打光完美）→ 视频里像样品册。生成时用
+  `botanical specimen photography / natural daylight colour` 这类词。
+- 道具图带手、带秤、带标签 → 出图会把手和道具一起照抄，多出一只手。
+- `props` 目录名就是文件名，改名字等于换道具，旧镜会静默丢参考图（`_prop_shape_lock` 读不到就当没有）。
+- 生成器里挂道具**按 add 时的原始 id**挂（`PROPS_FEED` / `PROPS_LOCK` 字典在 `add()` 里查），
+  不要等重编号之后再按 id 挂——ep02 刚踩过 id 错位，所有修正全落到别的镜头上。
+- 🔴 **`link="prev"` 的接力镜根本不调生图模型**：`ac.py frame` 直接把上一镜视频尾帧
+  截图当本镜首帧，所以给它挂 `props` 等于没挂（ep02 S12 踩过）。要么把 `link` 断掉
+  让它独立出图，要么降级成 `shape_props`（只锁句，视频提示词仍然生效）。
+  只有 `link="prev-ref"` 才会「尾帧 + 人脸 + 道具 + 场景板」重新出图。
+- 🔴 **补片要看前置镜重不重出**：接力镜的首帧来自上一镜尾帧。只重出接力镜、
+  不重出它的上一镜，旧画面里的错误产品会原样带进新视频（ep02 S10/S14）。
+  修这类镜必须先断 `link`，或者把上一镜一起重出、再按新尾帧重抽首帧。
+- 🔴 **挂了道具图不等于赢**：机位常量里常留着 `pale root mass` / `thin pale side-roots`
+  / `broken dark root` 这类旧描述，跟 `shape_lock` 的正向形态句打架，模型照旧按先验画。
+  补片要把这些词一起换掉（`fix_root()` 之类集中替换），并用 dry-run 查旧词 0 残留。
+- 补片提交别用官方 `ac.py video`：一镜全档失败会整轮退出，且 `_pending.json` 去重是
+  按 shot 做的，分批 `--only` 容易重复扣费。用「收集官方 task + 分档提交 + 落 state」的
+  方式，每镜同一时刻只投一次，成功后立刻落盘。
+
+## 🔴🔴 台词原文必须出现在视频提示词里，否则模型自己编词
+
+**这是 2026-11-12《黄精》整条片返工 30 镜的原因。**
+
+`shots.json` 里写着 `line`、剧本里写着对白，**但视频提示词只写了「这一镜有对白、要对口型」
+一句话，一个字台词都没给模型**。结果：
+
+- 成片 30 镜全在说「这根药根怎么这样皱」「药性都在里头，皱才好」「晒好了就收进来吧」
+  这类**场景相关的即兴词**，和剧本完全无关；
+- 更要命的是**镜头之间不接**——徒弟问的是 A，师父答的是 B，整条片的因果关系全塌了；
+- 光看画面/听个响完全正常，**只有把原声逐镜转录才能发现**（这正是 `audit` 看不出问题的原因）。
+
+模型不是不会念中文，是**没人告诉它念什么**。加上一句原文就一字不差：
+
+```
+The speaking character says this exact Mandarin line, word for word, with natural Mandarin
+mouth shapes and no improvised or additional words: "九蒸九晒，说到底，就是把它那股烈性，"
+```
+
+- 已写进 `ac.py` 的 `do_videos`：有台词就自动追加，**生成器不用自己拼**；
+- 一字不改地引号包住，多句用 ` / ` 分隔；
+- 中文标点保留（问号、省略号会带上语气）。
+
+**验收方式只有一条**：出片后**逐镜**抽音频转录（别转录全片，会被前后镜带偏），
+和 `shots.json` 的 `line` 对照。全片转录对不上不代表念错，单镜对不上才是真错。
+
 ## 对白节奏：慢不是念得慢，是镜头比台词长
 
 **症状**：一镜只有一句台词，却给了 7 秒；前 6 秒干站着，最后一秒才开口，拼起来又拖又假。
@@ -616,7 +732,8 @@ S31 猫哥突然从右跳到左。这三条逐镜看每条都合理，连起来�
   S07 师父：「火只煮得软，煮不出甜。」              4 秒（接 S06 尾帧）
 ```
 
-**Agnes 的硬下限**：`seconds` 只能是字符串 `"4"`–`"12"`（默认 `"5"`，`size` 只能是 `"720P"`）。
+**Agnes 的硬下限**：`seconds` 只能是字符串 `"4"`–`"12"`（默认 `"5"`；`size` 见上表，
+720P 通用、1080P 仅国际版）。
 所以**一镜最短 4 秒**；镜头表里写 3 秒的空镜，实际按 4 秒生成、拼接时取 3 秒。
 `calc_duration` 已经钳在 4–8 秒。
 
@@ -647,6 +764,34 @@ S31 猫哥突然从右跳到左。这三条逐镜看每条都合理，连起来�
 | **同一机位、同一景别不许连 3 镜** | 剪在一起观众读到的是"跳切"，不是"换镜头" |
 
 想要更碎的节奏，就在段与段之间**真换机位**：wide 交代 → 中近景对话 → 手部 insert → 过肩。
+
+### 🔴 段内换了说话人，提示词必须跟着换（2026-11-13 实测）
+
+机位段复用一个 `V_XXX` 常量很省事，但**只要段内某一镜换了说话人，那套常量就错了**。
+本集 S01 是徒弟提问、S02 是师父回答，两镜共用一套 video prompt（写着"右边徒弟开口说，
+左边师父接话"），结果 S02 出来就是徒弟在说话、师父在旁边听——台词和嘴型对不上，
+观众一眼看出来。
+
+正确做法：**prompt 里的"谁在说 / 谁在听"要按 `speaker` 分行写**，宁可多定义一个
+`V_TABLE_ANS`，也不要拿一套常量套到底。写法用正向描述：
+
+```
+On the LEFT the elderly master takes the dark root, rubs his thumb once across the bark
+and answers without hurrying, his mouth and jaw carrying the words.
+On the RIGHT the disciple listens and stays still, his hands down at his sides.
+```
+
+同理，**换了说话人还继续 `"link": "prev"` 是危险的**：首帧就是上一镜"另一个人在说话"
+的姿态，模型会顺着往下演。这一步该断开接力、按新构图重新出首帧（同机位同景别，
+剪起来照样连得上）。
+
+### 🔴 近景里站了不该站的人，就把 cast 收成一个人
+
+S03 是师父的近景，但 `cast` 写了两个人 → 模型把徒弟也画进来，站在师父身后（不是对面），
+背景还从桌前飘到了灶台边，跟上一镜完全接不上。prompt 里写 `the young man off frame`
+压不住。改法：**`cast` 只留要出镜的那一个**，prompt 里补一句正向的
+`He is the only person in frame.`，并把"他仍站在矮木桌后面、竹匾在画面下沿"写死，
+空间才不会乱跑。
 
 ## 转场：分两档，不要一刀切全叠化
 
@@ -687,6 +832,32 @@ S31 猫哥突然从右跳到左。这三条逐镜看每条都合理，连起来�
 > 🔴 **过肩镜头必看**：前景那人背对镜头、不露脸，就一定要 `"faces": ["露脸的那位"]`。
 > 把他的正脸参考图一起喂进去，模型会在窗边/门口另画一个完整的人——同一镜里出现两个同一个人。
 > 本 skill 已经踩过这个坑（S06 窗边凭空多出一个男主），代码层没有强制，只能靠 `faces` 收窄。
+
+### 🔴 头饰/帽冠在广角镜里会整体消失（2026-11-12《黄精》S01 实测）
+
+`face_ref.jpg` 明明戴着黑色道冠，提示词也写了 `keeps his black square Taoist crown exactly as in
+the face reference`，**中近景全都对，一到广角就两个人都变光头**——同一集里 18 张首帧有冠、只有
+第 1 张没有，视频一接上就是「帽子凭空长出来」。
+
+原因：头在画面里只有几十像素时，模型对「头顶那点黑布」的注意力低于「头发」这个词。
+光写 `crown` 不够，还得**明确说头发被帽子盖住了**，否则它会画头发。
+
+命中率高的写法（放在 framing 句**紧跟其后**，不要放到末尾）：
+
+```
+Both men wear black square Taoist crowns on their heads: the elderly master's black hunyuanjin
+crown with a green jade hairpin through it, the disciple's matching black square crown. The black
+cloth of each crown covers the whole top of the head; only the face, the ears and the sides of the
+neck are bare skin.
+```
+
+配合两条：① framing 里补 `both heads fully inside the frame`；② 别在同一个镜头里再写
+`short gray-white hair at the sides of his head` 之外的头发描述，越写越抢。
+
+> 通用：**帽子、头巾、发簪、眼镜、耳饰、领巾**这类「小面积配件」在广角/远景都要单独一句
+> 正向写明「布/框盖住了哪里」，只在 `SAME` 里提一句是压不住的。验收方式：把所有首帧按
+> 头部裁切拼成一张图（`qa/heads_all.jpg`），一眼能看出哪张漏了。
+
 
 ### 🔴🔴 否定句是最大的穿帮来源：写一次是防护，写十次是召唤
 
@@ -1308,6 +1479,40 @@ S11 只写 "furry white paws"，出图是**鹰爪**，画面里还混进一条�
 only two FURRY WHITE CAT PAWS — soft white fur, four rounded toes with small pink pads
 no face, no head, no arms above the wrist, no human hands, no bird claws, no legs, no torso
 ```
+
+> 🔴 **`no_faces` 镜绝对不能 `"link": "prev"`**（2026-11-13 实测）。
+> 接力时不重新出图，首帧直接用上一镜的尾帧 —— 上一镜是人物镜，这一镜就必然是人物镜，
+> `no_faces` 一个字都没生效。本集 S25 该是「师父双手掰开黄精」的极近特写，
+> 因为写了 `link="prev"` 接 S24 的人物中景，成片里变成「师父举着药、徒弟站旁边」，
+> 和 S24 几乎重样，剪起来像卡住了。
+> **无脸特写一律 `link=""`，独立出图。** 顺手检查 `angle`、`frame/video` 常量、
+> `link` 三者是不是同一套机位 —— 只改 `angle` 不改提示词常量，出图照旧是旧机位。
+
+---
+
+## 🔴 镜头表生成器里的「统一重编号」会静默错位（2026-11-13）
+
+`make_shots.py` 末尾常见这段：
+
+```python
+for i, s in enumerate(shots, 1):
+    s["id"] = "S%02d" % i
+```
+
+它按**列表顺序**重写 id，完全无视手写的 `add(id="S17")`。本集手写序列里漏了 `S16`、
+又重复了一个 `S30`，于是从第 16 个镜头起**全部前移一位**：源码里的 `S26`（掰药特写）
+在 shots.json 里成了 `S25`，`S27` 成了 `S26`……
+后面所有「按 id 改提示词」的操作全部改错镜，而且不报错、不告警。
+
+**自检**（改完生成器跑一次就够）：
+
+```
+grep -o 'add(id="S[0-9]*"' make_shots.py | sort | uniq -c | awk '$1>1'
+grep -o 'add(id="S[0-9]*"' make_shots.py | wc -l        # 要等于 shots.json 的镜头数
+```
+
+更省事的做法：**手写 id 直接按顺序写死，然后删掉重编号那段**；
+真要保留重编号，先保证手写序列本身就是连续唯一的。
 
 ---
 
@@ -2024,6 +2229,7 @@ python <skill-creator>/scripts/quick_validate.py <skill目录>   # 必须输出 
 | **`references/full_pipeline.md`** | **主作业手册**：15 个阶段的命令、字段、验收门、踩坑与验证命令 |
 | `providers/agnes.md` | 视频/图片/文本三套 API 的完整参数、错误码、实测结论 |
 | `providers/volc_music.md` | 火山引擎 AI 音乐生成（无显卡时的配乐通道） |
+| `providers/ark_seedance.md` | **v2.2.0 新增** 火山引擎 Ark · Seedance 2.5（视频）：端点/请求体/轮询/踩坑/实测 |
 | `references/screenplay.md` | 编剧方法：场景写法、动作、微表情、对白、口型、镜头语言 |
 | `references/shot_schema.md` | 镜头表字段、可拍性规则、动作估时 |
 | `references/story_design.md` | 为什么 AI 写的剧本没逻辑：logline / 情绪曲线 / 母题回环 |
@@ -2071,4 +2277,32 @@ python tools/git_sync.py status            # 本地 / 远端状态对照
 
 `--bump` 不带参数就按规则自动算下一个版本号；带值则校验格式，
 写 `2.0.10` / `1.37.0` 会被直接拦下。规则实现在 `tools/version_rule.py`（唯一真源）。
+
+## v2.2.0（2026-11-13）
+
+- **视频通道新增 Ark provider（火山引擎 · Seedance 2.5/2.0/mini/fast）**。
+  与 Agnes 并列走同一套 `video.tiers` / `tier_slots` / `_pending.json` 调度，
+  档里写 `provider:"ark"` 或 `model` 以 `ep-`/`cgt-` 开头即自动识别，
+  提交走 `POST /contents/generations/tasks`，轮询走
+  `GET /contents/generations/tasks/{id}`，结果 `content.video_url` 直接落盘。
+- 🔴 4 个 Ark 档 `tier_slots` 全部写 1（平台并发硬约束，个人账号 180 RPM / 3 并发，
+  本项目按 1 路跑，避免 `InflightBatchsizeExceeded`）。
+- 🔴 Seedance 2.5 协议与 Agnes 的关键差异（全部已处理）：
+  - 模型字段是「推理接入点 id」（`ep-...`），不是模型名；
+  - 请求体是 `content[]` 多模态数组（text/image_url/video_url/audio_url + role），
+    与 Agnes 的 `prompt + first_frame` 完全不同；
+  - 首帧必须走 `content` 里的 `role=first_frame`；只要带首帧/尾帧，`ratio` 强制
+    `adaptive`（保持图片比例，写死 9:16 会 400）；
+  - 时长 4–30s 整数（Agnes 是 4–12s），`_submit_one` 里 Ark 档允许到 30s；
+  - 🔴 不支持 `seed`（2.5 明确禁，传了直接 400），`_ark_video_payload` 收着但
+    不塞进 body；
+  - `generate_audio` 默认 true，出片自带同步环境音；
+  - 1080p 是 10-bit H.265/HEVC，浏览器/QuickTime 可能不播，下载后**别转码**。
+- 🔴 24h key 过期全档 401：`ark-ab58230e-...` 当天有效，配置里写
+  `ark.key_valid_until` 提醒。过期去方舟控制台新建 key。
+- 配置界面「生视频」TAB 新增：通道下拉加 `ark` 预设（自动填端点/模型/并发=1），
+  分辨率（480p/720p/1080p）、附带音频开关、水印开关。
+- `_ui_test` 按端点识别 Ark，走 `GET /models` 探活（不烧钱）。
+- 实测（2026-11-13 20:30）：提交 4s 9:16 text-only 0.6s 拿到 `cgt-...`，
+  8 次轮询后出片，TOS 签名 URL 24h 有效。
 

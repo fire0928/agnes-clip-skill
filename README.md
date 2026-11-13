@@ -4,7 +4,7 @@
 
 视频走云端算力，不占本地显卡。**全程不需要你手动切流程**，但每一步都留了验收门 —— 出问题能立刻定位到是哪一环。
 
-> 当前版本 **v2.1.0**：新增「多图接力」（尾帧 + 角色脸 + 场景板重新生成本镜首帧）、微表情进提示词、纯正向地域锚、节奏体检、场景裁板；修了备份文件绕过发布扫描、长台词检查漏读 `lines` 格式两个漏洞。
+> 当前版本 **v2.2.0**：视频通道新增火山引擎 Ark · Seedance 2.5/2.0/mini/fast（4 档，单账号 1 并发），与 Agnes 并列走同一份 `video.tiers`；档里写 `provider:"ark"` 即自动路由，提交走 `POST /contents/generations/tasks`，轮询走 `GET .../tasks/{id}`。Seedance 2.5 支持 4–30s、带同步环境音、首帧强制 `ratio:"adaptive"`、**禁 seed**。配置界面「生视频」TAB 加 Ark 预设与分辨率/音频/水印字段。完整文档：`providers/ark_seedance.md`。
 
 ---
 
@@ -490,9 +490,51 @@ agnes-clip-平哥分享版/
 
 ## 版本记录
 
-### v2.1.0（2026-11-12）—— 多图接力 + 微表情进提示词 + 两处发布漏洞
+### v2.2.0（2026-11-13）—— 视频通道接入火山引擎 Ark · Seedance（双 provider 并存）
 
-**背景**：v2.0.0 之后又攒了一批实战改进，这版一起发出去。
+**背景**：Agnes 免费/付费/订阅档全撞 503 时，没有第二条云端视频通道可降级。
+现在把火山方舟 Seedance 2.5/2.0/mini/fast 4 档接进来，档里写 `provider:"ark"`
+即自动路由，调度器和 `_pending.json` 复用 Agnes 那套。
+
+#### 改动一览
+
+| 项 | 说明 |
+|---|---|
+| `video_tier_list` | 档里新增 `provider` / `ak` / `sk` 字段，`_idx` 塞回每个 tier |
+| `_tier_is_ark` | 路由判定：`provider` ∈ {ark,volcengine,seedance,ark-seedance} **或** `model` 以 `ep-`/`cgt-` 开头 **或** 端点包含 `ark.cn-beijing.volces.com` / `ark.ap-southeast.bytepluses.com` |
+| `_ark_video_payload` | 构造 Ark 请求体：`content[]`（text + image_url + role）+ `duration`/`ratio`/`resolution`/`generate_audio`/`watermark`；🔴 带首帧/尾帧时 `ratio` 强制 `adaptive`；🔴 不收 seed（2.5 明确禁） |
+| `_ark_submit` | `POST /contents/generations/tasks`，429/5xx 退避策略与 Agnes 一致；超时/连接中断抛 `SubmitUncertain`（服务端可能已建任务并扣费，**绝不重提**） |
+| `ark_video_status` | `GET /contents/generations/tasks/{id}`，归一化成 Agnes 的 `status` / `url` / `error`；`content.video_url` 交给 `download_file` 直接落盘（下载不需要鉴权） |
+| `agnes_video_submit` / `agnes_video_status` | 按 tier 路由：Ark 档走 `_ark_submit` / `ark_video_status`，其它照旧 |
+| `_submit_one` | Ark 档允许 4–30s（`_clamp_seconds` 压到 30）；日志打 `提交 Ark / 提交 Agnes` |
+| 配置界面「生视频」TAB | 通道下拉加 `ark` 预设（自动填端点/模型/并发=1）；分辨率 480p/720p/1080p；附带音频/水印开关 |
+| `_ui_test` | 端点是 `ark.cn-beijing.volces.com` 时走 `GET /models` 探活（不烧钱） |
+| `DEFAULT_VIDEO_CH` | 新增 `ark` 默认块（endpoint / key / model / ratio / resolution / generate_audio / watermark）；`tier_slots` 文档注明「Ark 档务必写 1」 |
+| `providers/ark_seedance.md` | 完整协议文档：端点、请求体、轮询、踩坑清单、实测记录 |
+
+#### 平台差异速查（Agnes vs Ark Seedance 2.5）
+
+| 维度 | Agnes | Ark Seedance 2.5 |
+|---|---|---|
+| 模型字段 | 模型名（`agnes-video-2.5`） | 推理接入点 id（`ep-...`） |
+| 请求体 | `prompt + mode + first_frame` | `content[]`（多模态数组 + role） |
+| 时长 | 4–12s（字符串） | 4–30s（整数） |
+| 分辨率 | 720P/1080P（大写） | 480p/720p/1080p（小写），1080p 是 10-bit HEVC |
+| 首帧 ratio | `aspect_ratio: "9:16"` | 🔴 **必须 `"adaptive"`**（保持图片比例，写死 9:16 会 400） |
+| seed | 支持 | 🔴 **2.5 明确禁**，传了直接 400 |
+| 音频 | 不带 | `generate_audio: true` 默认开，出片带同步环境音 |
+| 并发 | 账号配额 3/10/50 路 | 🔴 **个人账号 1 路**（平台硬约束，`tier_slots` 全部写 1） |
+| key 有效期 | 长期 | 🔴 **24h**（过期全档 401，换 key 即可） |
+| 结果 URL | 24h | 24h（最多 100 次下载，下载无需鉴权） |
+
+#### 实测记录（2026-11-13 20:30）
+
+- `GET /models` 返回 55 个模型（kimi / deepseek / glm / qwen / seedance / seedream 等）
+- 提交 4s 9:16 text-only：0.6s 拿到 `cgt-20261113203046-ej2ie`
+- 8 次轮询（每次 8s）后 `status=completed`，`video_url` 返回 TOS 签名（`X-Tos-Expires=86400`）
+- 整条链路 1 分钟内出片，验证了 `_ark_submit` / `ark_video_status` 全链路可用
+
+
 
 #### 新功能一：多图接力 `link="prev-ref"`
 

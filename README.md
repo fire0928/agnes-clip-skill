@@ -490,6 +490,34 @@ agnes-clip-平哥分享版/
 
 ## 版本记录
 
+### v2.2.1（2026-11-17）—— 长镜头节奏阈值 + 真人剧硬门槛 + 档级配置修复
+
+- **节奏体检加「长镜头模式」**：`check_pacing` 新增 `long_shot=True`，走 `PACING_LONG`
+  阈值（全片语速下限 1.6 字/秒、单镜最多 90 字、纯动作镜上限 30 秒、十秒静默改判
+  「连续两镜无台词」），解决 Seedance 2.5 一镜 26–30 秒时「密度逼满 vs 空等」的逻辑死结。
+  `pacing_mode=long_shot` 由项目配置打开（`do_logic_check` 自动读）。
+- **单镜时长按通道自适应**：`_clamp_seconds(v, cap)` 在 Ark 档放 30s、Agnes 档仍 12s；
+  `_cfg_is_ark` 按端点/模型名判定，提交日志同步显示「Ark」或「Agnes」。
+- **档级配置修复**：`video_tier_list` 之前把档里写的 `ratio/resolution/generate_audio/
+  watermark/concurrency/api_version` 全丢了，档级配置形同虚设；现在原样保留。
+  Ark 档允许不写 key，回落全局 `video.ark` 块凭据（项目文件不落密钥）。
+- **首帧声画契约可关**：`shot.frame_no_voice=true` 时首帧提示词跳过口型句（静态图不需要
+  lip-sync，避免模型把「the spoken line」渲染成画面乱码字幕，ep22 S27 实测）。
+- **真人手部特写**：`no_faces` 镜头表在 `character_type=human` 项目改走「human hands」版，
+  其余项目（含拟人动物老项目）行为不变。
+- **429 冷却对齐 5 分钟窗口**：调度器限流冷却 180s → 310s，`wait_cd` 上限同步 310s
+  （免费档日额度耗尽是「每 5 分钟 1 次」，等 180s 会反复撞同一堵墙）。
+- **字幕烧制失败不再吞报错**：`do_assemble` 的 `SystemExit` 现在打印 ffmpeg 原始错误
+  （前 900 字），不再只 warn 一句「可能是字体问题」。
+- **真人剧硬门槛文档**（`providers/ark_seedance.md` 第五节 + SKILL.md 同步）：
+  Seedance 2.5/2.0 全系列拒收直接上传的真人人脸参考图（`InputImageSensitiveContentDetected.
+  PrivacyInformation`）。合规首帧只能来自同账号、近 30 天、未第三方修改的方舟自家产物：
+  Seedream 5.0 文生图（出图）+ 平台 `return_last_frame=true` 官方尾帧（接力）；
+  本地 ffmpeg 抽帧/PIL 裁切/第三方图床转发都断信任链。另两条路线：预置虚拟人像库
+  （`asset://<id>`）与真人认证授权入库。画风不能为绕过审核自行改插画风，改前必须用户拍板。
+- **新增 `说明.md`**（给人看的能力清单：15 阶段管线 / 锁脸 / 台词进提示词 / 道具防穿帮 /
+  双 provider 通道对照 / 命令清单 / 出片成本口径 / 三条最贵的教训 / 已知限制）。
+
 ### v2.2.0（2026-11-13）—— 视频通道接入火山引擎 Ark · Seedance（双 provider 并存）
 
 **背景**：Agnes 免费/付费/订阅档全撞 503 时，没有第二条云端视频通道可降级。

@@ -838,23 +838,38 @@ _VIDEO_TIER = {"idx": 0}
 def video_tier_list(cfg):
     v = cfg.get("video") or {}
     raw = v.get("tiers") or cfg.get("video_tiers") or []
+    ark_top = v.get("ark") or {}
     out = []
     for i, t in enumerate(raw):
-        if not str(t.get("key") or "").strip():
+        provider = str(t.get("provider") or "").strip().lower()
+        key = str(t.get("key") or t.get("api_key") or "").strip()
+        # 🔴 Ark 档允许不写 key：回落到 video.ark 块的凭据。
+        #    这样项目文件里不必落密钥，全局 ark 块统一管凭据（2026-11-13）。
+        if not key and provider == "ark":
+            key = str(ark_top.get("key") or ark_top.get("api_key") or "").strip()
+        if not key:
             # Ark 通道也允许 ak+sk 组合；只要有一个凭据就保留
             if not (str(t.get("ak") or "").strip() and str(t.get("sk") or "").strip()):
                 continue
-        out.append({
+        d = {
             "name": t.get("name") or t.get("model") or "tier",
             "endpoint": (t.get("endpoint") or "").rstrip("/"),
-            "key": str(t.get("key") or t.get("api_key") or "").strip(),
+            "key": key,
             "model": t.get("model") or "agnes-video-2.5-flash",
-            "provider": str(t.get("provider") or "").strip().lower(),
+            "provider": provider,
             "_idx": i,
             # 保留 ak/sk 供 Ark 使用
             "ak": t.get("ak") or "",
             "sk": t.get("sk") or "",
-        })
+        }
+        # 🔴 保留 Ark 档级覆盖字段。之前这里只留 name/endpoint/key/model，
+        #    把档里写的 ratio / resolution / generate_audio / watermark 全丢了，
+        #    档级配置形同虚设，一律回落到顶层 video.ark 块（2026-11-13）。
+        for k in ("ratio", "resolution", "generate_audio", "watermark",
+                  "concurrency", "api_version"):
+            if t.get(k) not in (None, ""):
+                d[k] = t[k]
+        out.append(d)
     return out
 
 
@@ -4006,16 +4021,37 @@ def shot_words(shot):
     return sum(len(re.sub(r"[^\u4e00-\u9fff]", "", x)) for x in shot_lines(shot))
 
 
-def check_pacing(shots, issues, warns):
+# 🔴 长镜头模式（2026-11-13）：Seedance 2.5 一镜可到 30 秒，原生生成声音。
+#    短剧的节奏假设是「镜长 = 台词念完的时间 + 1 秒」，在长镜头上不成立：
+#    · 30 秒做菜长镜里只有 10 秒说话，另外 20 秒是戏（揉面、擀面、浇头）；
+#    · 门禁在单镜 >17 秒时存在逻辑死结 —— 密度阈值 2.2 字/秒逼每镜说满 60 字，
+#      60 字按 4.2 字/秒只要 16 秒，26 秒的镜立刻又被判「多出 10 秒是空等」，
+#      两条规则永远无法同时满足。
+#    所以长镜头项目走另一套阈值：**镜长由剧情动作决定**，台词只卡「念得完」这一头。
+PACING_LONG = {
+    "dens_min": 1.6,        # 全片语速下限（长镜头项目对白本来就少）
+    "words_max": 90,        # 一镜最多说多少字
+    "silent_cap": 30.0,     # 空镜（纯动作）最长多少秒
+    "first_talk_slack": 30.0,# 首镜有台词时上限（长镜头首镜要用来建立空间）
+    "first_silent_cap": 12.0,# 首镜无台词时上限
+    "need_slack": 3.0,      # 台词念不完的容差
+}
+
+
+def check_pacing(shots, issues, warns, long_shot=False):
     """节奏体检：台词密度 / 空等 / 空镜连排 / 十秒静默 / 首镜钩子（2026-11-12）。
 
     对应 ai-video-pipeline/references/pacing_and_continuity.md。
-    用户原话：「对话慢条斯理的没有感觉」「节奏普遍太慢」——
+    用户原话：「对话慢斯斯的没有感觉」「节奏普遍太慢」——
     根因是镜头时长比台词长太多，逐镜看着都合理，连起来就拖。
+
+    🔴 long_shot=True 时走 PACING_LONG 阈值（Seedance 2.5 等 30 秒长镜头模型）。
     """
     timeline = []
     t = 0.0
     prev_silent = False
+    words_max = int(PACING_LONG["words_max"] if long_shot else 60)
+    dens_min = float(PACING_LONG["dens_min"] if long_shot else 2.2)
     for s in shots:
         sid = s.get("id") or "?"
         words = shot_words(s)
@@ -4040,23 +4076,32 @@ def check_pacing(shots, issues, warns):
                               % (sid, l, n, LINE_RED))
             elif n > LINE_IDEAL:
                 warns.append("%s 台词「%s」%d 字，偏长，配音容易赶" % (sid, l, n))
-        if words > 60:
-            issues.append("%s 一镜说了 %d 字，超过 60 字；必须拆镜" % (sid, words))
+        if words > words_max:
+            issues.append("%s 一镜说了 %d 字，超过 %d 字；必须拆镜" % (sid, words, words_max))
 
         if words:
-            if dur > need + 1.0:
-                issues.append(
-                    "%s 时长 %gs，台词 %d 字按 %.1f 字/秒只需 %gs —— 多出 %gs 是空等，"
-                    "模型还会自己加戏。改成 %gs（ac.py retime 可自动算）"
-                    % (sid, dur, words, NARRATION_CPS, need, dur - need, need))
-            elif dur < need - 0.3:
-                warns.append("%s 时长 %gs 比台词需要的 %gs 还短，容易赶词" % (sid, dur, need))
+            if long_shot:
+                # 长镜头：镜长由剧情动作决定，只卡「台词念不完」这一头。
+                if dur < need - 0.3:
+                    warns.append("%s 时长 %gs 比台词需要的 %gs 还短，容易赶词" % (sid, dur, need))
+            else:
+                if dur > need + 1.0:
+                    issues.append(
+                        "%s 时长 %gs，台词 %d 字按 %.1f 字/秒只需 %gs —— 多出 %gs 是空等，"
+                        "模型还会自己加戏。改成 %gs（ac.py retime 可自动算）"
+                        % (sid, dur, words, NARRATION_CPS, need, dur - need, need))
+                elif dur < need - 0.3:
+                    warns.append("%s 时长 %gs 比台词需要的 %gs 还短，容易赶词" % (sid, dur, need))
             prev_silent = False
         else:
             # 🔴 末镜例外（2026-11-12）：收尾镜常是「无声的动作 + 留白」（把匾架上、退后半步、
             #    镜头后拉），3 秒根本演不完。用户当时的话是「末尾的结果往往也很突然」——
             #    掐到 3 秒只会更突然。末镜上限放到 8 秒，中间的空镜仍是 3 秒。
-            cap = 8.0 if s is shots[-1] else 3.0
+            #    长镜头模式：纯动作镜（做菜、摔碗、撕面）是设计，���限放到 30 秒。
+            if long_shot:
+                cap = PACING_LONG["silent_cap"]
+            else:
+                cap = 8.0 if s is shots[-1] else 3.0
             if dur > cap:
                 issues.append("%s 是空镜但给了 %gs（上限 %.0f 秒），压到 2-3 秒或补一句台词"
                               % (sid, dur, cap))
@@ -4064,20 +4109,30 @@ def check_pacing(shots, issues, warns):
                 issues.append("%s 和上一镜连续两个空镜，会被当成过场；补台词或删一镜" % sid)
             prev_silent = True
 
-    for sid, st, en, _w in timeline:
-        mid = (st + en) / 2.0
-        window = [x for x in timeline if x[1] < mid + 5.0 and x[2] > mid - 5.0]
-        if window and not any(x[3] for x in window):
-            issues.append("第 %.0f-%.0f 秒有 10 秒没人说话，观众会划走；至少塞一句" % (mid - 5, mid + 5))
-            break
+    # 十秒静默窗口。🔴 长镜头模式：单镜 26-30 秒时「本镜中段 10 秒没台词」是
+    #    这一镜的正常结构（前半句、后半句、中间一段动作），不能按短剧口径报。
+    #    改判：只有**连续两镜都没台词**才算真的冷场。
+    if long_shot:
+        for i in range(1, len(timeline)):
+            if not timeline[i][3] and not timeline[i - 1][3]:
+                issues.append("%s 和 %s 连续两镜没有台词，观众会划走；至少给其中一镜补一句"
+                              % (timeline[i - 1][0], timeline[i][0]))
+                break
+    else:
+        for sid, st, en, _w in timeline:
+            mid = (st + en) / 2.0
+            window = [x for x in timeline if x[1] < mid + 5.0 and x[2] > mid - 5.0]
+            if window and not any(x[3] for x in window):
+                issues.append("第 %.0f-%.0f 秒有 10 秒没人说话，观众会划走；至少塞一句" % (mid - 5, mid + 5))
+                break
 
     total = timeline[-1][2] if timeline else 0.0
     total_words = sum(x[3] for x in timeline)
     if total > 0:
         dens = total_words / total
-        if dens < 2.2:
-            warns.append("全片 %d 字 / %.0f 秒 = %.2f 字/秒，低于 2.2；每 10 秒该有 25-30 个字"
-                         % (total_words, total, dens))
+        if dens < dens_min:
+            warns.append("全片 %d 字 / %.0f 秒 = %.2f 字/秒，低于 %.1f；每 10 秒该有 25-30 个字"
+                         % (total_words, total, dens, dens_min))
 
     if shots:
         d0 = float(shots[0].get("duration") or 0)
@@ -4085,10 +4140,14 @@ def check_pacing(shots, issues, warns):
         #    有台词的钩子镜，台词本身就是钩子，5-6 秒（16-20 字）是正常的；
         #    真正该报的是「没台词还硬拖」和「超过 7 秒还没说完」。
         if shot_lines(shots[0]):
-            if d0 > 7.0:
+            # 长镜头：首镜的钩子在前 3 秒就要出现，后面留白是戏，不是空等。
+            cap = (PACING_LONG["first_talk_slack"] + 1.0) if long_shot else 7.0
+            if d0 > cap:
                 issues.append("首镜 %gs，第一句话之后还有大段空白；压到「台词长度+1」以内" % d0)
-        elif d0 > 4.0:
-            issues.append("首镜 %gs 没有台词，钩子要在 2 秒内出现；压到 3 秒" % d0)
+        else:
+            cap = PACING_LONG["first_silent_cap"] if long_shot else 4.0
+            if d0 > cap:
+                issues.append("首镜 %gs 没有台词，钩子要在 2 秒内出现；压到 3 秒" % d0)
         if not shot_lines(shots[0]):
             act = (shots[0].get("action") or "") + (shots[0].get("video_prompt") or "")
             if not any(w in act for w in ("摔", "推", "抓", "塞", "递", "抬眼", "转身", "拔", "掰", "按", "掀")):
@@ -4597,7 +4656,12 @@ def _frame_for_shot(cfg, paths, shot, exe, chars=None, dry=False, chain_in=None)
 
     # 🔴 声画契约（v2.0.0）：明确这一镜是「静音画面 / 对白 / 旁白」。
     #    空镜被念、该说话时不说，根因都是提示词只有画面描述、没有配音声明。
-    prompt += _voice_clause(shot)
+    # 🔴 2026-11-13：首帧是**静态图**，不需要声画契约。加上「moves their lips and jaw in
+    #    precise lip-sync with the spoken line」这种句子，模型会自己把"the spoken line"
+    #    编成画面上的字幕文字（ep22 S27 实测：首帧顶部渲染出一段英文乱码）。
+    #    shot.frame_no_voice=true 时跳过（只影响首帧链，视频链照旧要契约）。
+    if not shot.get("frame_no_voice"):
+        prompt += _voice_clause(shot)
     # 外置画风 / 运镜（项目根目录的 style.md、camera.md），有就拼上
     prompt += _load_style_block(paths)
 
@@ -4805,12 +4869,26 @@ def cmd_frame(args):
 
 # ----------------------------------------------------------------------------- video
 
-def _clamp_seconds(v):
+def _clamp_seconds(v, cap=12):
+    """把镜头时长夹到接口允许的范围。cap=12 是 Agnes 的上限；
+    Seedance 2.5（Ark）单次最长 30 秒，调用方按通道传 cap=30。"""
     try:
         v = int(round(float(v)))
     except Exception:
         v = 8
-    return max(4, min(12, v))
+    return max(4, min(cap, v))
+
+
+def _cfg_is_ark(cfg):
+    """本项目的默认视频通道是不是 Ark（火山方舟 Seedance）。
+    用于决定单镜时长上限：Ark 30 秒、Agnes 12 秒。
+    判定依据与配置面板里 _sec_cap 保持一致：端点含 ark，或模型名是 ep-/cgt- 接入点。"""
+    v = (cfg.get("video") or {})
+    if "ark" in str(v.get("endpoint") or "").lower():
+        return True
+    if str(v.get("model") or "").strip().startswith(("ep-", "cgt-")):
+        return True
+    return False
 
 
 def extract_tail_frame(clip, dst, exe, back=0.4):
@@ -4898,7 +4976,9 @@ def _submit_one(cfg, task, force_tier=None, force_max_attempts=None):
         info("%s 提交 %s（%ss, %s, %s）→ %s ..."
              % (sid, tag, sec, a.get("aspect_ratio", "9:16"), _vsz_label(a), tn))
     else:
-        info("%s 提交 Agnes（%ss, %s, %s）..." % (sid, task["seconds"], a.get("aspect_ratio", "9:16"), _vsz_label(a)))
+        tag = "Ark" if _cfg_is_ark(cfg) else "Agnes"
+        info("%s 提交 %s（%ss, %s, %s）..."
+             % (sid, tag, task["seconds"], a.get("aspect_ratio", "9:16"), _vsz_label(a)))
     d = agnes_video_submit(cfg, task["prompt"], task["seconds"],
                            a.get("aspect_ratio", "9:16"),
                            first_frame=first, last_frame=last, seed=task.get("seed"),
@@ -4984,9 +5064,18 @@ def do_videos(cfg, paths, only=None, force=False, wait=False, allow_partial=Fals
         #    首帧只有爪子，运镜一推就可能拉出半张脸。
         #    视频提示词也要钉死「全程不露脸」。
         if shot.get("no_faces"):
-            prompt += (" The camera stays in an extreme close-up on the paws, the soil and the plants "
-                       "for the whole shot. No face, no head and no body ever enters the frame; "
-                       "the subjects stay cropped at the wrist and the elbow throughout.")
+            # 🔴 2026-11-13《黄元王》火山长镜头：全真人项目不能写 paws。
+            #    这句原来是无条件硬编码，真人手部特写会被画成毛爪。
+            #    只有明确声明 character_type=human 的项目走人手版，
+            #    其余（含没配该字段的拟人动物老项目）行为完全不变。
+            if (cfg.get("character_type") or "").strip().lower() == "human":
+                prompt += (" The camera stays in an extreme close-up on human hands and the "
+                           "object for the whole shot. No face, no head and no body ever "
+                           "enters the frame; the hands stay cropped at the wrist.")
+            else:
+                prompt += (" The camera stays in an extreme close-up on the paws, the soil and the plants "
+                           "for the whole shot. No face, no head and no body ever enters the frame; "
+                           "the subjects stay cropped at the wrist and the elbow throughout.")
         # 🔴 道具形态锁定也要进视频提示词（ep06 事故）：
         #    首帧画对了不代表视频里不跑偏——视频模型同样只看到首帧 + 文字，
         #    文字里不提形态，它在运动中就会把天麻「演化」成玉米棒/萝卜。
@@ -5029,7 +5118,8 @@ def do_videos(cfg, paths, only=None, force=False, wait=False, allow_partial=Fals
             "frame": frame_path,
             "clip": clip_path,
             "prompt": prompt,
-            "seconds": _clamp_seconds(shot.get("duration") or a.get("seconds", 8)),
+            "seconds": _clamp_seconds(shot.get("duration") or a.get("seconds", 8),
+                                     30 if _cfg_is_ark(cfg) else 12),
             "seed": shot.get("seed"),
             # 多图接力：提交前用上一镜尾帧 + 角色脸 + 场景板重新出本镜首帧。
             # 只有字符/布尔值，可以安全落进 _pending.json。
@@ -5244,9 +5334,10 @@ def _run_scheduler(cfg, paths, jobs, queue):
                             queue.append(task)
                             # tier_rr 不动 → 下一轮从别档开始
                             if "429" in str(e):
-                                # 速率限制：冷却 3 分钟，别再拿请求去撞墙
-                                tier_cooldown[tidx] = time.time() + 180
-                                info("  %s 档被限流，冷却 180s" % tl[tidx]["name"])
+                                # 速率限制：日额度用完后是「每 5 分钟 1 次」窗口，
+                                # 冷却必须大于 300s，等 180s 会反复撞同一堵墙。
+                                tier_cooldown[tidx] = time.time() + 310
+                                info("  %s 档被限流，冷却 310s（对齐 5 分钟窗口）" % tl[tidx]["name"])
                             elif "503" in str(e) or "queue_full" in str(e):
                                 # 🔴 队列满（503 video_queue_full）也要冷却。
                                 #    不冷却的话，占满的档会被每一个任务反复去撞 ——
@@ -5280,7 +5371,7 @@ def _run_scheduler(cfg, paths, jobs, queue):
                         )
                         if not _any_ready:
                             soonest = min(tier_cooldown.values())
-                            wait_cd = max(5.0, min(180.0, soonest - time.time()))
+                            wait_cd = max(5.0, min(310.0, soonest - time.time()))
                             info("  各档都在限流冷却，%.0fs 后再试" % wait_cd)
                             next_fill = max(next_fill, time.time() + wait_cd)
                         break
@@ -6927,8 +7018,11 @@ def do_assemble(cfg, paths, use_subs=False, use_voice=False, transition=None, ti
     if sub_path:
         try:
             render(True)
-        except SystemExit:
-            warn("字幕烧制失败（可能是字体问题），改为无字幕输出")
+        except SystemExit as e:
+            # 🔴 原来这里只 warn 一句「可能是字体问题」，把真实报错全吞了，
+            #    排查时完全看不到原因（ep22_cut 实测踩到）。
+            #    现在把 ffmpeg 的原始错误打出来。
+            warn("字幕烧制失败，改为无字幕输出。原始错误：%s" % str(e)[:900])
             # 去掉 ass 滤镜重试。
             # 注意：video_only 等中间产物这时已被删掉（见下面的清理），
             # 所以要先把它们重新生成出来，否则重试必然失败。
@@ -8779,7 +8873,9 @@ def do_logic_check(cfg, paths):
     # 🔴 ep07 事故：29 个有台词镜头，台词开口集中在 3.5-6.8 秒，
     #    前面全是无声动作，全片累计 100 多秒空等 —— 用户只说了两个字「冗长」。
     #    病根是「duration 拍脑袋给 7-9 秒」，没有跟台词字数挂钩。
-    check_pacing(shots, issues, warns)
+    # 长镜头项目（Seedance 2.5 等 30 秒单镜模型）走另一套节奏阈值
+    _pacing_mode = str((cfg.get("pacing_mode") or "")).strip().lower()
+    check_pacing(shots, issues, warns, long_shot=(_pacing_mode == "long_shot"))
 
     # ---- 输出 ----
     print("")

@@ -6,7 +6,7 @@ description: 用 Agnes 云端算力全自动做竖屏短剧/长视频——一�
 description_zh: 一句话创意自动做成有对白、会说话的竖屏短剧。全流程 15 步：写剧本、分镜、角色定妆、场景板、逐镜首帧、批量出视频、配乐音效字幕、合成成片，人脸全程锁死不怕换脸。视频走云端算力，不占本地显卡。适合做催泪短剧、漫剧、系列连续剧，也支持同系列多集复用同一张脸。
 description_en: Turn a one-line idea into a vertical short drama with real dialogue. A 15-stage pipeline handles scripting, storyboarding, character sheets, scene boards, first frames, batch video generation, music, sound effects, subtitles and final cut — with character faces locked across every shot so nobody switches faces mid-story. Video runs on cloud GPUs, so no local hardware needed. Great for tearjerkers, anime shorts and serialized episodes that reuse the same face across episodes.
 agent_created: true
-version: 2.2.0
+version: 2.2.1
 ---
 
 # Agnes Clip · 一句话成片
@@ -78,6 +78,23 @@ Ark 分支。4 个 Ark 档的 `tier_slots` 全部写 1，调度器不会并发�
 Ark 档实测：`GET /models` 探活（2026-11-13 20:30）返回 55 个模型，提交 4s 9:16
 text-only 0.6s 拿到 `cgt-...` 任务 id，8 次轮询（每次 8s）后出片，`content.video_url`
 是 TOS 签名（24h 有效）。完整文档见 `providers/ark_seedance.md`。
+
+### 🔴 用火山做真人剧：含人脸首帧只能来自方舟自家原始产物（v2.2.0 规则，2026-11-17 拍板）
+
+Seedance **2.5 / 2.0 全系列拒收直接上传的真人人脸参考图**
+（`HTTP 400 InputImageSensitiveContentDetected.PrivacyInformation`），
+换模型版本、改提示词、原样重试都无效。
+
+真人剧的含人脸首帧必须是**同一方舟账号、近 30 天、未经任何第三方修改**的平台原始产物：
+出图走 **Seedream 5.0 文生图**（Seedance 是视频模型，不出图），
+尾帧接力只能用平台 `return_last_frame=true` 返回的**官方尾帧**原样转存 TOS。
+用 `banana` / `gpt-image` 出真人首帧，或拿本地 ffmpeg 抽的尾帧去接，一律被打回；
+压缩、裁切、转码、第三方图床转发同样会让信任失效。
+
+🔴 **画风 = 产品定位，不许为了绕过审核自行把真人剧改成插画风**，改前必须用户拍板。
+
+📌 完整规则、四条合规条件、另两条路线（免费虚拟人像库 / 真人授权入库）
+见 `providers/ark_seedance.md` 第五节。
 
 ---
 
